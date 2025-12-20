@@ -1,7 +1,7 @@
 #!/bin/bash
 # Common functions and variables for hifi-wifi
 
-VERSION="1.2.0"
+VERSION="1.0.0"
 
 # Configuration constants
 STATE_DIR="/var/lib/wifi_patch"
