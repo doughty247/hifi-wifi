@@ -1,0 +1,10 @@
+# System files
+.DS_Store
+*~
+*.swp
+
+# Logs
+*.log
+
+# Runtime data (if any ends up here)
+*.flag
