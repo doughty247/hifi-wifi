@@ -1,13 +1,14 @@
 #!/bin/bash
 # Common functions and variables for hifi-wifi
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # Configuration constants
 STATE_DIR="/var/lib/wifi_patch"
 LOGFILE="$STATE_DIR/auto-optimize.log"
 BACKUP_PREFIX="$STATE_DIR/backup"
 STATE_FLAG="$STATE_DIR/applied.flag"
+FORCE_PERF_FLAG="$STATE_DIR/force_performance"
 NETWORK_PROFILES_DIR="$STATE_DIR/networks"
 DEFAULT_BANDWIDTH="200mbit"
 MIN_KERNEL_VERSION="5.15"
@@ -60,8 +61,22 @@ function detect_package_manager() {
     fi
     
     # Return package manager command - prioritize brew for Bazzite
+    # EXCEPTION: System components like iwd should use rpm-ostree if possible
     if command -v brew &>/dev/null && [[ "$distro" == "bazzite" ]]; then
-        echo "brew"
+        # Check if we are installing system components
+        local is_system_component=0
+        for arg in "$@"; do
+            if [[ "$arg" == "iwd" ]]; then
+                is_system_component=1
+                break
+            fi
+        done
+        
+        if [[ $is_system_component -eq 1 ]] && command -v rpm-ostree &>/dev/null; then
+             echo "rpm-ostree"
+        else
+             echo "brew"
+        fi
     elif [[ "$distro" == "steamos" ]]; then
         echo "pacman"
     elif command -v rpm-ostree &>/dev/null; then
@@ -79,7 +94,7 @@ function detect_package_manager() {
 function install_dependencies() {
     local missing_cmds=("$@")
     local pkg_mgr
-    pkg_mgr=$(detect_package_manager)
+    pkg_mgr=$(detect_package_manager "${missing_cmds[@]}")
     
     log_info "Detected package manager: $pkg_mgr"
     
@@ -91,6 +106,7 @@ function install_dependencies() {
         ["tc"]="iproute2-tc"
         ["ethtool"]="ethtool"
         ["sysctl"]="procps-ng"
+        ["iwd"]="iwd"
     )
     
     local packages=()
@@ -136,7 +152,22 @@ function install_dependencies() {
             ;;
         pacman)
             log_info "Installing via pacman..."
-            sudo pacman -S --noconfirm "${packages[@]}" || return 1
+            
+            # Create cache directory for persistence
+            local cache_dir="/var/lib/hifi-wifi/pkg_cache"
+            sudo mkdir -p "$cache_dir"
+            
+            # Download packages to cache first (so we can restore them after update)
+            log_info "Caching packages for persistence..."
+            sudo pacman -Sw --noconfirm --cachedir "$cache_dir" "${packages[@]}" || true
+            
+            # Install from cache if possible, or normal install
+            # We use -U with wildcard because version numbers might change
+            if ls "$cache_dir"/*.pkg.tar.zst 1> /dev/null 2>&1; then
+                 sudo pacman -U --noconfirm "$cache_dir"/*.pkg.tar.zst || sudo pacman -S --noconfirm "${packages[@]}" || return 1
+            else
+                 sudo pacman -S --noconfirm "${packages[@]}" || return 1
+            fi
             ;;
         dnf)
             log_info "Installing via dnf..."
@@ -420,6 +451,25 @@ function get_network_profile() {
     echo "$NETWORK_PROFILES_DIR/${safe_name}.conf"
 }
 
+function load_network_profile() {
+    local ssid="$1"
+    local profile
+    profile=$(get_network_profile "$ssid")
+    
+    if [[ -f "$profile" ]]; then
+        source "$profile"
+        # Check if expired
+        if is_profile_expired "$profile"; then
+            log_info "Profile for $ssid has expired. Re-evaluating..."
+            return 1
+        fi
+        # Renew profile on successful load (active use)
+        renew_profile "$profile"
+        return 0
+    fi
+    return 1
+}
+
 function save_network_profile() {
     local ssid="$1"
     local bandwidth="$2"
@@ -444,6 +494,35 @@ EXPIRY_DATE=$expiry_epoch
 CONNECTION_COUNT=1
 EOF
     log_success "Saved profile for network: $ssid (expires in $expiry_days days, adjusts with usage)"
+}
+
+function enable_iwd() {
+    log_info "Checking for iwd..."
+    if ! command -v iwd &>/dev/null; then
+        log_warning "iwd not found. Installing..."
+        install_dependencies "iwd" || {
+            log_error "Could not install iwd. Skipping backend switch."
+            return 1
+        }
+    fi
+
+    log_info "Switching NetworkManager backend to iwd..."
+    
+    # Create configuration to switch backend
+    mkdir -p /etc/NetworkManager/conf.d
+    cat > /etc/NetworkManager/conf.d/wifi_backend.conf <<EOF
+[device]
+wifi.backend=iwd
+EOF
+
+    # Mask wpa_supplicant to prevent conflicts
+    systemctl mask wpa_supplicant.service 2>/dev/null || true
+    systemctl stop wpa_supplicant.service 2>/dev/null || true
+
+    # Enable and start iwd
+    systemctl enable --now iwd.service 2>/dev/null || true
+
+    log_success "Switched to iwd backend. NetworkManager restart required."
 }
 
 # Comprehensive Wi-Fi card detection function

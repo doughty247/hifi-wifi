@@ -63,6 +63,7 @@ sudo hifi-wifi --status
 | `--interface <IFACE>` | Specify Wi-Fi interface (auto-detect if omitted). |
 | `--no-diagnose` | Skip diagnostic sections (only apply/revert). |
 | `--no-iwd` | Do not switch backend to `iwd` (keep `wpa_supplicant`). |
+| `--force-performance` | Disable power-saving even on battery (prevents jitter). |
 | `--dry-run` | Show what would be changed without making changes. |
 | `--quiet` | Minimal output. |
 | `--no-color` | Disable colored output. |
@@ -85,6 +86,7 @@ When connecting to a network, the tool:
 *   **Battery Devices**:
     *   **AC**: Power saving disabled (Performance mode).
     *   **Battery**: Power saving enabled.
+    *   **Forced Performance**: Use `--force-performance` to disable power saving on battery.
 
 ### Wi-Fi Backend (iwd)
 

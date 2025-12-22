@@ -251,38 +251,47 @@ if true; then  # New profile creation block
     POWER_MODE="off"  # Default: performance mode
     HAS_BATTERY=0
     
-    # Check for real system battery (not peripheral devices like mice)
-    if [[ -d /sys/class/power_supply/BAT0 ]] || [[ -d /sys/class/power_supply/BAT1 ]] || \
-       [[ -d /sys/class/power_supply/battery ]]; then
-        HAS_BATTERY=1
+    if [[ -f "$STATE_DIR/force_performance" ]]; then
+        log "Performance mode forced by user configuration"
+        # Skip battery detection, force performance
     else
-        # Check chassis type to distinguish desktops from laptops
-        if [[ -f /sys/class/dmi/id/chassis_type ]]; then
-            CHASSIS_TYPE=$(cat /sys/class/dmi/id/chassis_type 2>/dev/null)
-            # 8,9,10,11,14,30,31 = Portable/Laptop/Notebook/Tablet
-            [[ "$CHASSIS_TYPE" =~ ^(8|9|10|11|14|30|31)$ ]] && HAS_BATTERY=1
-        fi
-        
-        # If still uncertain, check for real batteries (exclude peripherals)
-        if [[ $HAS_BATTERY -eq 0 ]]; then
-            for bat in /sys/class/power_supply/*/type; do
-                if grep -q "Battery" "$bat" 2>/dev/null; then
-                    BAT_DIR=$(dirname "$bat")
-                    BAT_NAME=$(basename "$BAT_DIR")
-                    # Exclude peripheral batteries
-                    if [[ ! "$BAT_NAME" =~ (hidpp|hid|mouse|keyboard|wacom|peripheral) ]]; then
-                        # Real batteries have capacity
-                        if [[ -f "$BAT_DIR/capacity" ]]; then
-                            HAS_BATTERY=1
-                            break
+        # Check for real system battery (not peripheral devices like mice)
+        if [[ -d /sys/class/power_supply/BAT0 ]] || [[ -d /sys/class/power_supply/BAT1 ]] || \
+           [[ -d /sys/class/power_supply/battery ]]; then
+            HAS_BATTERY=1
+        else
+            # Check chassis type to distinguish desktops from laptops
+            if [[ -f /sys/class/dmi/id/chassis_type ]]; then
+                CHASSIS_TYPE=$(cat /sys/class/dmi/id/chassis_type 2>/dev/null)
+                # 8,9,10,11,14,30,31 = Portable/Laptop/Notebook/Tablet
+                [[ "$CHASSIS_TYPE" =~ ^(8|9|10|11|14|30|31)$ ]] && HAS_BATTERY=1
+            fi
+            
+            # If still uncertain, check for real batteries (exclude peripherals)
+            if [[ $HAS_BATTERY -eq 0 ]]; then
+                for bat in /sys/class/power_supply/*/type; do
+                    if grep -q "Battery" "$bat" 2>/dev/null; then
+                        BAT_DIR=$(dirname "$bat")
+                        BAT_NAME=$(basename "$BAT_DIR")
+                        # Exclude peripheral batteries
+                        if [[ ! "$BAT_NAME" =~ (hidpp|hid|mouse|keyboard|wacom|peripheral) ]]; then
+                            # Real batteries have capacity
+                            if [[ -f "$BAT_DIR/capacity" ]]; then
+                                HAS_BATTERY=1
+                                break
+                            fi
                         fi
                     fi
-                fi
-            done
+                done
+            fi
         fi
     fi
     
-    if [[ $HAS_BATTERY -eq 1 ]]; then
+    if [[ -f "$STATE_DIR/force_performance" ]]; then
+        POWER_MODE="off"
+        iw dev "$INTERFACE" set power_save off 2>/dev/null
+        log "Forced PERFORMANCE mode (power_save=off)"
+    elif [[ $HAS_BATTERY -eq 1 ]]; then
         # Battery device - check AC status with multiple methods
         AC_ONLINE=0
         

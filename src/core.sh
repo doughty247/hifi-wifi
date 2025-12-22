@@ -372,7 +372,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-RemainOnExit=yes
+RemainAfterExit=yes
 ExecStart=/bin/sh -c 'tc qdisc del dev %I root 2>/dev/null || true; tc qdisc add dev %I root cake bandwidth ${saved_bandwidth} diffserv4 dual-dsthost nat wash ack-filter'
 ExecStop=/usr/sbin/tc qdisc del dev %I root
 

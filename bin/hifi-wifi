@@ -40,6 +40,7 @@ LIST_BACKUPS=0
 LIST_NETWORKS=0
 VIEW_LOG=0
 NO_IWD=0
+FORCE_PERFORMANCE=0
 
 function usage() {
     cat <<EOF
@@ -56,6 +57,7 @@ Options:
     --interface IFACE  Specify Wi-Fi interface (auto-detect if omitted)
     --no-diagnose      Skip diagnostic sections (only apply/revert)
     --no-iwd           Do not switch backend to iwd (keep wpa_supplicant)
+    --force-performance Disable power-saving even on battery (prevents jitter)
     --dry-run          Show what would be changed without making changes
     --quiet            Minimal output (log still captures full detail)
     --no-color         Disable colored output
@@ -76,6 +78,7 @@ while [[ $# -gt 0 ]]; do
         --revert) REVERT=1; shift ;;
         --status) SHOW_STATUS=1; shift ;;
         --no-iwd) NO_IWD=1; shift ;;
+        --force-performance) FORCE_PERFORMANCE=1; shift ;;
         --list-backups) LIST_BACKUPS=1; shift ;;
         --list-networks) LIST_NETWORKS=1; shift ;;
         --view-log) VIEW_LOG=1; shift ;;
@@ -216,6 +219,7 @@ fi
 }
 
 if [[ $REVERT -eq 1 ]]; then
+  rm -f "$FORCE_PERF_FLAG" 2>/dev/null
   revert_patches
   [[ $NO_DIAG -eq 1 ]] && exit 0
 fi
@@ -248,6 +252,12 @@ if [[ $APPLY -eq 1 ]]; then
         log_warning "Patch already marked applied (state flag exists). Use --revert first if you want a clean re-apply."
         [[ $NO_DIAG -eq 1 ]] && exit 0
     else
+        # Handle force performance flag
+        if [[ $FORCE_PERFORMANCE -eq 1 ]]; then
+            touch "$FORCE_PERF_FLAG"
+            log_info "Performance mode forced (power saving disabled)"
+        fi
+
         if [[ -n "$DETECTED_DRIVER" ]] || [[ -n "$DRIVER_CATEGORY" ]]; then
             log_success "Wi-Fi hardware detected - applying optimizations..."
             apply_patches
