@@ -102,7 +102,7 @@ When connecting to a network, the tool:
 
 On Bazzite and SteamOS, the script defaults to using `iwd` as the Wi-Fi backend for NetworkManager. This provides faster connection times and better roaming.
 
-To opt-out and stay on `wpa_supplicant`:
+To opt-out on Bazzite and stay on `wpa_supplicant`:
 
 ```bash
 sudo hifi-wifi --apply --no-iwd
