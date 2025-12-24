@@ -424,35 +424,7 @@ EOF
           # Restart NetworkManager to apply the backend change immediately
           log_info "Restarting NetworkManager to apply iwd backend..."
           systemctl restart NetworkManager
-          
-          # Wait for NetworkManager to come back up and Wi-Fi to reconnect
-          log_info "Waiting for Wi-Fi to reconnect..."
-          local reconnect_timeout=30
-          local elapsed=0
-          local connected=false
-          
-          while [[ $elapsed -lt $reconnect_timeout ]]; do
-              sleep 2
-              elapsed=$((elapsed + 2))
-              
-              # Check if NetworkManager is running and if we have a Wi-Fi connection
-              if systemctl is-active --quiet NetworkManager; then
-                  if nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -q "^wlan.*:connected\|^wlp.*:connected"; then
-                      connected=true
-                      log_success "Wi-Fi reconnected successfully"
-                      break
-                  fi
-              fi
-              
-              if [[ $((elapsed % 10)) -eq 0 ]]; then
-                  log_info "Still waiting for Wi-Fi connection... (${elapsed}s elapsed)"
-              fi
-          done
-          
-          if [[ "$connected" = false ]]; then
-              log_warning "Wi-Fi did not reconnect within ${reconnect_timeout}s. Continuing anyway..."
-              log_warning "You may need to manually reconnect to your network."
-          fi
+          sleep 5
       fi
   else
       log_info "Skipping iwd enablement (--no-iwd flag used)"
