@@ -499,7 +499,7 @@ function revert_patches() {
       
       # Only remove Wi-Fi connections to ensure clean state for wpa_supplicant
       log_info "Cleaning up iwd connection profiles..."
-      nmcli -t -f UUID,TYPE connection show | grep ":802-11-wireless" | cut -d: -f1 | while read -r uuid; do
+      nmcli -t -f UUID,TYPE connection show | { grep ":802-11-wireless" || true; } | cut -d: -f1 | while read -r uuid; do
           nmcli connection delete "$uuid" 2>/dev/null || true
       done
       
@@ -536,7 +536,7 @@ function revert_patches() {
   systemctl daemon-reload 2>/dev/null || true
 
   # Restore IRQ affinity to default (all CPUs)
-  local wifi_irq=$(grep -E "rtw89_8852be|rtw89" /proc/interrupts | awk -F: '{print $1}' | head -n1 | tr -d ' ')
+  local wifi_irq=$( { grep -E "rtw89_8852be|rtw89" /proc/interrupts 2>/dev/null || true; } | awk -F: '{print $1}' | head -n1 | tr -d ' ')
   if [[ -n "$wifi_irq" && -f "/proc/irq/$wifi_irq/smp_affinity" ]]; then
     echo "f" > "/proc/irq/$wifi_irq/smp_affinity" 2>/dev/null || true
   fi

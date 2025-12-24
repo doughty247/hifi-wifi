@@ -147,7 +147,6 @@ if [[ $SHOW_STATUS -eq 1 ]]; then
         echo "  [+] rtw89_8852be module loaded"
     fi
     
-    local ifc
     ifc=$(detect_interface 2>/dev/null)
     if [[ -n "$ifc" ]]; then
         if tc qdisc show dev "$ifc" | grep -q "cake"; then
