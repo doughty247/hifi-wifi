@@ -425,8 +425,8 @@ EOF
           log_info "Restarting NetworkManager to apply iwd backend..."
           systemctl restart NetworkManager
           
-          # Wait for NetworkManager to come back up and Wi-Fi to reconnect
-          log_info "Waiting for Wi-Fi to reconnect..."
+          # Wait for NetworkManager to come back up and network to reconnect
+          log_info "Waiting for network to reconnect..."
           local reconnect_timeout=30
           local elapsed=0
           local connected=false
@@ -435,11 +435,11 @@ EOF
               sleep 2
               elapsed=$((elapsed + 2))
               
-              # Check if NetworkManager is running and if we have a Wi-Fi connection
+              # Check if NetworkManager is running and if we have any active connection
               if systemctl is-active --quiet NetworkManager; then
-                  if nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -q "^wlan.*:connected\|^wlp.*:connected"; then
+                  if nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -q ":connected"; then
                       connected=true
-                      log_success "Wi-Fi reconnected successfully"
+                      log_success "Network reconnected successfully"
                       
                       # Verify actual connectivity to ensure network is fully operational
                       log_info "Verifying internet connectivity..."
@@ -456,19 +456,19 @@ EOF
                       done
                       
                       if [[ "$ping_success" = false ]]; then
-                          log_warning "Internet check timed out, but Wi-Fi is connected. Proceeding..."
+                          log_warning "Internet check timed out, but network is connected. Proceeding..."
                       fi
                       break
                   fi
               fi
               
               if [[ $((elapsed % 10)) -eq 0 ]]; then
-                  log_info "Still waiting for Wi-Fi connection... (${elapsed}s elapsed)"
+                  log_info "Still waiting for network connection... (${elapsed}s elapsed)"
               fi
           done
           
           if [[ "$connected" = false ]]; then
-              log_warning "Wi-Fi did not reconnect within ${reconnect_timeout}s. Continuing anyway..."
+              log_warning "Network did not reconnect within ${reconnect_timeout}s. Continuing anyway..."
               log_warning "You may need to manually reconnect to your network."
           fi
       fi
@@ -537,12 +537,19 @@ function revert_patches() {
     fi
   fi
 
-  # Capture current active Wi-Fi connection before backend revert
-  local current_wifi_con current_wifi_ssid current_wifi_iface
-  current_wifi_con=$(timeout 5 nmcli -t -f NAME,TYPE connection show --active 2>/dev/null | grep ":802-11-wireless" | cut -d: -f1 | head -1 || true)
-  if [[ -n "$current_wifi_con" ]]; then
-      current_wifi_ssid=$(timeout 5 nmcli -t -f 802-11-wireless.ssid connection show "$current_wifi_con" 2>/dev/null | cut -d: -f2 || true)
-      current_wifi_iface=$(timeout 5 nmcli -t -f DEVICE connection show --active "$current_wifi_con" 2>/dev/null | head -1 || true)
+  # Capture current active connection (Wi-Fi or Ethernet) before backend revert
+  local current_connection current_connection_type is_wifi
+  current_connection=$(timeout 5 nmcli -t -f NAME connection show --active 2>/dev/null | head -1 || true)
+  current_connection_type=$(timeout 5 nmcli -t -f NAME,TYPE connection show --active 2>/dev/null | head -1 | cut -d: -f2 || true)
+  
+  if [[ "$current_connection_type" == "802-11-wireless" ]]; then
+      is_wifi=true
+      log_info "Current connection: $current_connection (Wi-Fi)"
+  elif [[ "$current_connection_type" == "802-3-ethernet" ]]; then
+      is_wifi=false
+      log_info "Current connection: $current_connection (Ethernet)"
+  else
+      is_wifi=false
   fi
   
   # Revert backend to default (wpa_supplicant) ONLY if we created the override config
@@ -579,36 +586,40 @@ function revert_patches() {
       rm -rf "$backup_dir"
       
       # Explicitly reconnect to the original network
-      if [[ -n "$current_wifi_con" ]]; then
-          log_info "Reconnecting to $current_wifi_con..."
-          timeout 10 nmcli connection up "$current_wifi_con" 2>/dev/null || true
+      if [[ -n "$current_connection" ]]; then
+          log_info "Reconnecting to $current_connection..."
+          timeout 10 nmcli connection up "$current_connection" 2>/dev/null || true
           sleep 2
       fi
       
       # Wait for network to reconnect and verify connectivity
-      log_info "Waiting for Wi-Fi to reconnect..."
+      if [[ "$is_wifi" == "true" ]]; then
+          log_info "Waiting for Wi-Fi to reconnect..."
+      else
+          log_info "Waiting for network to reconnect..."
+      fi
       local timeout=45
       local elapsed=0
       while [[ $elapsed -lt $timeout ]]; do
           local connected=false
           
-          if [[ -n "$current_wifi_con" ]]; then
+          if [[ -n "$current_connection" ]]; then
               # Check if our specific connection is back
-              if timeout 5 nmcli -t -f NAME connection show --active 2>/dev/null | grep -q "^${current_wifi_con}$"; then
+              if timeout 5 nmcli -t -f NAME connection show --active 2>/dev/null | grep -q "^${current_connection}$"; then
                   connected=true
               fi
           else
-              # Fallback: check for any connected Wi-Fi device
-              if timeout 5 nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -q "^wlan.*:connected\|^wlp.*:connected"; then
+              # Fallback: check for any connected device
+              if timeout 5 nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -q ":connected"; then
                   connected=true
               fi
           fi
           
           if [[ "$connected" == "true" ]]; then
-              log_info "Wi-Fi connection detected."
+              log_info "Network connection detected."
               # Verify internet connectivity
               if ping -c 1 -W 1 8.8.8.8 &>/dev/null; then
-                  log_success "Internet connectivity verified. Successfully reconnected to $current_wifi_con"
+                  log_success "Internet connectivity verified. Successfully reconnected to $current_connection"
                   break
               fi
           fi

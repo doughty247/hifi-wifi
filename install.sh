@@ -6,6 +6,21 @@ set -e
 INSTALL_DIR="/usr/local/bin"
 SHARE_DIR="/usr/local/share/hifi-wifi"
 
+# Capture current active connection (Wi-Fi or Ethernet) to ensure we reconnect
+CURRENT_CONNECTION=$(nmcli -t -f NAME connection show --active 2>/dev/null | head -1 || true)
+CURRENT_CONNECTION_TYPE=$(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null | head -1 | cut -d: -f2 || true)
+
+if [[ "$CURRENT_CONNECTION_TYPE" == "802-11-wireless" ]]; then
+    IS_WIFI=true
+    echo "Current active connection: $CURRENT_CONNECTION (Wi-Fi)"
+elif [[ "$CURRENT_CONNECTION_TYPE" == "802-3-ethernet" ]]; then
+    IS_WIFI=false
+    echo "Current active connection: $CURRENT_CONNECTION (Ethernet)"
+else
+    IS_WIFI=false
+    [[ -n "$CURRENT_CONNECTION" ]] && echo "Current active connection: $CURRENT_CONNECTION"
+fi
+
 IS_STEAMOS=false
 if grep -q "SteamOS" /etc/os-release 2>/dev/null; then
     IS_STEAMOS=true
@@ -37,19 +52,38 @@ if command -v hifi-wifi &>/dev/null; then
     sudo nmcli connection reload || true
     
     # Force reconnection to pick up restored profiles
-    echo "Triggering Wi-Fi reconnection..."
-    sudo nmcli radio wifi off 2>/dev/null || true
-    sleep 1
-    sudo nmcli radio wifi on 2>/dev/null || true
+    if [[ "$IS_WIFI" == "true" ]]; then
+        echo "Triggering Wi-Fi reconnection..."
+        sudo nmcli radio wifi off 2>/dev/null || true
+        sleep 1
+        sudo nmcli radio wifi on 2>/dev/null || true
+    else
+        echo "Reloading network connections..."
+        sudo nmcli connection reload
+        [[ -n "$CURRENT_CONNECTION" ]] && sudo nmcli connection up "$CURRENT_CONNECTION" 2>/dev/null || true
+    fi
     
     # Wait for connection to stabilize before proceeding
-    echo "Waiting for Wi-Fi to reconnect..."
-    timeout=30
+    if [[ "$IS_WIFI" == "true" ]]; then
+        echo "Waiting for Wi-Fi to reconnect..."
+    else
+        echo "Waiting for network to reconnect..."
+    fi
+    timeout=45
     elapsed=0
     while [ $elapsed -lt $timeout ]; do
-        if nmcli -t -f STATE general status 2>/dev/null | grep -q "connected"; then
-            echo "Wi-Fi reconnected."
-            # Verify internet connectivity
+        CONNECTED=false
+        if [[ -n "$CURRENT_CONNECTION" ]]; then
+            if nmcli -t -f NAME connection show --active 2>/dev/null | grep -q "^${CURRENT_CONNECTION}$"; then
+                CONNECTED=true
+            fi
+        else
+            if nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -q ":connected"; then
+                CONNECTED=true
+            fi
+        fi
+        if [ "$CONNECTED" = true ]; then
+            echo "Network connection detected."
             if ping -c 1 -W 1 8.8.8.8 &>/dev/null; then
                 echo "Internet connectivity verified."
                 break
