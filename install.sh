@@ -42,6 +42,26 @@ if command -v hifi-wifi &>/dev/null; then
     sleep 1
     sudo nmcli radio wifi on 2>/dev/null || true
     
+    # Wait for connection to stabilize before proceeding
+    echo "Waiting for Wi-Fi to reconnect..."
+    timeout=30
+    elapsed=0
+    while [ $elapsed -lt $timeout ]; do
+        if nmcli -t -f STATE general status 2>/dev/null | grep -q "connected"; then
+            echo "Wi-Fi reconnected."
+            # Verify internet connectivity
+            if ping -c 1 -W 1 8.8.8.8 &>/dev/null; then
+                echo "Internet connectivity verified."
+                break
+            fi
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+        if [ $((elapsed % 10)) -eq 0 ]; then
+             echo "Still waiting... (${elapsed}s)"
+        fi
+    done
+    
     rm -rf "$NM_BACKUP_DIR"
     
     # Re-disable read-only if the revert script re-enabled it
