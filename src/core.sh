@@ -537,8 +537,8 @@ function revert_patches() {
     fi
   fi
 
-  # Revert backend to default (wpa_supplicant) if currently on iwd
-  if NetworkManager --print-config 2>/dev/null | grep -q "wifi.backend=iwd"; then
+  # Revert backend to default (wpa_supplicant) ONLY if we created the override config
+  if [[ -f /etc/NetworkManager/conf.d/wifi_backend.conf ]] || [[ -f /etc/NetworkManager/conf.d/iwd.conf ]]; then
       log_info "Reverting Wi-Fi backend to default (wpa_supplicant)..."
       
       # Manual revert to avoid TUI and ensure consistency
@@ -557,6 +557,8 @@ function revert_patches() {
       log_info "Restarting NetworkManager..."
       systemctl restart NetworkManager
       sleep 5
+  elif NetworkManager --print-config 2>/dev/null | grep -q "wifi.backend=iwd"; then
+      log_info "System is using iwd, but no hifi-wifi override found. Assuming system default. Skipping backend revert."
   fi
 
   # Restore default queue discipline
