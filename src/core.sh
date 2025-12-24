@@ -537,6 +537,10 @@ function revert_patches() {
     fi
   fi
 
+  # Capture current active Wi-Fi connection before backend revert
+  local current_wifi_con
+  current_wifi_con=$(timeout 5 nmcli -t -f NAME,TYPE connection show --active 2>/dev/null | grep ":802-11-wireless" | cut -d: -f1 | head -1 || true)
+  
   # Revert backend to default (wpa_supplicant) ONLY if we created the override config
   if [[ -f /etc/NetworkManager/conf.d/wifi_backend.conf ]] || [[ -f /etc/NetworkManager/conf.d/iwd.conf ]]; then
       log_info "Reverting Wi-Fi backend to default (wpa_supplicant)..."
@@ -556,7 +560,43 @@ function revert_patches() {
       
       log_info "Restarting NetworkManager..."
       systemctl restart NetworkManager
-      sleep 5
+      sleep 3
+      
+      # Wait for network to reconnect
+      log_info "Waiting for Wi-Fi to reconnect..."
+      local timeout=45
+      local elapsed=0
+      while [[ $elapsed -lt $timeout ]]; do
+          local connected=false
+          
+          if [[ -n "$current_wifi_con" ]]; then
+              # Check if our specific connection is back
+              if timeout 5 nmcli -t -f NAME connection show --active 2>/dev/null | grep -q "^${current_wifi_con}$"; then
+                  connected=true
+              fi
+          else
+              # Fallback: check for any connected Wi-Fi device
+              if timeout 5 nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -q "^wlan.*:connected\|^wlp.*:connected"; then
+                  connected=true
+              fi
+          fi
+          
+          if [[ "$connected" == "true" ]]; then
+              log_info "Wi-Fi connection detected."
+              # Verify internet connectivity
+              if ping -c 1 -W 1 8.8.8.8 &>/dev/null; then
+                  log_success "Internet connectivity verified."
+                  break
+              fi
+          fi
+          
+          sleep 2
+          elapsed=$((elapsed + 2))
+      done
+      
+      if [[ $elapsed -ge $timeout ]]; then
+          log_warning "Network did not reconnect within timeout. You may need to manually reconnect."
+      fi
   elif NetworkManager --print-config 2>/dev/null | grep -q "wifi.backend=iwd"; then
       log_info "System is using iwd, but no hifi-wifi override found. Assuming system default. Skipping backend revert."
   fi
