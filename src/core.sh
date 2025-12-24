@@ -538,12 +538,21 @@ function revert_patches() {
   fi
 
   # Capture current active Wi-Fi connection before backend revert
-  local current_wifi_con
+  local current_wifi_con current_wifi_ssid current_wifi_iface
   current_wifi_con=$(timeout 5 nmcli -t -f NAME,TYPE connection show --active 2>/dev/null | grep ":802-11-wireless" | cut -d: -f1 | head -1 || true)
+  if [[ -n "$current_wifi_con" ]]; then
+      current_wifi_ssid=$(timeout 5 nmcli -t -f 802-11-wireless.ssid connection show "$current_wifi_con" 2>/dev/null | cut -d: -f2 || true)
+      current_wifi_iface=$(timeout 5 nmcli -t -f DEVICE connection show --active "$current_wifi_con" 2>/dev/null | head -1 || true)
+  fi
   
   # Revert backend to default (wpa_supplicant) ONLY if we created the override config
   if [[ -f /etc/NetworkManager/conf.d/wifi_backend.conf ]] || [[ -f /etc/NetworkManager/conf.d/iwd.conf ]]; then
       log_info "Reverting Wi-Fi backend to default (wpa_supplicant)..."
+      
+      # Backup network connection profiles before deletion
+      local backup_dir
+      backup_dir=$(mktemp -d)
+      cp -r /etc/NetworkManager/system-connections/. "$backup_dir/" 2>/dev/null || true
       
       # Manual revert to avoid TUI and ensure consistency
       rm -f /etc/NetworkManager/conf.d/iwd.conf
@@ -562,7 +571,21 @@ function revert_patches() {
       systemctl restart NetworkManager
       sleep 3
       
-      # Wait for network to reconnect
+      # Restore network connection profiles
+      log_info "Restoring network connection profiles..."
+      cp -r "$backup_dir/"* /etc/NetworkManager/system-connections/ 2>/dev/null || true
+      chmod 600 /etc/NetworkManager/system-connections/* 2>/dev/null || true
+      timeout 5 nmcli connection reload || true
+      rm -rf "$backup_dir"
+      
+      # Explicitly reconnect to the original network
+      if [[ -n "$current_wifi_con" ]]; then
+          log_info "Reconnecting to $current_wifi_con..."
+          timeout 10 nmcli connection up "$current_wifi_con" 2>/dev/null || true
+          sleep 2
+      fi
+      
+      # Wait for network to reconnect and verify connectivity
       log_info "Waiting for Wi-Fi to reconnect..."
       local timeout=45
       local elapsed=0
@@ -585,7 +608,7 @@ function revert_patches() {
               log_info "Wi-Fi connection detected."
               # Verify internet connectivity
               if ping -c 1 -W 1 8.8.8.8 &>/dev/null; then
-                  log_success "Internet connectivity verified."
+                  log_success "Internet connectivity verified. Successfully reconnected to $current_wifi_con"
                   break
               fi
           fi
