@@ -420,7 +420,12 @@ EOF
   ethtool -K "$ifc" tso off gso off gro on 2>/dev/null || true
 
   if [[ "${NO_IWD:-0}" -eq 0 ]]; then
-      enable_iwd
+      if enable_iwd; then
+          # Restart NetworkManager to apply the backend change immediately
+          log_info "Restarting NetworkManager to apply iwd backend..."
+          systemctl restart NetworkManager
+          sleep 5
+      fi
   else
       log_info "Skipping iwd enablement (--no-iwd flag used)"
   fi
