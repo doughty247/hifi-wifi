@@ -1,4 +1,4 @@
-hifi-wifi v1.2.0 🎄 Merry Christmas Update
+hifi-wifi v1.2.0 - Merry Christmas Update
 
 Critical stability release addressing SteamOS installation hangs, reboot issues, and network reconnection failures.
 
