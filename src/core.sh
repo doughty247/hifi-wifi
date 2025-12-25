@@ -61,6 +61,9 @@ function detect_driver_category() {
 function apply_patches() {
   log_info "Applying enhanced Wi-Fi optimizations..."
   
+  # Ensure state directories exist (fixes #4: missing directory error)
+  mkdir -p "$STATE_DIR" "$NETWORK_PROFILES_DIR" 2>/dev/null || true
+  
   local ifc
   if ! ifc=$(detect_interface); then
     log_error "Could not auto-detect Wi-Fi interface"

@@ -124,6 +124,8 @@ echo "Installing hifi-wifi..."
 sudo mkdir -p "$SHARE_DIR/src"
 sudo mkdir -p "$SHARE_DIR/config"
 sudo mkdir -p "$INSTALL_DIR"
+# Create state directories for runtime data (fixes #4: missing directory error)
+sudo mkdir -p "/var/lib/wifi_patch/networks"
 
 # Copy files
 sudo cp bin/hifi-wifi "$INSTALL_DIR/hifi-wifi"
