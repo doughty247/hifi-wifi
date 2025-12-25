@@ -1,5 +1,86 @@
 #!/bin/bash
 
+# Track changes made during apply for potential rollback
+declare -a CHANGES_MADE=()
+APPLY_IN_PROGRESS=0
+
+# Track a change for potential rollback
+track_change() {
+  local change_type="$1"
+  local change_data="$2"
+  CHANGES_MADE+=("$change_type:$change_data")
+}
+
+# Create a file and automatically track it for rollback
+create_tracked_file() {
+  local filepath="$1"
+  cat > "$filepath"
+  track_change "FILE" "$filepath"
+}
+
+# Copy a file and automatically track the destination for rollback
+cp_tracked() {
+  local src="$1"
+  local dest="$2"
+  cp "$src" "$dest"
+  track_change "FILE" "$dest"
+}
+
+# Cleanup function for abort/failure scenarios
+cleanup_on_abort() {
+  local exit_code=$?
+  
+  # Only cleanup if we're in the middle of apply and it failed
+  if [[ $APPLY_IN_PROGRESS -eq 1 && $exit_code -ne 0 ]]; then
+    log_warning "Apply failed, reverting changes..."
+    
+    # Revert changes in reverse order
+    for (( idx=${#CHANGES_MADE[@]}-1 ; idx>=0 ; idx-- )) ; do
+      local change="${CHANGES_MADE[idx]}"
+      local type="${change%%:*}"
+      local data="${change#*:}"
+      
+      case "$type" in
+        FILE)
+          if [[ -f "$data" ]]; then
+            rm -f "$data" 2>/dev/null
+            log_info "Removed: $data"
+          fi
+          ;;
+        POWER_SAVE)
+          local ifc="$data"
+          iw dev "$ifc" set power_save on 2>/dev/null
+          log_info "Restored power save on $ifc"
+          ;;
+        TC_QDISC)
+          local ifc="$data"
+          tc qdisc del dev "$ifc" root 2>/dev/null || true
+          log_info "Removed tc qdisc from $ifc"
+          ;;
+        SYSTEMD_SERVICE)
+          systemctl stop "$data" 2>/dev/null || true
+          systemctl disable "$data" 2>/dev/null || true
+          rm -f "/etc/systemd/system/$data" 2>/dev/null
+          systemctl daemon-reload 2>/dev/null || true
+          log_info "Removed service: $data"
+          ;;
+        BACKEND_CHANGE)
+          if [[ -f /etc/NetworkManager/conf.d/wifi_backend.conf ]]; then
+            rm -f /etc/NetworkManager/conf.d/wifi_backend.conf
+            systemctl restart NetworkManager 2>/dev/null || true
+            log_info "Reverted backend change"
+          fi
+          ;;
+      esac
+    done
+    
+    log_success "Cleanup completed, system restored to previous state"
+    CHANGES_MADE=()
+  fi
+  
+  APPLY_IN_PROGRESS=0
+}
+
 function detect_driver_category() {
     if [[ -n "$DETECTED_DRIVER" ]]; then
         case "$DETECTED_DRIVER" in
@@ -60,6 +141,11 @@ function detect_driver_category() {
 
 function apply_patches() {
   log_info "Applying enhanced Wi-Fi optimizations..."
+  
+  # Set up cleanup trap for failures
+  trap cleanup_on_abort EXIT ERR
+  APPLY_IN_PROGRESS=1
+  CHANGES_MADE=()
   
   # Ensure state directories exist (fixes #4: missing directory error)
   mkdir -p "$STATE_DIR" "$NETWORK_PROFILES_DIR" 2>/dev/null || true
@@ -143,7 +229,7 @@ function apply_patches() {
     cp "$PROJECT_ROOT/src/power-manager.sh" /usr/local/bin/wifi-power-manager.sh
     chmod +x /usr/local/bin/wifi-power-manager.sh
     
-    cat > /etc/udev/rules.d/70-wifi-power-ac.rules << 'EOF'
+    create_tracked_file /etc/udev/rules.d/70-wifi-power-ac.rules << 'EOF'
 # Adjust Wi-Fi power saving based on AC power status
 SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_ONLINE}=="0", RUN+="/usr/local/bin/wifi-power-manager.sh"
 SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_ONLINE}=="1", RUN+="/usr/local/bin/wifi-power-manager.sh"
@@ -155,6 +241,7 @@ EOF
     log_info "Applying maximum performance settings for desktop..."
     
     if iw dev "$ifc" set power_save off 2>/dev/null; then
+      track_change "POWER_SAVE" "$ifc"
       log_success "Power saving DISABLED on $ifc (desktop performance mode)"
     else
       log_warning "Could not disable power saving (may not be supported by driver)"
@@ -166,7 +253,7 @@ EOF
     cp "$PROJECT_ROOT/src/desktop-performance.sh" /usr/local/bin/wifi-desktop-performance.sh
     chmod +x /usr/local/bin/wifi-desktop-performance.sh
     
-    cat > /etc/udev/rules.d/70-wifi-powersave.rules << 'EOF'
+    create_tracked_file /etc/udev/rules.d/70-wifi-powersave.rules << 'EOF'
 # Desktop Wi-Fi - ALWAYS maximum performance mode
 ACTION=="add", SUBSYSTEM=="net", KERNEL=="wl*", RUN+="/usr/local/bin/wifi-desktop-performance.sh %k"
 EOF
@@ -179,7 +266,7 @@ EOF
   case "$DRIVER_CATEGORY" in
     rtw89)
       log_info "Applying Realtek RTW89 driver optimizations..."
-      cat > /etc/modprobe.d/rtw89.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/rtw89.conf << 'EOF'
 # Realtek RTW89 optimizations (RTL8852/RTL8852BE/etc)
 options rtw89_pci disable_aspm=1 disable_clkreq=1
 options rtw89_core tx_ampdu_subframes=32
@@ -187,7 +274,7 @@ EOF
       ;;
     rtw88)
       log_info "Applying Realtek RTW88 driver optimizations..."
-      cat > /etc/modprobe.d/rtw88.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/rtw88.conf << 'EOF'
 # Realtek RTW88 optimizations (RTL8822CE/etc)
 options rtw88_pci disable_aspm=1
 options rtw88_core disable_lps_deep=Y
@@ -195,7 +282,7 @@ EOF
       ;;
     rtl_legacy)
       log_info "Applying Legacy Realtek driver optimizations..."
-      cat > /etc/modprobe.d/rtl_legacy.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/rtl_legacy.conf << 'EOF'
 # Legacy Realtek optimizations (RTL8192EE/RTL8188EE/etc)
 options rtl8192ee swenc=1 ips=0 fwlps=0 2>/dev/null || true
 options rtl8188ee swenc=1 ips=0 fwlps=0 2>/dev/null || true
@@ -205,7 +292,7 @@ EOF
       ;;
     mediatek)
       log_info "Applying MediaTek driver optimizations..."
-      cat > /etc/modprobe.d/mediatek.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/mediatek.conf << 'EOF'
 # MediaTek optimizations (MT7921/MT76/etc)
 options mt7921e disable_aspm=1 2>/dev/null || true
 options mt76_usb disable_usb_sg=1 2>/dev/null || true
@@ -213,7 +300,7 @@ EOF
       ;;
     intel)
       log_info "Applying Intel Wi-Fi driver optimizations..."
-      cat > /etc/modprobe.d/iwlwifi.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/iwlwifi.conf << 'EOF'
 # Intel Wi-Fi optimizations
 options iwlwifi power_save=0 uapsd_disable=1 11n_disable=0
 options iwlmvm power_scheme=1
@@ -221,7 +308,7 @@ EOF
       ;;
     atheros)
       log_info "Applying Qualcomm Atheros driver optimizations..."
-      cat > /etc/modprobe.d/ath_wifi.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/ath_wifi.conf << 'EOF'
 # Qualcomm Atheros Wi-Fi optimizations
 options ath10k_core skip_otp=y 2>/dev/null || true
 options ath11k_pci disable_aspm=1 2>/dev/null || true
@@ -230,7 +317,7 @@ EOF
       ;;
     broadcom)
       log_info "Applying Broadcom driver optimizations..."
-      cat > /etc/modprobe.d/broadcom.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/broadcom.conf << 'EOF'
 # Broadcom Wi-Fi optimizations
 options brcmfmac roamoff=1 2>/dev/null || true
 options wl interference=0 2>/dev/null || true
@@ -238,7 +325,7 @@ EOF
       ;;
     ralink)
       log_info "Applying Ralink/MediaTek Legacy optimizations..."
-      cat > /etc/modprobe.d/ralink.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/ralink.conf << 'EOF'
 # Ralink/MediaTek Legacy optimizations
 options rt2800usb nohwcrypt=0 2>/dev/null || true
 options rt2800pci nohwcrypt=0 2>/dev/null || true
@@ -246,14 +333,14 @@ EOF
       ;;
     marvell)
       log_info "Applying Marvell driver optimizations..."
-      cat > /etc/modprobe.d/marvell.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/marvell.conf << 'EOF'
 # Marvell Wi-Fi optimizations
 options mwifiex disable_auto_ds=1 2>/dev/null || true
 EOF
       ;;
     *)
       log_info "Applying universal Wi-Fi optimizations (driver-agnostic)..."
-      cat > /etc/modprobe.d/wifi_generic.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/wifi_generic.conf << 'EOF'
 # Universal Wi-Fi optimizations
 # These settings work across most Wi-Fi drivers
 EOF
@@ -265,7 +352,7 @@ EOF
   fi
 
   local UDEV_FILE="/etc/udev/rules.d/70-wifi-powersave.rules"
-  echo 'ACTION=="add", SUBSYSTEM=="net", KERNEL=="wl*", RUN+="/usr/sbin/iw dev %k set power_save off"' > "$UDEV_FILE"
+  echo 'ACTION=="add", SUBSYSTEM=="net", KERNEL=="wl*", RUN+="/usr/sbin/iw dev %k set power_save off"' | create_tracked_file "$UDEV_FILE"
 
   local UUID=$(current_ssid_uuid)
   if [[ -n "$UUID" ]]; then
@@ -280,7 +367,7 @@ EOF
 
   echo "[PATCH] Applying upload speed optimizations..."
   
-  cat > /etc/modprobe.d/rtw89_advanced.conf << 'EOF'
+  create_tracked_file /etc/modprobe.d/rtw89_advanced.conf << 'EOF'
 # RTL8852BE upload speed optimizations and bufferbloat mitigation
 options rtw89_8852be disable_clkreq=1
 options rtw89_pci disable_aspm=1 disable_clkreq=1
@@ -336,6 +423,7 @@ EOF
   fi
   
   if tc qdisc add dev "$ifc" root cake bandwidth "$bandwidth" diffserv4 dual-dsthost nat wash ack-filter 2>/dev/null; then
+    track_change "TC_QDISC" "$ifc"
     log_success "Applied CAKE qdisc with bandwidth ${bandwidth}"
     if tc qdisc show dev "$ifc" | grep -q "cake"; then
       log_info "CAKE qdisc verified active on $ifc"
@@ -343,6 +431,7 @@ EOF
   else
     log_warning "CAKE unavailable, falling back to fq_codel"
     if tc qdisc add dev "$ifc" root handle 1: fq_codel limit 300 target 2ms interval 50ms quantum 300 ecn 2>/dev/null; then
+      track_change "TC_QDISC" "$ifc"
       log_info "Applied aggressive fq_codel for bufferbloat control"
     else
       log_warning "Could not apply any queue discipline"
@@ -354,7 +443,7 @@ EOF
   local saved_bandwidth
   saved_bandwidth=$(cat "$STATE_DIR/cake_bandwidth.txt" 2>/dev/null || echo "200mbit")
   
-  cat > /etc/systemd/system/wifi-cake-qdisc@.service <<EOF
+  create_tracked_file /etc/systemd/system/wifi-cake-qdisc@.service <<EOF
 [Unit]
 Description=Apply CAKE qdisc to %I for bufferbloat control
 After=network-online.target sys-subsystem-net-devices-%i.device
@@ -371,6 +460,7 @@ WantedBy=multi-user.target
 EOF
 
   systemctl enable "wifi-cake-qdisc@${ifc}.service" 2>/dev/null || log_warning "Could not enable CAKE systemd service"
+  track_change "SYSTEMD_SERVICE" "wifi-cake-qdisc@${ifc}.service"
   systemctl daemon-reload 2>/dev/null || true
   log_success "CAKE qdisc will persist across reboots"
   
@@ -390,14 +480,15 @@ WantedBy=multi-user.target
 EOF
 
   systemctl enable wifi-optimizations-verify.service 2>/dev/null || true
+  track_change "SYSTEMD_SERVICE" "wifi-optimizations-verify.service"
   log_success "Update protection enabled for immutable system"
   
   log_info "Setting up automatic network detection..."
-  cp "$PROJECT_ROOT/src/dispatcher.sh" /etc/NetworkManager/dispatcher.d/99-wifi-auto-optimize
+  cp_tracked "$PROJECT_ROOT/src/dispatcher.sh" /etc/NetworkManager/dispatcher.d/99-wifi-auto-optimize
   chmod +x /etc/NetworkManager/dispatcher.d/99-wifi-auto-optimize
   log_success "Automatic network optimization enabled - new networks will be configured automatically"
   
-  cp "$PROJECT_ROOT/config/99-wifi-upload-opt.conf" /etc/sysctl.d/99-wifi-upload-opt.conf
+  cp_tracked "$PROJECT_ROOT/config/99-wifi-upload-opt.conf" /etc/sysctl.d/99-wifi-upload-opt.conf
   sysctl -p /etc/sysctl.d/99-wifi-upload-opt.conf 2>/dev/null || true
 
   echo "[PATCH] Optimizing IRQ affinity..."
@@ -473,7 +564,7 @@ EOF
     mkdir -p /etc/iwd
     
     if [[ ! -f "$iwd_conf" ]]; then
-      cat > "$iwd_conf" <<EOF
+      create_tracked_file "$iwd_conf" <<EOF
 [General]
 ControlPortOverNL80211=true
 RoamThreshold=-75
@@ -498,6 +589,11 @@ EOF
   rfkill unblock wifi || true
 
   touch "$STATE_FLAG"
+  
+  # Mark apply as successfully completed - disable cleanup trap
+  APPLY_IN_PROGRESS=0
+  trap - EXIT ERR
+  
   echo "[PATCH] Applied with upload optimizations. Reconnect or reboot for full effect. Use --revert to undo."
 }
 
