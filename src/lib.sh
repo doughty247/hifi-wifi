@@ -1,7 +1,7 @@
 #!/bin/bash
 # Common functions and variables for hifi-wifi
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # Configuration constants
 STATE_DIR="/var/lib/wifi_patch"
@@ -555,7 +555,7 @@ function enable_iwd() {
     
     # Create configuration to switch backend
     mkdir -p /etc/NetworkManager/conf.d
-    cat > /etc/NetworkManager/conf.d/wifi_backend.conf <<EOF
+    create_tracked_file /etc/NetworkManager/conf.d/wifi_backend.conf <<EOF
 [device]
 wifi.backend=iwd
 EOF
