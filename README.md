@@ -30,7 +30,7 @@ sudo pacman-key --populate holo
 
 ### General Installation
 
-Clone the repository and install the latest stable release:
+Clone the repository and install the latest stable release, or head over to the releases page:
 
 ```bash
 git clone https://github.com/doughty247/hifi-wifi.git
