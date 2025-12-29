@@ -142,6 +142,70 @@ function detect_driver_category() {
     fi
 }
 
+
+function measure_bandwidth_speedtest() {
+    local speedtest_cmd=""
+    
+    # Check for speedtest-cli
+    if command -v speedtest-cli &>/dev/null; then
+        speedtest_cmd="speedtest-cli"
+    else
+        # Try to install it
+        log_info "speedtest-cli not found. Installing for accurate bandwidth detection..."
+        if install_dependencies "speedtest-cli"; then
+             if command -v speedtest-cli &>/dev/null; then
+                 speedtest_cmd="speedtest-cli"
+             fi
+        fi
+    fi
+    
+    if [[ -z "$speedtest_cmd" ]]; then
+        # Try homebrew path explicitly if not in PATH
+        if [[ -f "/home/linuxbrew/.linuxbrew/bin/speedtest-cli" ]]; then
+             speedtest_cmd="/home/linuxbrew/.linuxbrew/bin/speedtest-cli"
+        fi
+    fi
+
+    if [[ -z "$speedtest_cmd" ]]; then
+        log_warning "Could not install speedtest-cli. Falling back to link speed detection."
+        return 1
+    fi
+    
+    log_info "Running speedtest (this may take 30-60 seconds)..."
+    
+    # Run as real user if possible to avoid root issues with homebrew
+    local run_cmd="$speedtest_cmd"
+    if [[ -n "$SUDO_USER" ]]; then
+        run_cmd="sudo -u $SUDO_USER $speedtest_cmd"
+    fi
+    
+    local json_output
+    # Use --no-upload to save time, we mainly care about download for bufferbloat (CAKE handles upload separately usually, but here we set one bandwidth)
+    # Wait, CAKE bandwidth parameter is for the bottleneck. Usually download.
+    # We should probably measure both but download is the main one users notice.
+    # The user complained about download speed.
+    json_output=$($run_cmd --no-upload --timeout 60 --json 2>/dev/null)
+    
+    if [[ -z "$json_output" ]]; then
+        log_warning "Speedtest failed (no output)."
+        return 1
+    fi
+    
+    local dl_bits
+    dl_bits=$(echo "$json_output" | grep -o '"download": [0-9.]*' | awk '{print $2}')
+    
+    if [[ -n "$dl_bits" && "$dl_bits" != "0" ]]; then
+        # Convert bits/sec to Mbit/s (integer)
+        local dl_mbits
+        dl_mbits=$(awk "BEGIN {printf \"%.0f\", $dl_bits / 1000000}")
+        echo "$dl_mbits"
+        return 0
+    else
+        log_warning "Could not parse speedtest output."
+        return 1
+    fi
+}
+
 function apply_patches() {
   log_info "Applying enhanced Wi-Fi optimizations..."
   
@@ -398,25 +462,37 @@ EOF
       log_info "No profile found for $current_ssid, creating new profile..."
       
       log_info "Detecting optimal bandwidth settings..."
-      local link_speed
+      local measured_speed
       local overhead_percent=85
       
-      link_speed=$(iw dev "$ifc" link 2>/dev/null | grep -oP 'tx bitrate: \K[0-9]+' | head -1 || true)
-      
-      if [[ -z "$link_speed" ]]; then
-          link_speed=$(ethtool "$ifc" 2>/dev/null | grep -oP 'Speed: \K[0-9]+' | head -1 || true)
-          if [[ -n "$link_speed" ]]; then
-              overhead_percent=95
-              log_info "Ethernet detected, using aggressive ${overhead_percent}% limit"
-          fi
-      fi
-      
-      if [[ -n "$link_speed" && $link_speed -gt 0 ]]; then
-        local cake_limit=$((link_speed * overhead_percent / 100))
-        bandwidth="${cake_limit}mbit"
-        log_info "Detected link speed: ${link_speed}Mbit/s, setting CAKE to ${cake_limit}Mbit/s (${overhead_percent}%)"
+      # Try actual speedtest first (more accurate)
+      if measured_speed=$(measure_bandwidth_speedtest); then
+          # Use 95% of ACTUAL measured speed (since it's real throughput, not link speed)
+          overhead_percent=95
+          local cake_limit=$((measured_speed * overhead_percent / 100))
+          bandwidth="${cake_limit}mbit"
+          log_success "Measured download speed: ${measured_speed}Mbit/s. Setting CAKE to ${cake_limit}Mbit/s (${overhead_percent}%)"
       else
-        log_warning "Could not detect link speed, using default ${bandwidth}"
+          # Fallback to link speed
+          log_info "Falling back to link speed detection..."
+          local link_speed
+          link_speed=$(iw dev "$ifc" link 2>/dev/null | grep -oP 'tx bitrate: \K[0-9]+' | head -1 || true)
+          
+          if [[ -z "$link_speed" ]]; then
+              link_speed=$(ethtool "$ifc" 2>/dev/null | grep -oP 'Speed: \K[0-9]+' | head -1 || true)
+              if [[ -n "$link_speed" ]]; then
+                  overhead_percent=95
+                  log_info "Ethernet detected, using aggressive ${overhead_percent}% limit"
+              fi
+          fi
+          
+          if [[ -n "$link_speed" && $link_speed -gt 0 ]]; then
+            local cake_limit=$((link_speed * overhead_percent / 100))
+            bandwidth="${cake_limit}mbit"
+            log_info "Detected link speed: ${link_speed}Mbit/s, setting CAKE to ${cake_limit}Mbit/s (${overhead_percent}%)"
+          else
+            log_warning "Could not detect link speed, using default ${bandwidth}"
+          fi
       fi
       
       save_network_profile "$current_ssid" "$bandwidth" "auto"

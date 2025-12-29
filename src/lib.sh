@@ -1,7 +1,7 @@
 #!/bin/bash
 # Common functions and variables for hifi-wifi
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 
 # Configuration constants
 STATE_DIR="/var/lib/wifi_patch"
@@ -158,6 +158,7 @@ function install_dependencies() {
         ["ethtool"]="ethtool"
         ["sysctl"]="procps-ng"
         ["iwd"]="iwd"
+        ["speedtest-cli"]="speedtest-cli"
     )
     
     local packages=()
