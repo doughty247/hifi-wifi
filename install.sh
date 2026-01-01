@@ -45,10 +45,6 @@ if command -v hifi-wifi &>/dev/null; then
         sudo hifi-wifi --revert --quiet || echo "Warning: Failed to revert old patches. Proceeding anyway."
     fi
     
-    # Clean up cached network profiles to force re-measurement (fixes stuck low speeds)
-    echo "Clearing cached network profiles..."
-    sudo rm -rf /var/lib/wifi_patch/networks/* 2>/dev/null || true
-    
     # Restore network connections
     echo "Restoring network connections..."
     sudo cp -r "$NM_BACKUP_DIR/"* /etc/NetworkManager/system-connections/ 2>/dev/null || true

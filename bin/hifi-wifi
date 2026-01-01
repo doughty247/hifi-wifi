@@ -37,7 +37,6 @@ NO_COLOR=0
 DRY_RUN=0
 SHOW_STATUS=0
 LIST_BACKUPS=0
-LIST_NETWORKS=0
 VIEW_LOG=0
 FORCE_PERFORMANCE=0
 
@@ -51,7 +50,6 @@ Options:
     --revert           Revert previously applied patches
     --status           Show current patch status
     --list-backups     List available connection backups
-    --list-networks    List saved network profiles
     --view-log         View auto-optimization log
     --interface IFACE  Specify Wi-Fi interface (auto-detect if omitted)
     --no-diagnose      Skip diagnostic sections (only apply/revert)
@@ -78,7 +76,6 @@ while [[ $# -gt 0 ]]; do
         --status) SHOW_STATUS=1; shift ;;
         --force-performance) FORCE_PERFORMANCE=1; shift ;;
         --list-backups) LIST_BACKUPS=1; shift ;;
-        --list-networks) LIST_NETWORKS=1; shift ;;
         --view-log) VIEW_LOG=1; shift ;;
         --interface) 
             if [[ -z "${2:-}" ]]; then
@@ -181,12 +178,6 @@ if [[ $LIST_BACKUPS -eq 1 ]]; then
         date=$(date -r "$f")
         echo "UUID: $uuid (Backup date: $date)"
     done || echo "No backups found"
-    exit 0
-fi
-
-# Handle --list-networks
-if [[ $LIST_NETWORKS -eq 1 ]]; then
-    list_network_profiles
     exit 0
 fi
 

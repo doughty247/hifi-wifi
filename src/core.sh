@@ -219,7 +219,7 @@ function apply_patches() {
   CHANGES_MADE=()
   
   # Ensure state directories exist (fixes #4: missing directory error)
-  mkdir -p "$STATE_DIR" "$NETWORK_PROFILES_DIR" 2>/dev/null || true
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
   
   local interfaces
   mapfile -t interfaces < <(detect_all_interfaces)
