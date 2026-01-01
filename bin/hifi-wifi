@@ -207,7 +207,23 @@ fi
 # Main execution flow
 [[ $QUIET -eq 1 ]] || {
   echo "======================================"
-  echo "   Wi-Fi Diagnostic Tool (Bazzite)"
+  # Detect OS Name for display
+  OS_DISPLAY="Linux"
+  if [[ -f /etc/os-release ]]; then
+      # Run in subshell to avoid polluting global namespace and overwriting VERSION
+      OS_DISPLAY=$(source /etc/os-release 2>/dev/null; 
+          if [[ "$ID" == "steamos" ]] || [[ "${ID_LIKE:-}" =~ "steamos" ]]; then
+              echo "SteamOS"
+          elif [[ "$ID" == "bazzite" ]] || [[ "${NAME:-}" =~ "Bazzite" ]]; then
+              echo "Bazzite"
+          elif [[ -n "${NAME:-}" ]]; then
+              echo "$NAME"
+          else
+              echo "Linux"
+          fi
+      )
+  fi
+  echo "   Wi-Fi Diagnostic Tool ($OS_DISPLAY)"
   if [[ ${DRY_RUN:-0} -eq 0 ]]; then
     echo "   Log File: $LOGFILE"
   fi
@@ -284,7 +300,7 @@ if [[ $NO_DIAG -eq 0 ]]; then
 
 # --- AVAILABLE NETWORKS ---
     echo -e "\n[5] Available Wi-Fi Networks"
-    nmcli dev wifi list 2>/dev/null || echo "No Wi-Fi networks visible"
+    nmcli dev wifi list 2>/dev/null | head -n 20 || echo "No Wi-Fi networks visible"
 
 # --- CONNECTIVITY TEST ---
   echo -e "\n[6] Connectivity Test"
