@@ -207,123 +207,8 @@ function calc_stats() {
 }
 # -----------------------------------------------------------------
 
-function measure_bandwidth_active() {
-    echo "[INFO] Measuring download bandwidth using speedtest-cli..." >&2
-    
-    # Use speedtest-cli with --simple for parseable output
-    # Falls back to curl if speedtest-cli unavailable
-    if command -v speedtest-cli &>/dev/null; then
-        local result
-        result=$(timeout 60 speedtest-cli --simple 2>&1 || true)
-        
-        # Parse download speed from "Download: XXX.XX Mbit/s"
-        local download_mbps
-        download_mbps=$(echo "$result" | grep "Download:" | awk '{print $2}' | awk '{printf "%.0f", $1}')
-        
-        if [[ -n "$download_mbps" && "$download_mbps" -gt 0 ]]; then
-            echo "[INFO] speedtest-cli download result: ${download_mbps} Mbit/s" >&2
-            echo "$download_mbps"
-            return 0
-        else
-            echo "[WARNING] speedtest-cli failed, falling back to curl test" >&2
-        fi
-    fi
-    
-    # Fallback: Use curl + Tele2 Speedtest
-    echo "[INFO] Measuring bandwidth using Tele2 fallback test..." >&2
-    local url="http://speedtest.tele2.net/1GB.zip"
-    local speed_bps
-    
-    speed_bps=$(curl -s -o /dev/null -w "%{speed_download}" --max-time 120 "$url" || true)
-    
-    # Check if we got a number
-    if [[ ! "$speed_bps" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        echo "[WARNING] Speed test failed (invalid output: $speed_bps)" >&2
-        return 1
-    fi
-    
-    # Convert bytes/sec to bits/sec
-    local speed_bits
-    speed_bits=$(echo "$speed_bps * 8" | bc 2>/dev/null | awk '{printf "%.0f", $1}')
-    
-    if [[ -z "$speed_bits" || "$speed_bits" == "0" ]]; then
-         echo "[WARNING] Speed test returned 0." >&2
-         return 1
-    fi
-    
-    echo "[INFO] Raw download speedtest result: $speed_bits bits/sec" >&2
-    
-    # Convert to Mbit/s for return
-    local speed_mbit
-    speed_mbit=$(echo "scale=0; $speed_bits / 1000000" | bc)
-    
-    echo "$speed_mbit"
-    return 0
-}
-
-function measure_upload_bandwidth() {
-    echo "[INFO] Measuring upload bandwidth using speedtest-cli..." >&2
-    
-    # Use speedtest-cli with --simple for parseable output
-    # Falls back to curl if speedtest-cli unavailable
-    if command -v speedtest-cli &>/dev/null; then
-        local result
-        result=$(timeout 60 speedtest-cli --simple 2>&1 || true)
-        
-        # Parse upload speed from "Upload: XXX.XX Mbit/s"
-        local upload_mbps
-        upload_mbps=$(echo "$result" | grep "Upload:" | awk '{print $2}' | awk '{printf "%.0f", $1}')
-        
-        if [[ -n "$upload_mbps" && "$upload_mbps" -gt 0 ]]; then
-            echo "[INFO] speedtest-cli upload result: ${upload_mbps} Mbit/s" >&2
-            echo "$upload_mbps"
-            return 0
-        else
-            echo "[WARNING] speedtest-cli failed, falling back to curl test" >&2
-        fi
-    fi
-    
-    # Fallback: Use curl + Tele2
-    echo "[INFO] Measuring upload bandwidth (200MB test to Tele2)..." >&2
-    
-    # Create 200MB of zero data for upload test
-    # At 50Mbps (6.25MB/s), 200MB takes ~32 seconds
-    local upload_file="/tmp/hifi-upload-test.bin"
-    dd if=/dev/zero of="$upload_file" bs=1M count=200 2>/dev/null
-    
-    # Upload to Tele2 speed test endpoint
-    local url="http://speedtest.tele2.net/upload.php"
-    local speed_bps
-    
-    # -w "%{speed_upload}" gives bytes/sec for upload
-    speed_bps=$(curl -s -o /dev/null -w "%{speed_upload}" --max-time 120 -F "file=@${upload_file}" "$url" || true)
-    
-    rm -f "$upload_file"
-    
-    # Check if we got a number
-    if [[ ! "$speed_bps" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        echo "[WARNING] Upload speed test failed (invalid output: $speed_bps)" >&2
-        return 1
-    fi
-    
-    # Convert bytes/sec to bits/sec
-    local speed_bits
-    speed_bits=$(echo "$speed_bps * 8" | bc 2>/dev/null | awk '{printf "%.0f", $1}')
-    
-    if [[ -z "$speed_bits" || "$speed_bits" == "0" ]]; then
-         echo "[WARNING] Upload speed test returned 0." >&2
-         return 1
-    fi
-    
-    echo "[INFO] Raw upload speedtest result: $speed_bits bits/sec" >&2
-    
-    # Convert to Mbit/s for return
-    local speed_mbit
-    speed_mbit=$(echo "scale=0; $speed_bits / 1000000" | bc)
-    
-    echo "$speed_mbit"
-    return 0
-}
+# Bandwidth measurement functions removed in favor of Link Statistics (v1.3.0)
+# User feedback indicates Link Statistics are more reliable and faster than speedtests.
 
 function apply_patches() {
   log_info "Applying enhanced Wi-Fi optimizations..."
@@ -534,24 +419,11 @@ EOF
   # --- Global Setup ---
   
   # Measure Internet Bandwidth ONCE for all interfaces
-  log_info "Measuring internet connection speed (for bufferbloat protection)..."
+  # REPLACED with Link Statistics (v1.3.0)
+  log_info "Using Link Statistics for bandwidth estimation (faster/more reliable)..."
   local global_download_speed=0
   local global_upload_speed=0
   
-  if global_download_speed=$(measure_bandwidth_active); then
-      log_success "Internet Download Speed: ${global_download_speed}Mbit/s"
-  else
-      log_warning "Internet speed test failed, will rely on link speed"
-      global_download_speed=0
-  fi
-  
-  if global_upload_speed=$(measure_upload_bandwidth); then
-      log_success "Internet Upload Speed: ${global_upload_speed}Mbit/s"
-  else
-      log_warning "Internet upload test failed, will rely on defaults"
-      global_upload_speed=0
-  fi
-
   # Only create rtw89 config if that driver is actually in use
   if [[ "$DRIVER_CATEGORY" == "rtw89" ]]; then
     create_tracked_file /etc/modprobe.d/rtw89_advanced.conf << 'EOF'
@@ -643,19 +515,9 @@ EOF
       if [[ -n "$link_speed" && "$link_speed" -gt 0 ]]; then
           local link_limit=$((link_speed * overhead_percent / 100))
           
-          if [[ "$global_download_speed" -gt 0 ]]; then
-              # Use min(Link, Internet)
-              if [[ "$link_limit" -lt "$global_download_speed" ]]; then
-                  bandwidth_limit="$link_limit"
-                  log_info "Using Link Speed limit: ${bandwidth_limit}Mbit/s (Link: ${link_speed}Mbit/s)"
-              else
-                  bandwidth_limit="$global_download_speed"
-                  log_info "Using Internet Speed limit: ${bandwidth_limit}Mbit/s (Internet: ${global_download_speed}Mbit/s)"
-              fi
-          else
-              bandwidth_limit="$link_limit"
-              log_info "Using Link Speed limit: ${bandwidth_limit}Mbit/s (No internet test)"
-          fi
+          # Always use Link Speed (v1.3.0 change)
+          bandwidth_limit="$link_limit"
+          log_info "Using Link Speed limit: ${bandwidth_limit}Mbit/s (Link: ${link_speed}Mbit/s)"
       else
           bandwidth_limit="200" # Default
           log_warning "Could not detect link speed, using default ${bandwidth_limit}Mbit/s"
@@ -665,12 +527,8 @@ EOF
       local bandwidth="${bandwidth_limit}mbit"
       
       # Calculate Upload Limit
-      local upload_limit
-      if [[ "$global_upload_speed" -gt 0 ]]; then
-          upload_limit=$((global_upload_speed * 95 / 100))
-      else
-          upload_limit=50 # Default
-      fi
+      # Use the same link-based limit for upload (symmetric assumption or TX rate)
+      local upload_limit="$bandwidth_limit"
       [[ $upload_limit -lt 1 ]] && upload_limit=1
       local upload_bandwidth="${upload_limit}mbit"
       

@@ -165,7 +165,6 @@ function install_dependencies() {
         ["iwd"]="iwd"
         ["bc"]="bc"
         ["curl"]="curl"
-        ["speedtest-cli"]="speedtest-cli"
     )
     
     local packages=()
@@ -246,7 +245,7 @@ function install_dependencies() {
 # Check for required commands
 function check_dependencies() {
     local missing_deps=()
-    local required_cmds=("ip" "nmcli" "iw" "tc" "ethtool" "sysctl" "bc" "speedtest-cli")
+    local required_cmds=("ip" "nmcli" "iw" "tc" "ethtool" "sysctl" "bc")
     
     for cmd in "${required_cmds[@]}"; do
         if ! command -v "$cmd" &>/dev/null; then
