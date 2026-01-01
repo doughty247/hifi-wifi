@@ -298,16 +298,14 @@ if [[ $NO_DIAG -eq 0 ]]; then
     echo -e "\n[4] Current Wi-Fi Connection"
     nmcli -t -f active,ssid,device dev wifi 2>/dev/null | grep yes || echo "Not connected to any Wi-Fi"
 
-# --- AVAILABLE NETWORKS ---
-    echo -e "\n[5] Available Wi-Fi Networks"
-    nmcli dev wifi list 2>/dev/null | head -n 20 || echo "No Wi-Fi networks visible"
+
 
 # --- CONNECTIVITY TEST ---
-  echo -e "\n[6] Connectivity Test"
+  echo -e "\n[5] Connectivity Test"
   ping -c 4 8.8.8.8 2>/dev/null || echo "Ping to 8.8.8.8 failed"
   ping -c 4 google.com 2>/dev/null || echo "DNS resolution or connectivity issue"
 
-  echo -e "\n[6b] Bufferbloat Test"
+  echo -e "\n[5b] Bufferbloat Test"
   echo "[INFO] Testing latency under load (bufferbloat check)..."
   # Simple bufferbloat test: measure latency while generating load
   IFACE_TEST=$(detect_interface || echo "")
@@ -328,7 +326,7 @@ if [[ $NO_DIAG -eq 0 ]]; then
     tc qdisc show dev "$IFACE_TEST" 2>/dev/null | head -1
   fi
 
-  echo -e "\n[6c] Link Statistics"
+  echo -e "\n[5c] Link Statistics"
   IFACE_SHOW=$(detect_interface || echo "")
   if [[ -n "$IFACE_SHOW" ]]; then
     iw dev "$IFACE_SHOW" link 2>/dev/null || true
@@ -340,7 +338,7 @@ if [[ $NO_DIAG -eq 0 ]]; then
   fi
 
 # --- LOGS ---
-    echo -e "\n[7] System Logs (last 50 lines related to Wi-Fi)"
+    echo -e "\n[6] System Logs (last 50 lines related to Wi-Fi)"
     journalctl -u NetworkManager -n 50 --no-pager || echo "No NetworkManager logs"
     dmesg | grep -i wifi | tail -n 50 || echo "No dmesg Wi-Fi logs"
 fi
