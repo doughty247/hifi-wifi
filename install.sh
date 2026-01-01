@@ -120,6 +120,27 @@ fi
 
 echo "Installing hifi-wifi..."
 
+# CRITICAL: Clean up any legacy backend configs that may conflict with system settings
+# This fixes GitHub issue #5 where backend configs conflicted with SteamOS Developer Options
+echo "Checking for legacy conflicts..."
+if ls /etc/NetworkManager/conf.d/*hifi*.conf &>/dev/null 2>&1; then
+    echo "Removing conflicting hifi-wifi backend configs..."
+    sudo rm -f /etc/NetworkManager/conf.d/*hifi*.conf
+fi
+if [[ -f /etc/NetworkManager/conf.d/wifi_backend.conf ]]; then
+    echo "Removing conflicting wifi_backend.conf..."
+    sudo rm -f /etc/NetworkManager/conf.d/wifi_backend.conf
+fi
+if [[ -f /etc/NetworkManager/conf.d/iwd.conf ]]; then
+    echo "Removing conflicting iwd.conf..."
+    sudo rm -f /etc/NetworkManager/conf.d/iwd.conf
+fi
+# Unmask wpa_supplicant if it was masked by a previous version
+if systemctl is-enabled wpa_supplicant.service 2>&1 | grep -q "masked"; then
+    echo "Unmasking wpa_supplicant..."
+    sudo systemctl unmask wpa_supplicant.service 2>/dev/null || true
+fi
+
 # Create directories
 sudo mkdir -p "$SHARE_DIR/src"
 sudo mkdir -p "$SHARE_DIR/config"

@@ -8,3 +8,5 @@
 
 # Runtime data (if any ends up here)
 *.flag
+
+/tests/*

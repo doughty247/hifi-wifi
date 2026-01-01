@@ -8,7 +8,7 @@ hifi-wifi is a network optimization tool specifically targeting SteamOS and Bazz
 *   **Network Profiling**: Detects and profiles networks individually. Settings are saved and reapplied on reconnection.
 *   **Power Management**: Automatically switches between performance mode (AC) and power-saving mode (Battery) on supported devices.
 *   **Hardware Support**: Optimizes settings for Realtek, MediaTek, Intel, Atheros, Broadcom, and Marvell chipsets.
-*   **Backend Switching**: Automatically switches to `iwd` (iNet Wireless Daemon) for improved roaming and connection speed on supported systems.
+*   **iwd Optimization**: If iwd is active on your system, applies optimized roaming and scanning settings.
 
 ## System Requirements
 
@@ -72,7 +72,7 @@ sudo hifi-wifi --status
 | `--view-log` | View auto-optimization log. |
 | `--interface <IFACE>` | Specify Wi-Fi interface (auto-detect if omitted). |
 | `--no-diagnose` | Skip diagnostic sections (only apply/revert). |
-| `--no-iwd` | Do not switch backend to `iwd`. |
+| `--use-iwd` | Switch backend to `iwd` (advanced: faster roaming, may break some hardware). |
 | `--force-performance` | Disable power-saving even on battery (prevents jitter). |
 | `--dry-run` | Show what would be changed without making changes. |
 | `--quiet` | Minimal output. |
@@ -98,15 +98,14 @@ When connecting to a network, the tool:
     *   **Battery**: Power saving enabled.
     *   **Forced Performance**: Use `--force-performance` to disable power saving on battery.
 
-### Wi-Fi Backend (iwd)
+### Wi-Fi Backend
 
-On Bazzite and SteamOS, the script defaults to using `iwd` as the Wi-Fi backend for NetworkManager. This provides faster connection times and better roaming.
+hifi-wifi does **not** change your WiFi backend. Use your OS tools instead:
 
-To opt-out on Bazzite and stay on `wpa_supplicant`:
+*   **SteamOS**: Developer Options → "Force WPA Supplicant WiFi backend" (iwd is default)
+*   **Bazzite**: Run `ujust toggle-iwd` to switch between wpa_supplicant and iwd
 
-```bash
-sudo hifi-wifi --apply --no-iwd
-```
+If iwd is already active on your system, hifi-wifi will automatically apply iwd-specific optimizations.
 
 ## Supported Systems
 

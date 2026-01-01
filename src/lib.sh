@@ -1,7 +1,12 @@
 #!/bin/bash
 # Common functions and variables for hifi-wifi
 
-VERSION="1.2.0"
+VERSION="1.3.0"
+
+# Ensure homebrew binaries are in PATH (needed when running with sudo)
+if [[ -d "/home/linuxbrew/.linuxbrew/bin" ]] && [[ ":$PATH:" != *":/home/linuxbrew/.linuxbrew/bin:"* ]]; then
+    export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
+fi
 
 # Configuration constants
 STATE_DIR="/var/lib/wifi_patch"
@@ -9,15 +14,8 @@ LOGFILE="$STATE_DIR/auto-optimize.log"
 BACKUP_PREFIX="$STATE_DIR/backup"
 STATE_FLAG="$STATE_DIR/applied.flag"
 FORCE_PERF_FLAG="$STATE_DIR/force_performance"
-NETWORK_PROFILES_DIR="$STATE_DIR/networks"
 DEFAULT_BANDWIDTH="200mbit"
 MIN_KERNEL_VERSION="5.15"
-
-# Tiered expiry system based on connection frequency
-EXPIRY_DAILY=180      # 6 months for networks used 5-7x per week
-EXPIRY_REGULAR=90     # 3 months for networks used 2-4x per week
-EXPIRY_OCCASIONAL=30  # 1 month for networks used <2x per week
-EXPIRY_NEW=90         # Default for new networks (3 months)
 
 # Color codes (disable with --no-color)
 RED='\033[0;31m'
@@ -41,6 +39,57 @@ function log_warning() {
 
 function log_error() {
     [[ ${NO_COLOR:-0} -eq 1 ]] && echo "[ERROR] $*" >&2 || echo -e "${RED}[ERROR]${NC} $*" >&2
+}
+
+# Check if network is idle, abort with clear message if busy
+function check_network_idle_or_abort() {
+  local ifc="$1"
+  local threshold_kbps=300  # Consider busy if >300 KB/s traffic
+  
+  log_info "Checking network activity..."
+  
+  local rx1 tx1 rx2 tx2 rx_rate tx_rate total_rate
+  rx1=$(cat "/sys/class/net/$ifc/statistics/rx_bytes" 2>/dev/null || echo 0)
+  tx1=$(cat "/sys/class/net/$ifc/statistics/tx_bytes" 2>/dev/null || echo 0)
+  sleep 2
+  rx2=$(cat "/sys/class/net/$ifc/statistics/rx_bytes" 2>/dev/null || echo 0)
+  tx2=$(cat "/sys/class/net/$ifc/statistics/tx_bytes" 2>/dev/null || echo 0)
+  
+  rx_rate=$(( (rx2 - rx1) / 2048 ))
+  tx_rate=$(( (tx2 - tx1) / 2048 ))
+  total_rate=$((rx_rate + tx_rate))
+  
+  if [[ $total_rate -gt $threshold_kbps ]]; then
+    log_error "Network activity detected (${total_rate} KB/s)"
+    log_error ""
+    log_error "Common causes:"
+    
+    # Check for common bandwidth-consuming processes
+    if pgrep -f "steam" >/dev/null 2>&1; then
+      log_error "  - Steam downloads (Steam is running)"
+    fi
+    if pgrep -f "apt-get|apt|dnf|pacman|zypper" >/dev/null 2>&1; then
+      log_error "  - System updates (package manager is running)"
+    fi
+    if pgrep -f "firefox|chrome|chromium" >/dev/null 2>&1; then
+      log_error "  - Browser downloads"
+    fi
+    
+    # Always show generic message if no specific processes found
+    if ! pgrep -f "steam|apt|dnf|firefox|chrome" >/dev/null 2>&1; then
+      log_error "  - Active downloads or updates"
+      log_error "  - Background system processes"
+    fi
+    
+    log_error ""
+    log_error "Please close applications and pause downloads, then retry."
+    log_error ""
+    
+    return 1
+  fi
+  
+  log_success "Network is idle (${total_rate} KB/s) - safe to proceed"
+  return 0
 }
 
 # Detect package manager and system type
@@ -107,6 +156,8 @@ function install_dependencies() {
         ["ethtool"]="ethtool"
         ["sysctl"]="procps-ng"
         ["iwd"]="iwd"
+        ["bc"]="bc"
+        ["curl"]="curl"
     )
     
     local packages=()
@@ -187,7 +238,7 @@ function install_dependencies() {
 # Check for required commands
 function check_dependencies() {
     local missing_deps=()
-    local required_cmds=("ip" "nmcli" "iw" "tc" "ethtool" "sysctl")
+    local required_cmds=("ip" "nmcli" "iw" "tc" "ethtool" "sysctl" "bc")
     
     for cmd in "${required_cmds[@]}"; do
         if ! command -v "$cmd" &>/dev/null; then
@@ -216,6 +267,41 @@ function check_dependencies() {
     return 0
 }
 
+# Detect the interface that is actually carrying traffic (default route)
+function detect_default_interface() {
+    # Get the interface used for the default route (this is where traffic actually flows)
+    local default_ifc
+    default_ifc=$(ip route show default 2>/dev/null | head -1 | awk '{print $5}')
+    
+    if [[ -n "$default_ifc" ]] && ip link show "$default_ifc" &>/dev/null; then
+        echo "$default_ifc"
+        return 0
+    fi
+    
+    # Fallback: try IPv6 default route
+    default_ifc=$(ip -6 route show default 2>/dev/null | head -1 | awk '{print $5}')
+    if [[ -n "$default_ifc" ]] && ip link show "$default_ifc" &>/dev/null; then
+        echo "$default_ifc"
+        return 0
+    fi
+    
+    return 1
+}
+
+# Detect interface type (wifi, ethernet, etc)
+function get_interface_type() {
+    local ifc="$1"
+    if [[ "$ifc" =~ ^wl ]]; then
+        echo "wifi"
+    elif [[ "$ifc" =~ ^(en|eth) ]]; then
+        echo "ethernet"
+    elif [[ "$ifc" =~ ^(tailscale|tun|tap) ]]; then
+        echo "vpn"
+    else
+        echo "unknown"
+    fi
+}
+
 function detect_interface() {
     if [[ -n "$INTERFACE" ]]; then
         if ip link show "$INTERFACE" &>/dev/null; then
@@ -226,11 +312,25 @@ function detect_interface() {
             return 1
         fi
     fi
-    # pick first wireless interface in state UP or DOWN
+    
+    # PRIORITY 1: Use the interface that's actually carrying traffic (default route)
+    local default_ifc
+    if default_ifc=$(detect_default_interface); then
+        local ifc_type=$(get_interface_type "$default_ifc")
+        # Skip VPN interfaces, we want the underlying connection
+        if [[ "$ifc_type" != "vpn" ]]; then
+            # Send log to stderr so it doesn't pollute the return value
+            echo "[INFO] Detected active interface: $default_ifc ($ifc_type)" >&2
+            echo "$default_ifc"
+            return 0
+        fi
+    fi
+    
+    # PRIORITY 2: Pick first wireless interface in state UP
     local ifc
     ifc=$(ip -o link show | awk -F': ' '{print $2}' | grep -E '^wl' | head -n1)
     
-    # If no wireless, look for ethernet (en* or eth*) that is UP
+    # PRIORITY 3: If no wireless, look for ethernet (en* or eth*) that is UP
     if [[ -z "$ifc" ]]; then
         ifc=$(ip -o link show | awk -F': ' '{print $2}' | grep -E '^(en|eth)' | head -n1)
     fi
@@ -329,175 +429,21 @@ function sanitize_ssid() {
     echo "$1" | tr -cd '[:alnum:]_-' | tr '[:upper:]' '[:lower:]'
 }
 
-function get_connection_frequency() {
-    local profile_file="$1"
-    [[ ! -f "$profile_file" ]] && echo "0" && return
-    
-    # Get connection count and created date
-    local connection_count=$(grep '^CONNECTION_COUNT=' "$profile_file" 2>/dev/null | cut -d= -f2)
-    local created_date=$(grep '^CREATED_DATE=' "$profile_file" 2>/dev/null | cut -d= -f2)
-    
-    connection_count=${connection_count:-1}
-    created_date=${created_date:-$(date +%s)}
-    
-    local now=$(date +%s)
-    local age_weeks=$(( (now - created_date) / 604800 ))
-    
-    # Avoid division by zero
-    [[ $age_weeks -lt 1 ]] && age_weeks=1
-    
-    # Calculate connections per week
-    local connections_per_week=$((connection_count / age_weeks))
-    echo "$connections_per_week"
-}
-
-function calculate_expiry_days() {
-    local profile_file="$1"
-    
-    if [[ ! -f "$profile_file" ]]; then
-        echo "$EXPIRY_NEW"
-        return
-    fi
-    
-    local freq=$(get_connection_frequency "$profile_file")
-    
-    # Tiered expiry based on usage frequency
-    if [[ $freq -ge 5 ]]; then
-        echo "$EXPIRY_DAILY"        # Daily use: 6 months
-    elif [[ $freq -ge 2 ]]; then
-        echo "$EXPIRY_REGULAR"      # Regular use: 3 months
-    else
-        echo "$EXPIRY_OCCASIONAL"  # Occasional use: 1 month
-    fi
-}
-
-function is_profile_expired() {
-    local profile_file="$1"
-    [[ ! -f "$profile_file" ]] && return 0  # Doesn't exist = expired
-    
-    # Check if profile has expiry date
-    if ! grep -q '^EXPIRY_DATE=' "$profile_file"; then
-        # Old profile without expiry - migrate it
-        migrate_profile "$profile_file"
-    fi
-    
-    source "$profile_file"
-    local expiry_epoch="${EXPIRY_DATE:-0}"
-    local now_epoch=$(date +%s)
-    
-    [[ $now_epoch -gt $expiry_epoch ]]
-}
-
-function migrate_profile() {
-    local profile_file="$1"
-    [[ ! -f "$profile_file" ]] && return
-    
-    # Add creation and expiry dates to old profiles
-    if ! grep -q '^CREATED_DATE=' "$profile_file"; then
-        local now_epoch=$(date +%s)
-        local expiry_days=$EXPIRY_NEW
-        local expiry_epoch=$((now_epoch + expiry_days * 86400))
-        
-        echo "CREATED_DATE=$now_epoch" >> "$profile_file"
-        echo "EXPIRY_DATE=$expiry_epoch" >> "$profile_file"
-        echo "CONNECTION_COUNT=1" >> "$profile_file"
-        log_info "Migrated profile $(basename "$profile_file") with ${expiry_days}-day expiry"
-    fi
-    
-    # Add connection count if missing
-    if ! grep -q '^CONNECTION_COUNT=' "$profile_file"; then
-        echo "CONNECTION_COUNT=1" >> "$profile_file"
-    fi
-}
-
-function renew_profile() {
-    local profile_file="$1"
-    [[ ! -f "$profile_file" ]] && return 1
-    
-    # Increment connection count
-    local count=$(grep '^CONNECTION_COUNT=' "$profile_file" 2>/dev/null | cut -d= -f2)
-    count=${count:-0}
-    count=$((count + 1))
-    
-    if grep -q '^CONNECTION_COUNT=' "$profile_file"; then
-        sed -i "s/^CONNECTION_COUNT=.*/CONNECTION_COUNT=$count/" "$profile_file"
-    else
-        echo "CONNECTION_COUNT=$count" >> "$profile_file"
-    fi
-    
-    # Calculate new expiry based on connection frequency
-    local expiry_days=$(calculate_expiry_days "$profile_file")
-    local now_epoch=$(date +%s)
-    local expiry_epoch=$((now_epoch + expiry_days * 86400))
-    
-    # Update expiry date in file
-    if grep -q '^EXPIRY_DATE=' "$profile_file"; then
-        sed -i "s/^EXPIRY_DATE=.*/EXPIRY_DATE=$expiry_epoch/" "$profile_file"
-    else
-        echo "EXPIRY_DATE=$expiry_epoch" >> "$profile_file"
-    fi
-    
-    # Log the tier if verbose
-    local freq=$(get_connection_frequency "$profile_file")
-    log_info "Renewed profile: ${count} connections, ${freq}/week frequency, ${expiry_days}-day expiry"
-    
-    return 0
-}
-
-function get_network_profile() {
-    local ssid="$1"
-    local safe_name
-    safe_name=$(sanitize_ssid "$ssid")
-    echo "$NETWORK_PROFILES_DIR/${safe_name}.conf"
-}
-
-function load_network_profile() {
-    local ssid="$1"
-    local profile
-    profile=$(get_network_profile "$ssid")
-    
-    if [[ -f "$profile" ]]; then
-        source "$profile"
-        # Check if expired
-        if is_profile_expired "$profile"; then
-            log_info "Profile for $ssid has expired. Re-evaluating..."
-            return 1
-        fi
-        # Renew profile on successful load (active use)
-        renew_profile "$profile"
-        return 0
-    fi
-    return 1
-}
-
-function save_network_profile() {
-    local ssid="$1"
-    local bandwidth="$2"
-    local power_mode="${3:-auto}"  # auto, always-off, always-on
-    local profile
-    profile=$(get_network_profile "$ssid")
-    
-    local now_epoch=$(date +%s)
-    local expiry_days=$EXPIRY_NEW
-    local expiry_epoch=$((now_epoch + expiry_days * 86400))
-    
-    cat > "$profile" << EOF
-# Network profile for: $ssid
-# Generated: $(date)
-# Expires: $(date -d "@$expiry_epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r $expiry_epoch '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "in ${expiry_days} days")
-# Expiry tier: New network (will adjust based on usage frequency)
-SSID="$ssid"
-BANDWIDTH="$bandwidth"
-POWER_MODE="$power_mode"
-CREATED_DATE=$now_epoch
-EXPIRY_DATE=$expiry_epoch
-CONNECTION_COUNT=1
-EOF
-    log_success "Saved profile for network: $ssid (expires in $expiry_days days, adjusts with usage)"
-}
+# NOTE: Network profile caching removed in v1.3.0
+# Link Statistics are instant and always accurate, so we measure fresh on every connection.
+# CAKE always gets the correct bandwidth limit - no stale data possible.
 
 function enable_iwd() {
-    log_info "Checking for iwd..."
+    log_info "Switching to iwd backend (--use-iwd was specified)..."
+    
+    # Warn SteamOS users about potential Developer Options conflict
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        if [[ "$ID" == "steamos" ]] || [[ "${ID_LIKE:-}" =~ "steamos" ]]; then
+            log_warning "SteamOS detected! iwd may conflict with Developer Options."
+            log_warning "If WiFi breaks, disable 'Force WPA Supplicant' in Developer Options."
+        fi
+    fi
     
     # Check for iwd presence
     local iwd_installed=false
@@ -656,4 +602,11 @@ function detect_wifi_hardware() {
         log_warning "Could not auto-detect Wi-Fi driver"
         return 1
     fi
+}
+
+# Detect all active network interfaces (Ethernet and Wi-Fi)
+function detect_all_interfaces() {
+    # Find all interfaces that are UP and not loopback/vpn
+    # We look for 'state UP' in ip link output
+    ip -o link show up | awk -F': ' '{print $2}' | grep -E '^(en|eth|wl)' | sort -u
 }

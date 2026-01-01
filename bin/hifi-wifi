@@ -37,9 +37,7 @@ NO_COLOR=0
 DRY_RUN=0
 SHOW_STATUS=0
 LIST_BACKUPS=0
-LIST_NETWORKS=0
 VIEW_LOG=0
-NO_IWD=0
 FORCE_PERFORMANCE=0
 
 function usage() {
@@ -52,11 +50,10 @@ Options:
     --revert           Revert previously applied patches
     --status           Show current patch status
     --list-backups     List available connection backups
-    --list-networks    List saved network profiles
     --view-log         View auto-optimization log
     --interface IFACE  Specify Wi-Fi interface (auto-detect if omitted)
     --no-diagnose      Skip diagnostic sections (only apply/revert)
-    --no-iwd           Do not switch backend to iwd (keep wpa_supplicant)
+
     --force-performance Disable power-saving even on battery (prevents jitter)
     --dry-run          Show what would be changed without making changes
     --quiet            Minimal output (log still captures full detail)
@@ -77,10 +74,8 @@ while [[ $# -gt 0 ]]; do
         --apply) APPLY=1; shift ;;
         --revert) REVERT=1; shift ;;
         --status) SHOW_STATUS=1; shift ;;
-        --no-iwd) NO_IWD=1; shift ;;
         --force-performance) FORCE_PERFORMANCE=1; shift ;;
         --list-backups) LIST_BACKUPS=1; shift ;;
-        --list-networks) LIST_NETWORKS=1; shift ;;
         --view-log) VIEW_LOG=1; shift ;;
         --interface) 
             if [[ -z "${2:-}" ]]; then
@@ -186,12 +181,6 @@ if [[ $LIST_BACKUPS -eq 1 ]]; then
     exit 0
 fi
 
-# Handle --list-networks
-if [[ $LIST_NETWORKS -eq 1 ]]; then
-    list_network_profiles
-    exit 0
-fi
-
 # Handle --view-log
 if [[ $VIEW_LOG -eq 1 ]]; then
     LOGFILE="$STATE_DIR/auto-optimize.log"
@@ -209,7 +198,23 @@ fi
 # Main execution flow
 [[ $QUIET -eq 1 ]] || {
   echo "======================================"
-  echo "   Wi-Fi Diagnostic Tool (Bazzite)"
+  # Detect OS Name for display
+  OS_DISPLAY="Linux"
+  if [[ -f /etc/os-release ]]; then
+      # Run in subshell to avoid polluting global namespace and overwriting VERSION
+      OS_DISPLAY=$(source /etc/os-release 2>/dev/null; 
+          if [[ "$ID" == "steamos" ]] || [[ "${ID_LIKE:-}" =~ "steamos" ]]; then
+              echo "SteamOS"
+          elif [[ "$ID" == "bazzite" ]] || [[ "${NAME:-}" =~ "Bazzite" ]]; then
+              echo "Bazzite"
+          elif [[ -n "${NAME:-}" ]]; then
+              echo "$NAME"
+          else
+              echo "Linux"
+          fi
+      )
+  fi
+  echo "   Wi-Fi Diagnostic Tool ($OS_DISPLAY)"
   if [[ ${DRY_RUN:-0} -eq 0 ]]; then
     echo "   Log File: $LOGFILE"
   fi
@@ -284,16 +289,14 @@ if [[ $NO_DIAG -eq 0 ]]; then
     echo -e "\n[4] Current Wi-Fi Connection"
     nmcli -t -f active,ssid,device dev wifi 2>/dev/null | grep yes || echo "Not connected to any Wi-Fi"
 
-# --- AVAILABLE NETWORKS ---
-    echo -e "\n[5] Available Wi-Fi Networks"
-    nmcli dev wifi list 2>/dev/null || echo "No Wi-Fi networks visible"
+
 
 # --- CONNECTIVITY TEST ---
-  echo -e "\n[6] Connectivity Test"
+  echo -e "\n[5] Connectivity Test"
   ping -c 4 8.8.8.8 2>/dev/null || echo "Ping to 8.8.8.8 failed"
   ping -c 4 google.com 2>/dev/null || echo "DNS resolution or connectivity issue"
 
-  echo -e "\n[6b] Bufferbloat Test"
+  echo -e "\n[5b] Bufferbloat Test"
   echo "[INFO] Testing latency under load (bufferbloat check)..."
   # Simple bufferbloat test: measure latency while generating load
   IFACE_TEST=$(detect_interface || echo "")
@@ -314,7 +317,7 @@ if [[ $NO_DIAG -eq 0 ]]; then
     tc qdisc show dev "$IFACE_TEST" 2>/dev/null | head -1
   fi
 
-  echo -e "\n[6c] Link Statistics"
+  echo -e "\n[5c] Link Statistics"
   IFACE_SHOW=$(detect_interface || echo "")
   if [[ -n "$IFACE_SHOW" ]]; then
     iw dev "$IFACE_SHOW" link 2>/dev/null || true
@@ -326,7 +329,7 @@ if [[ $NO_DIAG -eq 0 ]]; then
   fi
 
 # --- LOGS ---
-    echo -e "\n[7] System Logs (last 50 lines related to Wi-Fi)"
+    echo -e "\n[6] System Logs (last 50 lines related to Wi-Fi)"
     journalctl -u NetworkManager -n 50 --no-pager || echo "No NetworkManager logs"
     dmesg | grep -i wifi | tail -n 50 || echo "No dmesg Wi-Fi logs"
 fi
