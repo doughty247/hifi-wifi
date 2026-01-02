@@ -443,26 +443,12 @@ EOF
       modprobe ifb numifbs=4 2>/dev/null || log_warning "Could not load IFB module"
   fi
 
-  # Create dynamic systemd service for CAKE
-  create_tracked_file /etc/systemd/system/wifi-cake-qdisc@.service <<EOF
-[Unit]
-Description=Apply CAKE qdisc to %I for bufferbloat control
-After=network-online.target sys-subsystem-net-devices-%i.device
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'bw=\$(cat /var/lib/wifi_patch/bandwidth_%I.txt 2>/dev/null || echo 200mbit); up_bw=\$(cat /var/lib/wifi_patch/upload_bandwidth_%I.txt 2>/dev/null || echo 50mbit); tc qdisc replace dev %I root cake bandwidth \${up_bw} diffserv4 dual-dsthost nat wash ack-filter 2>/dev/null || tc qdisc replace dev %I root fq_codel'
-ExecStop=/bin/sh -c 'test -d /sys/class/net/%I && tc qdisc del dev %I root 2>/dev/null || true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  track_change "SYSTEMD_SERVICE" "wifi-cake-qdisc@.service"
+  # NOTE: wifi-cake-qdisc@.service REMOVED in v1.3.0
+  # The systemd service caused race conditions with the dispatcher.
+  # The dispatcher (99-wifi-auto-optimize) is now the single source of truth
+  # for applying CAKE on connection events.
 
   # --- Per-Interface Loop ---
-  local ifb_index=0
   for ifc in "${interfaces[@]}"; do
       log_info "--- Configuring interface: $ifc ---"
       
@@ -532,34 +518,14 @@ EOF
       [[ $upload_limit -lt 1 ]] && upload_limit=1
       local upload_bandwidth="${upload_limit}mbit"
       
-      # Save for Systemd Service
-      echo "$bandwidth" > "$STATE_DIR/bandwidth_${ifc}.txt"
-      echo "$upload_bandwidth" > "$STATE_DIR/upload_bandwidth_${ifc}.txt"
-      
-      # Apply CAKE (Upload)
+      # Apply CAKE (egress only - ingress shaping via IFB removed in v1.3.0)
+      # CAKE on egress handles bufferbloat; download shaping is less critical
       if tc qdisc replace dev "$ifc" root cake bandwidth "$upload_bandwidth" diffserv4 dual-dsthost nat wash ack-filter 2>/dev/null; then
           track_change "TC_QDISC" "$ifc"
-          log_success "Applied CAKE on $ifc (Up: $upload_bandwidth)"
+          log_success "Applied CAKE on $ifc (bandwidth: $upload_bandwidth)"
+      else
+          log_warning "Failed to apply CAKE on $ifc"
       fi
-      
-      # Apply CAKE (Download via IFB)
-      local ifb_dev="ifb$ifb_index"
-      if ip link show "$ifb_dev" &>/dev/null; then
-          ip link set dev "$ifb_dev" up 2>/dev/null
-          tc qdisc del dev "$ifc" ingress 2>/dev/null || true
-          if tc qdisc add dev "$ifc" handle ffff: ingress 2>/dev/null && \
-             tc filter add dev "$ifc" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$ifb_dev" 2>/dev/null; then
-              if tc qdisc replace dev "$ifb_dev" root cake bandwidth "$bandwidth" diffserv4 dual-srchost nat nowash ingress 2>/dev/null; then
-                  track_change "TC_QDISC_IFB" "$ifb_dev"
-                  log_success "Applied download CAKE on $ifc via $ifb_dev (Down: $bandwidth)"
-              fi
-          fi
-      fi
-      ((ifb_index++))
-      
-      # Enable Service
-      systemctl enable "wifi-cake-qdisc@${ifc}.service" 2>/dev/null || true
-      track_change "SYSTEMD_SERVICE" "wifi-cake-qdisc@${ifc}.service"
       
       ethtool -K "$ifc" tso off gso off gro on 2>/dev/null || true
       
@@ -792,19 +758,25 @@ function revert_patches() {
   ifc=$(detect_interface) || true
   if [[ -n "$ifc" ]]; then
     tc qdisc del dev "$ifc" root 2>/dev/null || true
+    tc qdisc del dev "$ifc" ingress 2>/dev/null || true
     log_info "Removed CAKE/fq_codel from $ifc"
     # Reset ethtool settings to defaults
     ethtool -K "$ifc" tso on gso on gro on 2>/dev/null || true
-    
-    # Disable and remove systemd service for CAKE
-    if systemctl is-enabled "wifi-cake-qdisc@${ifc}.service" &>/dev/null; then
-      systemctl disable "wifi-cake-qdisc@${ifc}.service" 2>/dev/null || true
-      log_info "Disabled CAKE systemd service"
-    fi
   fi
   
-  # Remove systemd service files
+  # Clean up IFB interfaces
+  for ifb_dev in ifb0 ifb1 ifb2 ifb3; do
+    tc qdisc del dev "$ifb_dev" root 2>/dev/null || true
+  done
+  
+  # Disable and remove ALL systemd CAKE services (any interface)
+  systemctl stop 'wifi-cake-qdisc@*.service' 2>/dev/null || true
+  systemctl disable 'wifi-cake-qdisc@*.service' 2>/dev/null || true
   rm -f /etc/systemd/system/wifi-cake-qdisc@.service || true
+  
+  # Remove stale bandwidth files (no longer used)
+  rm -f "$STATE_DIR"/bandwidth_*.txt 2>/dev/null || true
+  rm -f "$STATE_DIR"/upload_bandwidth_*.txt 2>/dev/null || true
   
   # Disable and remove verification service
   if systemctl is-enabled wifi-optimizations-verify.service &>/dev/null; then

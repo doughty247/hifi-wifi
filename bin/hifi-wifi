@@ -126,44 +126,100 @@ check_dependencies || exit 1
 
 # Handle --status flag
 if [[ $SHOW_STATUS -eq 1 ]]; then
-    echo "======================================"
-    echo "   Patch Status"
-    echo "======================================"
-    if [[ -f "$STATE_FLAG" ]]; then
-        log_success "Patches are currently APPLIED"
-        echo "Applied on: $(date -r "$STATE_FLAG")"
-    else
-        echo "Patches are NOT applied"
-    fi
+    # Colors
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    CYAN='\033[0;36m'
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    NC='\033[0m' # No Color
     
     echo ""
-    echo "Active Optimizations:"
-    if lsmod | grep -q rtw89_8852be; then
-        echo "  [+] rtw89_8852be module loaded"
-    fi
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}       hifi-wifi v${VERSION} Status${NC}"
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════${NC}"
+    echo ""
     
-    ifc=$(detect_interface 2>/dev/null)
-    if [[ -n "$ifc" ]]; then
-        if tc qdisc show dev "$ifc" | grep -q "cake"; then
-            echo "  [+] CAKE qdisc active on $ifc"
-        else
-            echo "  [-] CAKE qdisc NOT active on $ifc"
-        fi
-        
-        if iw dev "$ifc" get power_save 2>/dev/null | grep -q "on"; then
-            echo "  [-] Power save is ON (should be off for performance)"
-        else
-            echo "  [+] Power save is OFF (performance mode)"
-        fi
+    # Patch Status
+    if [[ -f "$STATE_FLAG" ]]; then
+        echo -e "${BOLD}Status:${NC}      ${GREEN}[APPLIED]${NC}"
+        echo -e "${DIM}Applied:${NC}     $(date -r "$STATE_FLAG" '+%Y-%m-%d %H:%M:%S')"
+    else
+        echo -e "${BOLD}Status:${NC}      ${RED}[NOT APPLIED]${NC}"
     fi
+    echo ""
     
+    # Dispatcher
+    echo -e "${BOLD}${BLUE}┌─ Dispatcher${NC}"
     if [[ -f /etc/NetworkManager/dispatcher.d/99-wifi-auto-optimize ]]; then
-        echo "  [+] Auto-optimization dispatcher installed"
+        echo -e "${BLUE}│${NC}  ${GREEN}[OK]${NC} Auto-optimization dispatcher installed"
+    else
+        echo -e "${BLUE}│${NC}  ${RED}[MISSING]${NC} Dispatcher not installed"
     fi
+    echo -e "${BLUE}└${NC}"
+    echo ""
     
+    # CAKE Status
+    echo -e "${BOLD}${BLUE}┌─ CAKE Queue Discipline${NC}"
+    for ifc in $(ip -o link show up | awk -F': ' '{print $2}' | grep -E '^(wl|en|eth)'); do
+        qdisc=$(tc qdisc show dev "$ifc" 2>/dev/null | head -1)
+        if echo "$qdisc" | grep -q "cake"; then
+            bw=$(echo "$qdisc" | grep -oP 'bandwidth \K[0-9]+[A-Za-z]+' || echo "unknown")
+            echo -e "${BLUE}│${NC}  ${GREEN}[ACTIVE]${NC} ${BOLD}$ifc${NC}: ${GREEN}$bw${NC}"
+        else
+            echo -e "${BLUE}│${NC}  ${RED}[INACTIVE]${NC} ${BOLD}$ifc${NC}"
+        fi
+    done
+    echo -e "${BLUE}└${NC}"
+    echo ""
+    
+    # Power Save
+    echo -e "${BOLD}${BLUE}┌─ Wi-Fi Power Management${NC}"
+    wifi_found=false
+    for ifc in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
+        wifi_found=true
+        ps_status=$(iw dev "$ifc" get power_save 2>/dev/null | awk '{print $NF}')
+        if [[ "$ps_status" == "off" ]]; then
+            echo -e "${BLUE}│${NC}  ${GREEN}[OFF]${NC} ${BOLD}$ifc${NC}: Performance mode"
+        elif [[ "$ps_status" == "on" ]]; then
+            echo -e "${BLUE}│${NC}  ${YELLOW}[ON]${NC} ${BOLD}$ifc${NC}: Power saving (not optimal)"
+        fi
+    done
+    [[ "$wifi_found" == "false" ]] && echo -e "${BLUE}│${NC}  ${DIM}No Wi-Fi interfaces detected${NC}"
+    echo -e "${BLUE}└${NC}"
+    echo ""
+    
+    # Services
+    echo -e "${BOLD}${BLUE}┌─ Services${NC}"
     if systemctl is-enabled wifi-optimizations-verify.service &>/dev/null; then
-        echo "  [+] Update verification service enabled"
+        echo -e "${BLUE}│${NC}  ${GREEN}[ENABLED]${NC} Update verification service"
+    else
+        echo -e "${BLUE}│${NC}  ${DIM}[DISABLED]${NC} Update verification service"
     fi
+    echo -e "${BLUE}└${NC}"
+    echo ""
+    
+    # Recent Activity
+    echo -e "${BOLD}${BLUE}┌─ Recent Activity${NC}"
+    LOGFILE="$STATE_DIR/auto-optimize.log"
+    if [[ -f "$LOGFILE" ]]; then
+        tail -n 6 "$LOGFILE" | while read line; do
+            # Extract timestamp and message
+            ts=$(echo "$line" | grep -oP '^\[\K[^\]]+' || true)
+            msg=$(echo "$line" | sed 's/^\[[^]]*\] //')
+            if [[ -n "$ts" ]]; then
+                echo -e "${BLUE}│${NC}  ${DIM}$ts${NC}  $msg"
+            else
+                echo -e "${BLUE}│${NC}  $line"
+            fi
+        done
+    else
+        echo -e "${BLUE}│${NC}  ${DIM}No activity log found${NC}"
+    fi
+    echo -e "${BLUE}└${NC}"
+    echo ""
     
     exit 0
 fi

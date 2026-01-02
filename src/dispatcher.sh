@@ -4,6 +4,9 @@
 #
 # v1.3.0: Simplified - always uses fresh Link Statistics (no caching/expiry)
 # CAKE always gets accurate bandwidth limits from iw/ethtool
+#
+# v1.3.0-rc2: Removed is_network_idle() check - apply CAKE immediately
+# The idle check caused 4+ second delays and conflicts with Steam auto-downloads
 
 INTERFACE="$1"
 ACTION="$2"
@@ -46,6 +49,7 @@ get_interface_type() {
 }
 
 # Get link speed using iw (Wi-Fi) or ethtool (Ethernet)
+# Returns bandwidth limit in Mbit/s
 get_link_speed() {
     local ifc="$1"
     local ifc_type=$(get_interface_type "$ifc")
@@ -53,10 +57,10 @@ get_link_speed() {
     local overhead=85
     
     if [[ "$ifc_type" == "ethernet" ]]; then
-        speed=$(ethtool "$ifc" 2>/dev/null | grep -oP 'Speed: \K[0-9]+' | head -1)
+        speed=$(timeout 2 ethtool "$ifc" 2>/dev/null | grep -oP 'Speed: \K[0-9]+' | head -1)
         overhead=95
     else
-        speed=$(iw dev "$ifc" link 2>/dev/null | grep -oP 'tx bitrate: \K[0-9]+' | head -1)
+        speed=$(timeout 2 iw dev "$ifc" link 2>/dev/null | grep -oP 'tx bitrate: \K[0-9]+' | head -1)
         overhead=85
     fi
     
@@ -69,27 +73,6 @@ get_link_speed() {
     
     echo "200"  # Default fallback
     return 1
-}
-
-# Check if network is idle
-is_network_idle() {
-    local ifc="$1"
-    local threshold_kbps=500
-    
-    local rx1=$(cat "/sys/class/net/$ifc/statistics/rx_bytes" 2>/dev/null || echo 0)
-    local tx1=$(cat "/sys/class/net/$ifc/statistics/tx_bytes" 2>/dev/null || echo 0)
-    
-    sleep 2
-    
-    local rx2=$(cat "/sys/class/net/$ifc/statistics/rx_bytes" 2>/dev/null || echo 0)
-    local tx2=$(cat "/sys/class/net/$ifc/statistics/tx_bytes" 2>/dev/null || echo 0)
-    
-    local rx_rate=$(( (rx2 - rx1) / 2048 ))
-    local tx_rate=$(( (tx2 - tx1) / 2048 ))
-    local total_rate=$((rx_rate + tx_rate))
-    
-    log "Network activity: ${total_rate} KB/s"
-    [[ $total_rate -lt $threshold_kbps ]]
 }
 
 # Determine power mode based on device type
@@ -153,24 +136,18 @@ CONNECTION_NAME=$(get_connection_name)
 
 log "Connection UP: $CONNECTION_NAME on $INTERFACE"
 
-# Wait for connection to stabilize
-sleep 2
+# Brief delay to ensure link is established and speed is accurate
+# Reduced from 2s to 1s for faster optimization
+sleep 1
 
-# Check if network is busy
-if ! is_network_idle "$INTERFACE"; then
-    log "Network busy - applying default CAKE (200mbit) to avoid interference"
-    tc qdisc del dev "$INTERFACE" root 2>/dev/null || true
-    tc qdisc add dev "$INTERFACE" root cake bandwidth 200mbit diffserv4 dual-dsthost nat wash ack-filter 2>/dev/null || true
-    exit 0
-fi
-
-# Get fresh link speed (no caching - instant with iw/ethtool)
+# Get fresh link speed (instant with iw/ethtool)
 LINK_SPEED=$(get_link_speed "$INTERFACE")
 BANDWIDTH="${LINK_SPEED}mbit"
 
 log "Link speed: ${LINK_SPEED}Mbit/s -> CAKE bandwidth: $BANDWIDTH"
 
-# Apply CAKE with accurate bandwidth
+# Apply CAKE immediately - no idle check needed
+# CAKE handles active traffic gracefully; waiting only delays protection
 tc qdisc del dev "$INTERFACE" root 2>/dev/null || true
 if tc qdisc add dev "$INTERFACE" root cake bandwidth "$BANDWIDTH" diffserv4 dual-dsthost nat wash ack-filter 2>/dev/null; then
     log "Applied CAKE on $INTERFACE: $BANDWIDTH"
