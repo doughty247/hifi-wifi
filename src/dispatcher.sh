@@ -13,6 +13,11 @@ ACTION="$2"
 
 [[ "$ACTION" == "up" ]] || exit 0
 
+# Skip loopback, VPN, and other virtual interfaces
+# Only process physical WiFi and Ethernet interfaces
+[[ "$INTERFACE" =~ ^(lo|tun|tap|veth|docker|br-|virbr|tailscale) ]] && exit 0
+[[ ! "$INTERFACE" =~ ^(wl|wlan|en|eth) ]] && exit 0
+
 STATE_DIR="/var/lib/wifi_patch"
 LOGFILE="$STATE_DIR/auto-optimize.log"
 
