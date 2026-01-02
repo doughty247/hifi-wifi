@@ -103,33 +103,39 @@ get_power_mode() {
         return
     fi
     
-    # Check for system battery (with timeout to prevent hangs)
+    # Check for SYSTEM battery only (ignore device batteries like mouse/keyboard/UPS)
+    # System batteries are typically named BAT0/BAT1 or 'battery'
     local has_battery=0
     
     if timeout 0.5 test -d /sys/class/power_supply/BAT0 2>/dev/null || \
        timeout 0.5 test -d /sys/class/power_supply/BAT1 2>/dev/null || \
        timeout 0.5 test -d /sys/class/power_supply/battery 2>/dev/null; then
         has_battery=1
-    elif [[ -f /sys/class/dmi/id/chassis_type ]]; then
-        local chassis=$(timeout 0.5 cat /sys/class/dmi/id/chassis_type 2>/dev/null || echo "0")
-        [[ "$chassis" =~ ^(8|9|10|11|14|30|31)$ ]] && has_battery=1
     fi
     
+    # If no system battery detected, this is a desktop - always performance
     if [[ $has_battery -eq 0 ]]; then
-        # Desktop - always performance
         echo "off"
         return
     fi
     
-    # Battery device - check AC status (with timeout to prevent hangs)
+    # Battery device - check AC status by power supply type (with timeout to prevent hangs)
     local ac_online=0
     
-    for ac in /sys/class/power_supply/AC*/online /sys/class/power_supply/ADP*/online; do
-        if [[ -f "$ac" ]]; then
-            local online=$(timeout 0.5 cat "$ac" 2>/dev/null || echo "0")
-            if [[ "$online" == "1" ]]; then
-                ac_online=1
-                break
+    # Check all power supplies for type="Mains" or "USB" (USB-C charging on Steam Deck/laptops)
+    for psu in /sys/class/power_supply/*; do
+        [ -d "$psu" ] || continue
+        
+        local psu_type=$(timeout 0.5 cat "$psu/type" 2>/dev/null || echo "")
+        
+        # Only check Mains and USB type power supplies (ignore Battery, UPS, etc.)
+        if [[ "$psu_type" == "Mains" ]] || [[ "$psu_type" == "USB" ]]; then
+            if [[ -f "$psu/online" ]]; then
+                local online=$(timeout 0.5 cat "$psu/online" 2>/dev/null || echo "0")
+                if [[ "$online" == "1" ]]; then
+                    ac_online=1
+                    break
+                fi
             fi
         fi
     done
