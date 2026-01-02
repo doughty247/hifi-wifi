@@ -631,10 +631,12 @@ function revert_patches() {
   rm -f /etc/modprobe.d/ralink.conf /etc/modprobe.d/marvell.conf || true
   rm -f /etc/modprobe.d/wifi_generic.conf || true
   rm -f /etc/udev/rules.d/70-wifi-powersave.rules || true
+  rm -f /etc/udev/rules.d/70-wifi-powersave-*.rules || true
   rm -f /etc/udev/rules.d/70-wifi-power-ac.rules || true
   rm -f /usr/local/bin/wifi-power-manager.sh || true
   rm -f /usr/local/bin/wifi-desktop-performance.sh || true
   rm -f /etc/NetworkManager/dispatcher.d/99-wifi-auto-optimize || true
+  rm -f /etc/NetworkManager/conf.d/99-hifi-wifi-powersave.conf || true
   rm -f /etc/sysctl.d/99-wifi-upload-opt.conf || true
   
   # Remove iwd optimization config if we created it (check if it matches our signature)
