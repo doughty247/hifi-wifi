@@ -38,7 +38,7 @@ DRY_RUN=0
 SHOW_STATUS=0
 LIST_BACKUPS=0
 VIEW_LOG=0
-FORCE_PERFORMANCE=0
+# FORCE_PERFORMANCE=0  # DEPRECATED - Broken in v1.3.0, fix scheduled for v1.4.0
 
 function usage() {
     cat <<EOF
@@ -54,7 +54,7 @@ Options:
     --interface IFACE  Specify Wi-Fi interface (auto-detect if omitted)
     --no-diagnose      Skip diagnostic sections (only apply/revert)
 
-    --force-performance Disable power-saving even on battery (prevents jitter)
+    # --force-performance Disable power-saving even on battery (prevents jitter)  # BROKEN - Fix in v1.4.0
     --dry-run          Show what would be changed without making changes
     --quiet            Minimal output (log still captures full detail)
     --no-color         Disable colored output
@@ -74,7 +74,22 @@ while [[ $# -gt 0 ]]; do
         --apply) APPLY=1; shift ;;
         --revert) REVERT=1; shift ;;
         --status) SHOW_STATUS=1; shift ;;
-        --force-performance) FORCE_PERFORMANCE=1; shift ;;
+        --force-performance)
+            echo ""
+            echo "====================================="
+            echo "  Feature Currently Unavailable"
+            echo "====================================="
+            echo ""
+            echo "The --force-performance flag is temporarily broken in v1.3.0"
+            echo "and has been disabled. A fix is scheduled for v1.4.0."
+            echo ""
+            echo "IMPORTANT: Do NOT disable Wi-Fi power management in Steam"
+            echo "Developer Options, as it may conflict with future fixes."
+            echo ""
+            echo "Apologies for the inconvenience."
+            echo ""
+            exit 1
+            ;;
         --list-backups) LIST_BACKUPS=1; shift ;;
         --view-log) VIEW_LOG=1; shift ;;
         --interface) 
@@ -205,7 +220,7 @@ if [[ $SHOW_STATUS -eq 1 ]]; then
     echo -e "${BOLD}${BLUE}┌─ Recent Activity${NC}"
     LOGFILE="$STATE_DIR/auto-optimize.log"
     if [[ -f "$LOGFILE" ]]; then
-        tail -n 6 "$LOGFILE" | while read line; do
+        while IFS= read -r line; do
             # Extract timestamp and message
             ts=$(echo "$line" | grep -oP '^\[\K[^\]]+' || true)
             msg=$(echo "$line" | sed 's/^\[[^]]*\] //')
@@ -214,7 +229,7 @@ if [[ $SHOW_STATUS -eq 1 ]]; then
             else
                 echo -e "${BLUE}│${NC}  $line"
             fi
-        done
+        done < <(tail -n 6 "$LOGFILE")
     else
         echo -e "${BLUE}│${NC}  ${DIM}No activity log found${NC}"
     fi
@@ -313,10 +328,11 @@ if [[ $APPLY -eq 1 ]]; then
         [[ $NO_DIAG -eq 1 ]] && exit 0
     else
         # Handle force performance flag
-        if [[ $FORCE_PERFORMANCE -eq 1 ]]; then
-            touch "$FORCE_PERF_FLAG"
-            log_info "Performance mode forced (power saving disabled)"
-        fi
+        # DISABLED - Feature broken, fix scheduled for v1.4.0
+        # if [[ $FORCE_PERFORMANCE -eq 1 ]]; then
+        #     touch "$FORCE_PERF_FLAG"
+        #     log_info "Performance mode forced (power saving disabled)"
+        # fi
 
         if [[ -n "$DETECTED_DRIVER" ]] || [[ -n "$DRIVER_CATEGORY" ]]; then
             log_success "Wi-Fi hardware detected - applying optimizations..."
