@@ -30,12 +30,12 @@ sudo pacman-key --populate holo
 
 ### General Installation
 
-Clone the repository and install the latest stable release, or head over to the releases page:
+Clone the repository and install the latest release candidate (v1.3.0-rc2) from the testing branch:
 
 ```bash
 git clone https://github.com/doughty247/hifi-wifi.git
 cd hifi-wifi
-git checkout $(git describe --tags --abbrev=0)
+git checkout testing
 sudo ./install.sh
 ```
 
