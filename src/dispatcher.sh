@@ -55,27 +55,42 @@ get_interface_type() {
 
 # Get link speed using iw (Wi-Fi) or ethtool (Ethernet)
 # Returns bandwidth limit in Mbit/s
+# Includes retry logic for wake-from-sleep scenarios
 get_link_speed() {
     local ifc="$1"
     local ifc_type=$(get_interface_type "$ifc")
     local speed=""
     local overhead=85
+    local max_attempts=3
+    local attempt=1
     
-    if [[ "$ifc_type" == "ethernet" ]]; then
-        speed=$(timeout 2 ethtool "$ifc" 2>/dev/null | grep -oP 'Speed: \K[0-9]+' | head -1)
-        overhead=95
-    else
-        speed=$(timeout 2 iw dev "$ifc" link 2>/dev/null | grep -oP 'tx bitrate: \K[0-9]+' | head -1)
-        overhead=85
-    fi
+    while [[ $attempt -le $max_attempts ]]; do
+        if [[ "$ifc_type" == "ethernet" ]]; then
+            speed=$(timeout 2 ethtool "$ifc" 2>/dev/null | grep -oP 'Speed: \K[0-9]+' | head -1)
+            overhead=95
+        else
+            speed=$(timeout 2 iw dev "$ifc" link 2>/dev/null | grep -oP 'tx bitrate: \K[0-9]+' | head -1)
+            overhead=85
+        fi
+        
+        # Got valid speed, calculate and return
+        if [[ -n "$speed" && "$speed" -gt 0 ]]; then
+            local limit=$((speed * overhead / 100))
+            [[ $limit -lt 1 ]] && limit=1
+            echo "$limit"
+            return 0
+        fi
+        
+        # Hardware not ready yet (common after wake from sleep)
+        if [[ $attempt -lt $max_attempts ]]; then
+            sleep 0.5
+            ((attempt++))
+        else
+            break
+        fi
+    done
     
-    if [[ -n "$speed" && "$speed" -gt 0 ]]; then
-        local limit=$((speed * overhead / 100))
-        [[ $limit -lt 1 ]] && limit=1
-        echo "$limit"
-        return 0
-    fi
-    
+    # All attempts failed, use fallback
     echo "200"  # Default fallback
     return 1
 }
