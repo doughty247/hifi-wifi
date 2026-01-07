@@ -516,6 +516,9 @@ WantedBy=multi-user.target
     info!("  Status: systemctl status hifi-wifi");
     info!("  Logs:   journalctl -u hifi-wifi -f");
     
+    // Create CLI symlink for user convenience
+    ensure_symlinks();
+    
     Ok(())
 }
 
