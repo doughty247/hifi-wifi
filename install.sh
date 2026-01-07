@@ -118,6 +118,12 @@ if [[ $EUID -ne 0 ]]; then
     RUN_AS_ROOT="sudo"
 fi
 
+# Stop existing service before upgrading (prevents "Text file busy" error)
+if systemctl is-active --quiet hifi-wifi 2>/dev/null; then
+    echo -e "${BLUE}Stopping existing hifi-wifi service for upgrade...${NC}"
+    $RUN_AS_ROOT systemctl stop hifi-wifi
+fi
+
 $RUN_AS_ROOT ./target/release/hifi-wifi install
 $RUN_AS_ROOT /var/lib/hifi-wifi/hifi-wifi apply
 
