@@ -119,7 +119,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 $RUN_AS_ROOT ./target/release/hifi-wifi install
-$RUN_AS_ROOT hifi-wifi apply
+$RUN_AS_ROOT /var/lib/hifi-wifi/hifi-wifi apply
 
 echo -e "${GREEN}Success! hifi-wifi v3.0 is installed and active.${NC}"
-echo -e "Monitor with: ${BLUE}hifi-wifi status${NC}"
+echo -e "Monitor with: ${BLUE}/var/lib/hifi-wifi/hifi-wifi status${NC}"
