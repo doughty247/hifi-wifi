@@ -33,19 +33,48 @@ fi
 if [[ "$ID" == "steamos" || "$ID_LIKE" == *"arch"* ]]; then
     # Check if 'cc' is missing
     if ! command -v cc &> /dev/null; then
-        echo -e "${RED}Linker (cc) not found.${NC}"
-        echo -e "${BLUE}On SteamOS, you need to manually prepare the system first:${NC}"
-        echo ""
-        echo -e "  1. Disable readonly: ${BLUE}sudo steamos-readonly disable${NC}"
-        echo -e "  2. Check for sysexts: ${BLUE}systemd-sysext status${NC}"
-        echo -e "  3. If sysexts loaded:  ${BLUE}sudo systemd-sysext unmerge${NC}"
-        echo -e "  4. Initialize pacman:  ${BLUE}sudo pacman-key --init${NC}"
-        echo -e "  5. Populate keys:      ${BLUE}sudo pacman-key --populate archlinux${NC}"
-        echo -e "  6. Install tools:      ${BLUE}sudo pacman -S base-devel${NC}"
-        echo -e "  7. Re-run this script: ${BLUE}sudo ./install.sh${NC}"
-        echo ""
-        echo -e "${RED}Automated installation cannot proceed due to system extensions.${NC}"
-        exit 1
+        echo -e "${BLUE}Linker (cc) not found. Preparing SteamOS for build...${NC}"
+        
+        # We need root for this
+        if [[ $EUID -ne 0 ]]; then
+            echo -e "${RED}This script must be run as root on SteamOS.${NC}"
+            echo -e "Try: ${BLUE}sudo ./install.sh${NC}"
+            exit 1
+        fi
+        
+        echo -e "${BLUE}[SteamOS] Checking for system extensions...${NC}"
+        if systemd-sysext status 2>/dev/null | grep -q "merged"; then
+            echo -e "${BLUE}[SteamOS] Unmerging system extensions...${NC}"
+            systemd-sysext unmerge || true
+            sleep 1
+        fi
+        
+        echo -e "${BLUE}[SteamOS] Disabling readonly filesystem...${NC}"
+        steamos-readonly disable
+        sleep 2
+        
+        # Verify filesystem is writable
+        if mount | grep -q "/ type btrfs.*ro,"; then
+            echo -e "${RED}Filesystem is still read-only after disable!${NC}"
+            echo -e "You may need to reboot and try again."
+            exit 1
+        fi
+        
+        echo -e "${BLUE}[SteamOS] Initializing pacman...${NC}"
+        if [[ ! -f /etc/pacman.d/gnupg/trustdb.gpg ]]; then
+            pacman-key --init
+        fi
+        
+        echo -e "${BLUE}[SteamOS] Populating pacman keys...${NC}"
+        pacman-key --populate archlinux holo 2>/dev/null || pacman-key --populate archlinux
+        
+        echo -e "${BLUE}[SteamOS] Syncing package database...${NC}"
+        pacman -Sy
+        
+        echo -e "${BLUE}[SteamOS] Installing build dependencies...${NC}"
+        pacman -S --noconfirm --needed base-devel glibc linux-api-headers
+        
+        echo -e "${GREEN}[SteamOS] Build environment ready!${NC}"
     fi
 fi
 
