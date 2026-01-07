@@ -1,0 +1,18 @@
+[package]
+name = "hifi-wifi"
+version = "3.0.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.54", features = ["derive"] }
+env_logger = "0.11.8"
+log = "0.4.29"
+nix = { version = "0.30.1", features = ["user"] }
+procfs = "0.18.0"
+regex = "1.12.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.49.0", features = ["full"] }
+toml = "0.9.10"
+zbus = "5.12.0"

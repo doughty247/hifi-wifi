@@ -74,6 +74,9 @@ systemctl disable wifi-optimizations-verify.service 2>/dev/null || true
 # SteamOS restore service (v1.1.0+)
 systemctl stop hifi-wifi-restore.service 2>/dev/null || true
 systemctl disable hifi-wifi-restore.service 2>/dev/null || true
+# v3.0 Rust service
+systemctl stop hifi-wifi.service 2>/dev/null || true
+systemctl disable hifi-wifi.service 2>/dev/null || true
 echo "  [OK] Services stopped"
 
 echo ""
@@ -81,6 +84,7 @@ echo "[3/13] Removing systemd service files..."
 rm -f /etc/systemd/system/wifi-cake-qdisc@.service
 rm -f /etc/systemd/system/wifi-optimizations-verify.service
 rm -f /etc/systemd/system/hifi-wifi-restore.service
+rm -f /etc/systemd/system/hifi-wifi.service
 systemctl daemon-reload
 echo "  [OK] Service files removed"
 
@@ -145,8 +149,10 @@ echo ""
 echo "[10/13] Removing state directories..."
 # Main state directory (all versions)
 rm -rf /var/lib/wifi_patch
-# SteamOS persistence directory (v1.1.0+)
+# SteamOS persistence directory (v1.1.0+ and v3.0)
 rm -rf /var/lib/hifi-wifi
+# v3.0 Config directory
+rm -rf /etc/hifi-wifi
 echo "  [OK] State directories removed"
 
 echo ""
