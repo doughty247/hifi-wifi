@@ -41,6 +41,10 @@ enum Commands {
     Install,
     /// Uninstall system service
     Uninstall,
+    /// Stop service and revert optimizations (for A/B testing)
+    Off,
+    /// Start service and apply optimizations (for A/B testing)
+    On,
 }
 
 #[tokio::main]
@@ -81,6 +85,12 @@ async fn main() -> Result<()> {
         }
         Commands::Uninstall => {
             run_uninstall()?;
+        }
+        Commands::Off => {
+            run_off()?;
+        }
+        Commands::On => {
+            run_on()?;
         }
     }
 
@@ -555,5 +565,50 @@ fn run_uninstall() -> Result<()> {
     run_revert()?;
 
     info!("\n=== Uninstallation Complete ===");
+    Ok(())
+}
+
+/// Turn off hifi-wifi (stop service, revert optimizations) for A/B testing
+fn run_off() -> Result<()> {
+    use std::process::Command;
+    
+    info!("=== Turning OFF hifi-wifi ===\n");
+
+    // Stop service if running
+    if Command::new("systemctl").args(["is-active", "--quiet", "hifi-wifi"]).status()?.success() {
+        info!("Stopping hifi-wifi service...");
+        Command::new("systemctl").args(["stop", "hifi-wifi.service"]).output()?;
+    } else {
+        info!("Service not running.");
+    }
+
+    // Revert all optimizations
+    run_revert()?;
+
+    info!("\n=== hifi-wifi is OFF ===");
+    info!("Network is now using default settings.");
+    info!("To turn back on: sudo hifi-wifi on");
+    Ok(())
+}
+
+/// Turn on hifi-wifi (start service, apply optimizations) for A/B testing
+fn run_on() -> Result<()> {
+    use std::process::Command;
+    
+    info!("=== Turning ON hifi-wifi ===\n");
+
+    // Check if service exists
+    if !std::path::Path::new("/etc/systemd/system/hifi-wifi.service").exists() {
+        error!("hifi-wifi service not installed. Run: sudo hifi-wifi install");
+        return Ok(());
+    }
+
+    // Start service
+    info!("Starting hifi-wifi service...");
+    Command::new("systemctl").args(["start", "hifi-wifi.service"]).output()?;
+
+    info!("\n=== hifi-wifi is ON ===");
+    info!("Network optimizations are active.");
+    info!("Check status: hifi-wifi status");
     Ok(())
 }
