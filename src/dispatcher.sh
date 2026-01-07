@@ -1,355 +1,208 @@
 #!/bin/bash
-# Auto-apply Wi-Fi optimizations when connecting to new networks
+# Auto-apply Wi-Fi optimizations when connecting to networks
 # Triggered by NetworkManager on connection up/down events
+#
+# v1.3.0: Simplified - always uses fresh Link Statistics (no caching/expiry)
+# CAKE always gets accurate bandwidth limits from iw/ethtool
+#
+# v1.3.0-rc2: Removed is_network_idle() check - apply CAKE immediately
+# The idle check caused 4+ second delays and conflicts with Steam auto-downloads
 
 INTERFACE="$1"
 ACTION="$2"
 
-# Only process Wi-Fi interfaces on connection-up
-# [[ "$INTERFACE" =~ ^wl ]] || exit 0
 [[ "$ACTION" == "up" ]] || exit 0
 
+# Skip loopback, VPN, and other virtual interfaces
+# Only process physical WiFi and Ethernet interfaces
+[[ "$INTERFACE" =~ ^(lo|tun|tap|veth|docker|br-|virbr|tailscale) ]] && exit 0
+[[ ! "$INTERFACE" =~ ^(wl|wlan|en|eth) ]] && exit 0
+
 STATE_DIR="/var/lib/wifi_patch"
-PROFILES_DIR="$STATE_DIR/networks"
 LOGFILE="$STATE_DIR/auto-optimize.log"
 
-mkdir -p "$PROFILES_DIR" 2>/dev/null
-
-# Get current SSID or Connection Name (for Ethernet)
-get_ssid() {
-    # Try Wi-Fi SSID first
-    local ssid=$(timeout 2 nmcli -t -f active,ssid dev wifi 2>/dev/null | grep '^yes' | cut -d: -f2 | head -1)
-    if [[ -n "$ssid" ]]; then
-        echo "$ssid"
-    else
-        # Fallback to connection name (works for Ethernet)
-        timeout 2 nmcli -t -f NAME,DEVICE connection show --active | grep ":$INTERFACE" | cut -d: -f1 | head -1
-    fi
-}
-
-# Sanitize SSID for filename
-sanitize_ssid() {
-    echo "$1" | tr -cd 'a-zA-Z0-9._-' | head -c 100
-}
+mkdir -p "$STATE_DIR" 2>/dev/null
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOGFILE"
 }
 
-SSID=$(get_ssid)
-[[ -z "$SSID" ]] && exit 0
-
-SAFE_SSID=$(sanitize_ssid "$SSID")
-PROFILE_FILE="$PROFILES_DIR/${SAFE_SSID}.conf"
-
-# Tiered expiry configuration
-EXPIRY_DAILY=180      # 6 months for networks used 5-7x per week
-EXPIRY_REGULAR=90     # 3 months for networks used 2-4x per week
-EXPIRY_OCCASIONAL=30  # 1 month for networks used <2x per week
-EXPIRY_NEW=90         # Default for new networks
-
-# Function to calculate connection frequency
-get_frequency() {
-    local profile="$1"
-    [[ ! -f "$profile" ]] && echo "0" && return
-    
-    local count=$(grep '^CONNECTION_COUNT=' "$profile" 2>/dev/null | cut -d= -f2)
-    local created=$(grep '^CREATED_DATE=' "$profile" 2>/dev/null | cut -d= -f2)
-    
-    count=${count:-1}
-    created=${created:-$(date +%s)}
-    
-    local now=$(date +%s)
-    local age_weeks=$(( (now - created) / 604800 ))
-    [[ $age_weeks -lt 1 ]] && age_weeks=1
-    
-    local freq=$((count / age_weeks))
-    echo "$freq"
-}
-
-# Function to calculate expiry days based on usage
-calc_expiry_days() {
-    local profile="$1"
-    [[ ! -f "$profile" ]] && echo "$EXPIRY_NEW" && return
-    
-    local freq=$(get_frequency "$profile")
-    
-    if [[ $freq -ge 5 ]]; then
-        echo "$EXPIRY_DAILY"
-    elif [[ $freq -ge 2 ]]; then
-        echo "$EXPIRY_REGULAR"
+# Get current SSID or Connection Name (for Ethernet)
+get_connection_name() {
+    local ssid=$(timeout 2 nmcli -t -f active,ssid dev wifi 2>/dev/null | grep '^yes' | cut -d: -f2 | head -1)
+    if [[ -n "$ssid" ]]; then
+        echo "$ssid"
     else
-        echo "$EXPIRY_OCCASIONAL"
+        timeout 2 nmcli -t -f NAME,DEVICE connection show --active | grep ":$INTERFACE" | cut -d: -f1 | head -1
     fi
 }
 
-# Function to check if profile is expired
-is_expired() {
-    local profile="$1"
-    [[ ! -f "$profile" ]] && return 0
-    
-    if ! grep -q '^EXPIRY_DATE=' "$profile"; then
-        # Old profile - add expiry and connection tracking
-        local now=$(date +%s)
-        local expiry=$((now + EXPIRY_NEW * 86400))
-        echo "CREATED_DATE=$now" >> "$profile"
-        echo "EXPIRY_DATE=$expiry" >> "$profile"
-        echo "CONNECTION_COUNT=1" >> "$profile"
-        return 1  # Not expired, just migrated
+# Get interface type
+get_interface_type() {
+    local ifc="$1"
+    if [[ "$ifc" =~ ^(wl|wlan|wifi) ]]; then
+        echo "wifi"
+    elif [[ "$ifc" =~ ^(en|eth) ]]; then
+        echo "ethernet"
+    else
+        local type=$(cat "/sys/class/net/$ifc/type" 2>/dev/null)
+        case "$type" in
+            1) echo "ethernet" ;;
+            *) echo "unknown" ;;
+        esac
     fi
-    
-    local expiry=$(grep '^EXPIRY_DATE=' "$profile" | cut -d= -f2)
-    local now=$(date +%s)
-    [[ $now -gt $expiry ]]
 }
 
-# Function to renew profile expiry with tiered system
-renew_expiry() {
-    local profile="$1"
+# Get link speed using iw (Wi-Fi) or ethtool (Ethernet)
+# Returns bandwidth limit in Mbit/s
+# Includes retry logic for wake-from-sleep scenarios
+get_link_speed() {
+    local ifc="$1"
+    local ifc_type=$(get_interface_type "$ifc")
+    local speed=""
+    local overhead=85
+    local max_attempts=3
+    local attempt=1
     
-    # Increment connection count
-    local count=$(grep '^CONNECTION_COUNT=' "$profile" 2>/dev/null | cut -d= -f2)
-    count=${count:-0}
-    count=$((count + 1))
-    
-    if grep -q '^CONNECTION_COUNT=' "$profile"; then
-        sed -i "s/^CONNECTION_COUNT=.*/CONNECTION_COUNT=$count/" "$profile"
-    else
-        echo "CONNECTION_COUNT=$count" >> "$profile"
-    fi
-    
-    # Calculate new expiry based on frequency
-    local expiry_days=$(calc_expiry_days "$profile")
-    local now=$(date +%s)
-    local expiry=$((now + expiry_days * 86400))
-    
-    sed -i "s/^EXPIRY_DATE=.*/EXPIRY_DATE=$expiry/" "$profile"
-    
-    local freq=$(get_frequency "$profile")
-    log "Renewed: ${count} connections, ${freq}/week, ${expiry_days}d expiry"
-}
-
-# Function to check if network is idle (not busy with downloads)
-is_network_idle() {
-    local interface="$1"
-    local threshold_kbps=500  # Consider busy if >500 KB/s traffic
-    
-    # Get initial byte counters
-    local rx1=$(cat "/sys/class/net/$interface/statistics/rx_bytes" 2>/dev/null || echo 0)
-    local tx1=$(cat "/sys/class/net/$interface/statistics/tx_bytes" 2>/dev/null || echo 0)
-    
-    sleep 2  # Sample period
-    
-    # Get byte counters after delay
-    local rx2=$(cat "/sys/class/net/$interface/statistics/rx_bytes" 2>/dev/null || echo 0)
-    local tx2=$(cat "/sys/class/net/$interface/statistics/tx_bytes" 2>/dev/null || echo 0)
-    
-    # Calculate rate in KB/s
-    local rx_rate=$(( (rx2 - rx1) / 2048 ))  # Bytes to KB/s
-    local tx_rate=$(( (tx2 - tx1) / 2048 ))
-    local total_rate=$((rx_rate + tx_rate))
-    
-    log "Network activity: ${total_rate} KB/s (threshold: ${threshold_kbps} KB/s)"
-    
-    [[ $total_rate -lt $threshold_kbps ]]
-}
-
-# Check if profile already exists and is not expired
-if [[ -f "$PROFILE_FILE" ]]; then
-    if is_expired "$PROFILE_FILE"; then
-        log "Profile for $SSID expired (>7 days old), will recreate when network is idle..."
-        
-        # Check if network is busy before recreating profile
-        if ! is_network_idle "$INTERFACE"; then
-            log "Network is busy, skipping bandwidth detection to avoid interference"
-            log "Profile will be recreated on next idle connection"
-            rm -f "$PROFILE_FILE"
-            exit 0
-        fi
-        rm -f "$PROFILE_FILE"
-    else
-        log "Network $SSID already has a profile, applying saved settings..."
-        source "$PROFILE_FILE"
-        
-        # Renew expiry since we're using this profile
-        renew_expiry "$PROFILE_FILE"
-        log "Renewed profile expiry for $SSID (+7 days)"
-        
-        # Apply saved bandwidth with CAKE
-        tc qdisc del dev "$INTERFACE" root 2>/dev/null || true
-        if tc qdisc add dev "$INTERFACE" root cake bandwidth "$BANDWIDTH" diffserv4 dual-dsthost nat wash ack-filter 2>/dev/null; then
-            log "Applied CAKE qdisc with saved bandwidth $BANDWIDTH on $INTERFACE"
-        fi
-        
-        # Apply saved power mode
-        if [[ "$POWER_MODE" == "on" ]]; then
-            iw dev "$INTERFACE" set power_save on 2>/dev/null
-            log "Applied power save: on"
-        elif [[ "$POWER_MODE" == "off" ]]; then
-            iw dev "$INTERFACE" set power_save off 2>/dev/null
-            log "Applied power save: off"
-        fi
-        exit 0
-    fi
-fi
-
-if true; then  # New profile creation block
-    log "New network detected: $SSID - checking network activity before profiling..."
-    
-    # Wait for connection to stabilize before checking activity
-    sleep 3
-    
-    # Check if network is busy before bandwidth detection
-    if ! is_network_idle "$INTERFACE"; then
-        log "Network is BUSY (active downloads/uploads detected)"
-        log "Skipping bandwidth detection to avoid interference with ongoing transfers"
-        log "Will create profile on next idle connection to this network"
-        log "Using safe defaults for now: 200mbit, standard power mode"
-        
-        # Apply safe defaults without creating profile
-        tc qdisc del dev "$INTERFACE" root 2>/dev/null || true
-        tc qdisc add dev "$INTERFACE" root cake bandwidth 200mbit diffserv4 dual-dsthost nat wash ack-filter 2>/dev/null || true
-        iw dev "$INTERFACE" set power_save off 2>/dev/null
-        exit 0
-    fi
-    
-    log "Network is IDLE - safe to perform bandwidth detection"
-    
-    # Auto-detect bandwidth
-    # Try iw for Wi-Fi first
-    LINK_SPEED=$(iw dev "$INTERFACE" link 2>/dev/null | grep -oP 'tx bitrate: \K[0-9]+' | head -1 || true)
-    OVERHEAD_PERCENT=85
-    
-    # If iw failed (likely Ethernet), try ethtool
-    if [[ -z "$LINK_SPEED" ]]; then
-        LINK_SPEED=$(ethtool "$INTERFACE" 2>/dev/null | grep -oP 'Speed: \K[0-9]+' | head -1 || true)
-        if [[ -n "$LINK_SPEED" ]]; then
-            OVERHEAD_PERCENT=95
-            log "Ethernet detected, using aggressive ${OVERHEAD_PERCENT}% limit"
-        fi
-    fi
-    
-    if [[ -n "$LINK_SPEED" && $LINK_SPEED -gt 0 ]]; then
-        CAKE_LIMIT=$((LINK_SPEED * OVERHEAD_PERCENT / 100))
-        BANDWIDTH="${CAKE_LIMIT}mbit"
-        log "Detected link speed: ${LINK_SPEED}Mbit/s, setting CAKE to ${CAKE_LIMIT}Mbit/s (${OVERHEAD_PERCENT}%)"
-    else
-        BANDWIDTH="200mbit"
-        log "Could not detect link speed, using default $BANDWIDTH"
-    fi
-    
-    # Apply CAKE
-    tc qdisc del dev "$INTERFACE" root 2>/dev/null || true
-    if tc qdisc add dev "$INTERFACE" root cake bandwidth "$BANDWIDTH" diffserv4 dual-dsthost nat wash ack-filter 2>/dev/null; then
-        log "Applied CAKE qdisc with bandwidth $BANDWIDTH on $INTERFACE"
-    else
-        log "CAKE unavailable, using fq_codel fallback"
-        tc qdisc add dev "$INTERFACE" root handle 1: fq_codel limit 300 target 2ms interval 50ms quantum 300 ecn 2>/dev/null || true
-    fi
-    
-    # Determine power mode based on device type with robust detection
-    POWER_MODE="off"  # Default: performance mode
-    HAS_BATTERY=0
-    
-    if [[ -f "$STATE_DIR/force_performance" ]]; then
-        log "Performance mode forced by user configuration"
-        # Skip battery detection, force performance
-    else
-        # Check for real system battery (not peripheral devices like mice)
-        if [[ -d /sys/class/power_supply/BAT0 ]] || [[ -d /sys/class/power_supply/BAT1 ]] || \
-           [[ -d /sys/class/power_supply/battery ]]; then
-            HAS_BATTERY=1
+    while [[ $attempt -le $max_attempts ]]; do
+        if [[ "$ifc_type" == "ethernet" ]]; then
+            speed=$(timeout 2 ethtool "$ifc" 2>/dev/null | grep -oP 'Speed: \K[0-9]+' | head -1)
+            overhead=95
         else
-            # Check chassis type to distinguish desktops from laptops
-            if [[ -f /sys/class/dmi/id/chassis_type ]]; then
-                CHASSIS_TYPE=$(cat /sys/class/dmi/id/chassis_type 2>/dev/null)
-                # 8,9,10,11,14,30,31 = Portable/Laptop/Notebook/Tablet
-                [[ "$CHASSIS_TYPE" =~ ^(8|9|10|11|14|30|31)$ ]] && HAS_BATTERY=1
-            fi
-            
-            # If still uncertain, check for real batteries (exclude peripherals)
-            if [[ $HAS_BATTERY -eq 0 ]]; then
-                for bat in /sys/class/power_supply/*/type; do
-                    if grep -q "Battery" "$bat" 2>/dev/null; then
-                        BAT_DIR=$(dirname "$bat")
-                        BAT_NAME=$(basename "$BAT_DIR")
-                        # Exclude peripheral batteries
-                        if [[ ! "$BAT_NAME" =~ (hidpp|hid|mouse|keyboard|wacom|peripheral) ]]; then
-                            # Real batteries have capacity
-                            if [[ -f "$BAT_DIR/capacity" ]]; then
-                                HAS_BATTERY=1
-                                break
-                            fi
-                        fi
-                    fi
-                done
-            fi
+            speed=$(timeout 2 iw dev "$ifc" link 2>/dev/null | grep -oP 'tx bitrate: \K[0-9]+' | head -1)
+            overhead=85
         fi
+        
+        # Got valid speed, calculate and return
+        if [[ -n "$speed" && "$speed" -gt 0 ]]; then
+            local limit=$((speed * overhead / 100))
+            [[ $limit -lt 1 ]] && limit=1
+            echo "$limit"
+            return 0
+        fi
+        
+        # Hardware not ready yet (common after wake from sleep)
+        if [[ $attempt -lt $max_attempts ]]; then
+            sleep 0.5
+            ((attempt++))
+        else
+            break
+        fi
+    done
+    
+    # All attempts failed, use fallback
+    echo "200"  # Default fallback
+    return 1
+}
+
+# Determine power mode based on device type
+get_power_mode() {
+    # Check for forced performance mode
+    if [[ -f "$STATE_DIR/force_performance" ]]; then
+        log "Power mode: Performance (forced)"
+        echo "off"
+        return
     fi
     
-    if [[ -f "$STATE_DIR/force_performance" ]]; then
-        POWER_MODE="off"
-        iw dev "$INTERFACE" set power_save off 2>/dev/null
-        log "Forced PERFORMANCE mode (power_save=off)"
-    elif [[ $HAS_BATTERY -eq 1 ]]; then
-        # Battery device - check AC status with multiple methods
-        AC_ONLINE=0
+    # Check for SYSTEM battery only (ignore device batteries like mouse/keyboard/UPS)
+    # System batteries are typically named BAT0/BAT1 or 'battery'
+    local has_battery=0
+    
+    if timeout 0.5 test -d /sys/class/power_supply/BAT0 2>/dev/null || \
+       timeout 0.5 test -d /sys/class/power_supply/BAT1 2>/dev/null || \
+       timeout 0.5 test -d /sys/class/power_supply/battery 2>/dev/null; then
+        has_battery=1
+    fi
+    
+    # If no system battery detected, this is a desktop - always performance
+    if [[ $has_battery -eq 0 ]]; then
+        log "Power mode: Desktop detected (no system battery)"
+        echo "off"
+        return
+    fi
+    
+    # Battery device - check AC status by power supply type (with timeout to prevent hangs)
+    local ac_online=0
+    local ac_source=""
+    
+    # Check all power supplies for type="Mains" or "USB" (USB-C charging on Steam Deck/laptops)
+    for psu in /sys/class/power_supply/*; do
+        [ -d "$psu" ] || continue
         
-        # Method 1: Check AC adapter
-        for ac in /sys/class/power_supply/AC*/online /sys/class/power_supply/ADP*/online; do
-            if [[ -f "$ac" ]] && [[ $(cat "$ac" 2>/dev/null) == "1" ]]; then
-                AC_ONLINE=1
-                break
+        local psu_type=$(timeout 0.5 cat "$psu/type" 2>/dev/null || echo "")
+        
+        # Only check Mains and USB type power supplies (ignore Battery, UPS, etc.)
+        if [[ "$psu_type" == "Mains" ]] || [[ "$psu_type" == "USB" ]]; then
+            if [[ -f "$psu/online" ]]; then
+                local online=$(timeout 0.5 cat "$psu/online" 2>/dev/null || echo "0")
+                if [[ "$online" == "1" ]]; then
+                    ac_online=1
+                    ac_source="$(basename "$psu") (type=$psu_type)"
+                    break
+                fi
+            fi
+        fi
+    done
+    
+    # Fallback: Check battery status (Charging/Full means AC is connected)
+    # Use timeout to prevent hangs from stuck battery indicators
+    if [[ $ac_online -eq 0 ]]; then
+        for bat in /sys/class/power_supply/BAT*/status /sys/class/power_supply/battery/status; do
+            if [[ -f "$bat" ]]; then
+                local status=$(timeout 0.5 cat "$bat" 2>/dev/null || echo "Unknown")
+                if [[ "$status" =~ ^(Charging|Full|Not\ charging)$ ]]; then
+                    ac_online=1
+                    ac_source="battery status: $status"
+                    break
+                fi
             fi
         done
-        
-        # Method 2: Check battery status
-        if [[ $AC_ONLINE -eq 0 ]]; then
-            for bat in /sys/class/power_supply/BAT*/status /sys/class/power_supply/battery/status; do
-                if [[ -f "$bat" ]]; then
-                    BAT_STATUS=$(cat "$bat" 2>/dev/null)
-                    if [[ "$BAT_STATUS" =~ ^(Charging|Full|Not\ charging)$ ]]; then
-                        AC_ONLINE=1
-                        break
-                    fi
-                fi
-            done
-        fi
-        
-        if [[ $AC_ONLINE -eq 1 ]]; then
-            POWER_MODE="off"
-            iw dev "$INTERFACE" set power_save off 2>/dev/null
-            log "Battery device on AC power - PERFORMANCE mode (power_save=off)"
-        else
-            POWER_MODE="on"
-            iw dev "$INTERFACE" set power_save on 2>/dev/null
-            log "Battery device on battery - POWER SAVING mode (power_save=on)"
-        fi
-    else
-        # Desktop - ALWAYS maximum performance
-        POWER_MODE="off"
-        iw dev "$INTERFACE" set power_save off 2>/dev/null
-        ethtool -s "$INTERFACE" speed 1000 duplex full 2>/dev/null || true
-        log "Desktop device - PERFORMANCE mode enforced (power_save=off)"
     fi
     
-    # Save profile with tiered expiry
-    NOW=$(date +%s)
-    EXPIRY_DAYS=$EXPIRY_NEW
-    EXPIRY=$((NOW + EXPIRY_DAYS * 86400))
-    cat > "$PROFILE_FILE" <<PROFILE
-# Wi-Fi optimization profile for: $SSID
-# Auto-created: $(date '+%Y-%m-%d %H:%M:%S')
-# Expires: $(date -d "@$EXPIRY" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r $EXPIRY '+%Y-%m-%d %H:%M:%S')
-# Expiry adjusts based on usage: Daily=180d, Regular=90d, Occasional=30d
-SSID="$SSID"
-BANDWIDTH="$BANDWIDTH"
-POWER_MODE="$POWER_MODE"
-CREATED_DATE=$NOW
-EXPIRY_DATE=$EXPIRY
-CONNECTION_COUNT=1
-PROFILE
-    log "Created new profile for $SSID (bandwidth=$BANDWIDTH, power_mode=$POWER_MODE, ${EXPIRY_DAYS}d expiry)"
+    if [[ $ac_online -eq 1 ]]; then
+        log "Power mode: AC connected via $ac_source"
+        echo "off"  # AC = performance
+    else
+        log "Power mode: On battery (power saving)"
+        echo "on"   # Battery = power save
+    fi
+}
+
+# --- Main ---
+
+CONNECTION_NAME=$(get_connection_name)
+[[ -z "$CONNECTION_NAME" ]] && exit 0
+
+log "Connection UP: $CONNECTION_NAME on $INTERFACE"
+
+# Brief delay to ensure link is established and speed is accurate
+# Reduced from 2s to 1s for faster optimization
+sleep 1
+
+# Get fresh link speed (instant with iw/ethtool)
+LINK_SPEED=$(get_link_speed "$INTERFACE")
+BANDWIDTH="${LINK_SPEED}mbit"
+
+log "Link speed: ${LINK_SPEED}Mbit/s -> CAKE bandwidth: $BANDWIDTH"
+
+# Apply CAKE immediately - no idle check needed
+# CAKE handles active traffic gracefully; waiting only delays protection
+tc qdisc del dev "$INTERFACE" root 2>/dev/null || true
+if tc qdisc add dev "$INTERFACE" root cake bandwidth "$BANDWIDTH" diffserv4 dual-dsthost nat wash ack-filter 2>/dev/null; then
+    log "Applied CAKE on $INTERFACE: $BANDWIDTH"
+else
+    log "CAKE unavailable, using fq_codel"
+    tc qdisc add dev "$INTERFACE" root handle 1: fq_codel limit 300 target 2ms interval 50ms quantum 300 ecn 2>/dev/null || true
+fi
+
+# Apply power mode
+POWER_MODE=$(get_power_mode)
+if [[ "$POWER_MODE" == "off" ]]; then
+    iw dev "$INTERFACE" set power_save off 2>/dev/null
+    log "Power save: OFF (performance mode)"
+else
+    iw dev "$INTERFACE" set power_save on 2>/dev/null
+    log "Power save: ON (battery saving)"
 fi
 
 exit 0

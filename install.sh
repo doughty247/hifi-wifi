@@ -5,6 +5,12 @@ set -e
 
 INSTALL_DIR="/usr/local/bin"
 SHARE_DIR="/usr/local/share/hifi-wifi"
+NEW_VERSION="1.3.0"
+
+# Function to compare versions (returns 0 if $1 < $2, i.e. $1 is older)
+version_lt() {
+    [ "$1" != "$2" ] && [ "$1" = "$(echo -e "$1\n$2" | sort -V | head -n1)" ]
+}
 
 # Capture current active connection (Wi-Fi or Ethernet) to ensure we reconnect
 CURRENT_CONNECTION=$(nmcli -t -f NAME connection show --active 2>/dev/null | head -1 || true)
@@ -30,6 +36,51 @@ fi
 
 # Check for existing installation and cleanup
 if command -v hifi-wifi &>/dev/null; then
+    # Get installed version
+    INSTALLED_VERSION=""
+    IS_LEGACY_INSTALL=false
+    
+    if [[ -f "$SHARE_DIR/src/lib.sh" ]]; then
+        # New-style install (v1.3.0+) - version in lib.sh
+        INSTALLED_VERSION=$(grep -oP 'VERSION="\K[^"]+' "$SHARE_DIR/src/lib.sh" 2>/dev/null || true)
+    elif [[ -f "/usr/local/bin/hifi-wifi" ]] && [[ ! -d "$SHARE_DIR" ]]; then
+        # Old-style install (pre-1.3.0) - single bundled script, no lib directory
+        IS_LEGACY_INSTALL=true
+    fi
+    
+    # If upgrading from before v1.3.0, require uninstall first
+    # This ensures legacy configs (systemd CAKE service, bandwidth files, etc.) are cleaned up
+    if [[ "$IS_LEGACY_INSTALL" == "true" ]] || { [[ -n "$INSTALLED_VERSION" ]] && version_lt "$INSTALLED_VERSION" "1.3.0"; }; then
+        echo ""
+        echo "=========================================="
+        echo "  IMPORTANT: Clean Upgrade Required"
+        echo "=========================================="
+        echo ""
+        if [[ "$IS_LEGACY_INSTALL" == "true" ]]; then
+            echo "You have a legacy version of hifi-wifi installed (pre-1.3.0)."
+        else
+            echo "You have hifi-wifi v${INSTALLED_VERSION} installed."
+        fi
+        echo ""
+        echo "v1.3.0 includes major architectural changes that require a clean"
+        echo "uninstall before upgrading. This ensures all legacy configurations"
+        echo "are properly removed to prevent conflicts."
+        echo ""
+        echo "Please run the uninstall script first:"
+        echo ""
+        echo "  sudo ./uninstall.sh"
+        echo ""
+        echo "Then re-run this installer:"
+        echo ""
+        echo "  sudo ./install.sh"
+        echo ""
+        echo "This is a one-time requirement for the v1.3.0 upgrade."
+        echo "Future updates will not require this step."
+        echo ""
+        echo "=========================================="
+        exit 1
+    fi
+    
     echo "Detected existing installation. Cleaning up old patches..."
     
     # Backup network connections to prevent data loss during revert
@@ -120,12 +171,63 @@ fi
 
 echo "Installing hifi-wifi..."
 
+# =============================================================================
+# LEGACY CLEANUP (v1.0.0 - v1.3.0-rc1)
+# This section removes artifacts from prior versions that may cause conflicts
+# =============================================================================
+echo "Cleaning up legacy configurations..."
+
+# v1.1.0 - v1.2.0: Backend configs (caused GitHub issue #5)
+if ls /etc/NetworkManager/conf.d/*hifi*.conf &>/dev/null 2>&1; then
+    echo "  Removing legacy hifi-wifi backend configs..."
+    sudo rm -f /etc/NetworkManager/conf.d/*hifi*.conf
+fi
+if [[ -f /etc/NetworkManager/conf.d/wifi_backend.conf ]]; then
+    echo "  Removing legacy wifi_backend.conf..."
+    sudo rm -f /etc/NetworkManager/conf.d/wifi_backend.conf
+fi
+if [[ -f /etc/NetworkManager/conf.d/iwd.conf ]]; then
+    echo "  Removing legacy iwd.conf..."
+    sudo rm -f /etc/NetworkManager/conf.d/iwd.conf
+fi
+
+# v1.2.0: Network profile cache (no longer used in v1.3.0)
+if [[ -d /var/lib/wifi_patch/networks ]]; then
+    echo "  Removing legacy network profile cache..."
+    sudo rm -rf /var/lib/wifi_patch/networks
+fi
+
+# v1.3.0-rc1: Stale bandwidth files (systemd CAKE service removed)
+if ls /var/lib/wifi_patch/bandwidth_*.txt &>/dev/null 2>&1; then
+    echo "  Removing stale bandwidth files..."
+    sudo rm -f /var/lib/wifi_patch/bandwidth_*.txt
+    sudo rm -f /var/lib/wifi_patch/upload_bandwidth_*.txt
+fi
+
+# v1.3.0-rc1: Disable redundant systemd CAKE service (causes race condition)
+if systemctl list-unit-files 2>/dev/null | grep -q "wifi-cake-qdisc@"; then
+    echo "  Disabling redundant CAKE systemd services..."
+    sudo systemctl disable 'wifi-cake-qdisc@*.service' 2>/dev/null || true
+    sudo systemctl stop 'wifi-cake-qdisc@*.service' 2>/dev/null || true
+fi
+sudo rm -f /etc/systemd/system/wifi-cake-qdisc@.service 2>/dev/null || true
+
+# v1.1.0: Unmask wpa_supplicant if it was masked
+if systemctl is-enabled wpa_supplicant.service 2>&1 | grep -q "masked"; then
+    echo "  Unmasking wpa_supplicant..."
+    sudo systemctl unmask wpa_supplicant.service 2>/dev/null || true
+fi
+
+sudo systemctl daemon-reload 2>/dev/null || true
+echo "Legacy cleanup complete."
+echo ""
+
 # Create directories
 sudo mkdir -p "$SHARE_DIR/src"
 sudo mkdir -p "$SHARE_DIR/config"
 sudo mkdir -p "$INSTALL_DIR"
 # Create state directories for runtime data (fixes #4: missing directory error)
-sudo mkdir -p "/var/lib/wifi_patch/networks"
+sudo mkdir -p "/var/lib/wifi_patch"
 
 # Copy files
 sudo cp bin/hifi-wifi "$INSTALL_DIR/hifi-wifi"
@@ -178,5 +280,17 @@ EOF
     sudo steamos-readonly enable
 fi
 
+echo ""
 echo "Installation complete!"
-echo "Run 'sudo hifi-wifi --apply' to apply optimizations."
+echo ""
+
+# Prompt to apply optimizations
+read -p "Would you like to apply network optimizations now? [Y/n] " -n 1 -r
+echo ""
+if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+    echo ""
+    sudo hifi-wifi --apply
+else
+    echo ""
+    echo "Run 'sudo hifi-wifi --apply' when you're ready to apply optimizations."
+fi

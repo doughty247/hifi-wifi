@@ -1,5 +1,89 @@
 #!/bin/bash
 
+# Track changes made during apply for potential rollback
+declare -a CHANGES_MADE=()
+APPLY_IN_PROGRESS=0
+
+# Track a change for potential rollback
+track_change() {
+  local change_type="$1"
+  local change_data="$2"
+  CHANGES_MADE+=("$change_type:$change_data")
+}
+
+# Create a file and automatically track it for rollback
+create_tracked_file() {
+  local filepath="$1"
+  cat > "$filepath"
+  track_change "FILE" "$filepath"
+}
+
+# Copy a file and automatically track the destination for rollback
+cp_tracked() {
+  local src="$1"
+  local dest="$2"
+  cp "$src" "$dest"
+  track_change "FILE" "$dest"
+}
+
+# Cleanup function for abort/failure scenarios
+cleanup_on_abort() {
+  local exit_code=$?
+  
+  # Only cleanup if we're in the middle of apply and it failed
+  if [[ $APPLY_IN_PROGRESS -eq 1 && $exit_code -ne 0 ]]; then
+    log_warning "Apply failed, reverting changes..."
+    
+    # Revert changes in reverse order
+    for (( idx=${#CHANGES_MADE[@]}-1 ; idx>=0 ; idx-- )) ; do
+      local change="${CHANGES_MADE[idx]}"
+      local type="${change%%:*}"
+      local data="${change#*:}"
+      
+      case "$type" in
+        FILE)
+          if [[ -f "$data" ]]; then
+            rm -f "$data" 2>/dev/null
+            log_info "Removed: $data"
+          fi
+          ;;
+        POWER_SAVE)
+          local ifc="$data"
+          iw dev "$ifc" set power_save on 2>/dev/null
+          log_info "Restored power save on $ifc"
+          ;;
+        TC_QDISC)
+          local ifc="$data"
+          tc qdisc del dev "$ifc" root 2>/dev/null || true
+          log_info "Removed tc qdisc from $ifc"
+          ;;
+        SYSTEMD_SERVICE)
+          systemctl stop "$data" 2>/dev/null || true
+          systemctl disable "$data" 2>/dev/null || true
+          rm -f "/etc/systemd/system/$data" 2>/dev/null
+          systemctl daemon-reload 2>/dev/null || true
+          log_info "Removed service: $data"
+          ;;
+        BACKEND_CHANGE)
+          # AGGRESSIVE cleanup: Remove ALL possible backend config files (fixes GitHub issue #5)
+          rm -f /etc/NetworkManager/conf.d/wifi_backend.conf 2>/dev/null || true
+          rm -f /etc/NetworkManager/conf.d/iwd.conf 2>/dev/null || true
+          rm -f /etc/NetworkManager/conf.d/*hifi*.conf 2>/dev/null || true
+          # Unmask wpa_supplicant in case it was masked
+          systemctl unmask wpa_supplicant.service 2>/dev/null || true
+          systemctl restart NetworkManager 2>/dev/null || true
+          log_info "Reverted backend change (cleaned all configs)"
+          ;;
+      esac
+    done
+    
+    log_success "Cleanup completed, system restored to previous state"
+    CHANGES_MADE=()
+  fi
+  
+  APPLY_IN_PROGRESS=0
+}
+
 function detect_driver_category() {
     if [[ -n "$DETECTED_DRIVER" ]]; then
         case "$DETECTED_DRIVER" in
@@ -58,23 +142,103 @@ function detect_driver_category() {
     fi
 }
 
+# --- Latency Monitoring Functions (Ported from wifi-grader.sh) ---
+PING_PIDS=()
+TARGETS=("8.8.8.8" "1.1.1.1")
+
+function start_ping_monitor() {
+    local label="$1"
+    PING_PIDS=()
+    
+    # log_info "[$label] Starting latency monitor to: ${TARGETS[*]}"
+    
+    for target in "${TARGETS[@]}"; do
+        local safe_target=$(echo "$target" | tr . _)
+        # Run ping in background, redirecting output
+        # -i 0.2: Fast interval (5 packets/sec) for high resolution
+        ping -i 0.2 "$target" > "/tmp/ping_${label}_${safe_target}.txt" 2>&1 &
+        PING_PIDS+=($!)
+    done
+}
+
+function stop_ping_monitor() {
+    # Send SIGINT (Ctrl+C) to all pings to force them to print summary
+    for pid in "${PING_PIDS[@]}"; do
+        kill -2 $pid 2>/dev/null
+        wait $pid 2>/dev/null
+    done
+}
+
+function calc_stats() {
+    local label="$1"
+    local total_avg=0
+    local total_jitter=0
+    local count=0
+    
+    for target in "${TARGETS[@]}"; do
+        local safe_target=$(echo "$target" | tr . _)
+        local file="/tmp/ping_${label}_${safe_target}.txt"
+        
+        if [[ -f "$file" ]]; then
+            # Parse ping summary: rtt min/avg/max/mdev = 15.1/16.2/18.3/1.1 ms
+            local stats=$(grep "rtt" "$file" | tail -1)
+            local values=$(echo "$stats" | awk -F'=' '{print $2}' | awk '{print $1}')
+            
+            # Extract avg and mdev (jitter)
+            local avg=$(echo "$values" | cut -d'/' -f2)
+            local jitter=$(echo "$values" | cut -d'/' -f4)
+            
+            if [[ "$avg" =~ ^[0-9.]+$ ]]; then
+                total_avg=$(echo "$total_avg + $avg" | bc)
+                total_jitter=$(echo "$total_jitter + $jitter" | bc)
+                count=$((count + 1))
+            fi
+            rm -f "$file"
+        fi
+    done
+    
+    if [[ $count -gt 0 ]]; then
+        FINAL_AVG=$(echo "scale=1; $total_avg / $count" | bc)
+        FINAL_JITTER=$(echo "scale=1; $total_jitter / $count" | bc)
+    else
+        FINAL_AVG="0"
+        FINAL_JITTER="0"
+    fi
+}
+# -----------------------------------------------------------------
+
+# Bandwidth measurement functions removed in favor of Link Statistics (v1.3.0)
+# User feedback indicates Link Statistics are more reliable and faster than speedtests.
+
 function apply_patches() {
   log_info "Applying enhanced Wi-Fi optimizations..."
   
-  # Ensure state directories exist (fixes #4: missing directory error)
-  mkdir -p "$STATE_DIR" "$NETWORK_PROFILES_DIR" 2>/dev/null || true
+  # Set up cleanup trap for failures
+  trap cleanup_on_abort EXIT ERR
+  APPLY_IN_PROGRESS=1
+  CHANGES_MADE=()
   
-  local ifc
-  if ! ifc=$(detect_interface); then
-    log_error "Could not auto-detect Wi-Fi interface"
+  # Ensure state directories exist (fixes #4: missing directory error)
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  
+  local interfaces
+  mapfile -t interfaces < <(detect_all_interfaces)
+  
+  if [[ ${#interfaces[@]} -eq 0 ]]; then
+    log_error "Could not auto-detect any active network interface"
     return 1
   fi
   
-  log_info "Using interface: $ifc"
+  log_info "Detected interfaces: ${interfaces[*]}"
+  
+  # Abort early if network is busy - accurate bandwidth detection requires idle network
+  if ! check_network_idle_or_abort "${interfaces[0]}"; then
+    return 1
+  fi
 
   if [[ ${DRY_RUN:-0} -eq 1 ]]; then
     log_info "[DRY-RUN] Would apply the following changes:"
-    log_info "  - Disable power saving on $ifc"
+    log_info "  - Disable power saving on detected interfaces"
     log_info "  - Create /etc/modprobe.d/rtw89.conf"
     log_info "  - Create /etc/modprobe.d/rtw89_advanced.conf"
     log_info "  - Create /etc/udev/rules.d/70-wifi-powersave.rules"
@@ -138,7 +302,7 @@ function apply_patches() {
     cp "$PROJECT_ROOT/src/power-manager.sh" /usr/local/bin/wifi-power-manager.sh
     chmod +x /usr/local/bin/wifi-power-manager.sh
     
-    cat > /etc/udev/rules.d/70-wifi-power-ac.rules << 'EOF'
+    create_tracked_file /etc/udev/rules.d/70-wifi-power-ac.rules << 'EOF'
 # Adjust Wi-Fi power saving based on AC power status
 SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_ONLINE}=="0", RUN+="/usr/local/bin/wifi-power-manager.sh"
 SUBSYSTEM=="power_supply", ENV{POWER_SUPPLY_ONLINE}=="1", RUN+="/usr/local/bin/wifi-power-manager.sh"
@@ -149,40 +313,33 @@ EOF
   else
     log_info "Applying maximum performance settings for desktop..."
     
-    if iw dev "$ifc" set power_save off 2>/dev/null; then
-      log_success "Power saving DISABLED on $ifc (desktop performance mode)"
-    else
-      log_warning "Could not disable power saving (may not be supported by driver)"
-    fi
-    
-    ethtool -s "$ifc" speed 1000 duplex full 2>/dev/null && \
-      log_success "Set link speed to maximum" || true
-    
     cp "$PROJECT_ROOT/src/desktop-performance.sh" /usr/local/bin/wifi-desktop-performance.sh
     chmod +x /usr/local/bin/wifi-desktop-performance.sh
     
-    cat > /etc/udev/rules.d/70-wifi-powersave.rules << 'EOF'
+    create_tracked_file /etc/udev/rules.d/70-wifi-powersave.rules << 'EOF'
 # Desktop Wi-Fi - ALWAYS maximum performance mode
 ACTION=="add", SUBSYSTEM=="net", KERNEL=="wl*", RUN+="/usr/local/bin/wifi-desktop-performance.sh %k"
 EOF
     
-    /usr/local/bin/wifi-desktop-performance.sh "$ifc"
-    log_success "Desktop performance mode configured and active"
+    log_success "Desktop performance mode configured"
   fi
   
   # Apply driver-specific module parameters
   case "$DRIVER_CATEGORY" in
     rtw89)
       log_info "Applying Realtek RTW89 driver optimizations..."
-      cat > /etc/modprobe.d/rtw89.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/rtw89.conf << 'EOF'
 # Realtek RTW89 optimizations (RTL8852/RTL8852BE/etc)
+# Disable power management for consistent latency
 options rtw89_pci disable_aspm=1 disable_clkreq=1
 options rtw89_core tx_ampdu_subframes=32
+# Disable low power states that cause latency spikes
+options rtw89_8852be disable_ps_mode=1
 EOF
       ;;
     rtw88)
       log_info "Applying Realtek RTW88 driver optimizations..."
-      cat > /etc/modprobe.d/rtw88.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/rtw88.conf << 'EOF'
 # Realtek RTW88 optimizations (RTL8822CE/etc)
 options rtw88_pci disable_aspm=1
 options rtw88_core disable_lps_deep=Y
@@ -190,7 +347,7 @@ EOF
       ;;
     rtl_legacy)
       log_info "Applying Legacy Realtek driver optimizations..."
-      cat > /etc/modprobe.d/rtl_legacy.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/rtl_legacy.conf << 'EOF'
 # Legacy Realtek optimizations (RTL8192EE/RTL8188EE/etc)
 options rtl8192ee swenc=1 ips=0 fwlps=0 2>/dev/null || true
 options rtl8188ee swenc=1 ips=0 fwlps=0 2>/dev/null || true
@@ -200,7 +357,7 @@ EOF
       ;;
     mediatek)
       log_info "Applying MediaTek driver optimizations..."
-      cat > /etc/modprobe.d/mediatek.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/mediatek.conf << 'EOF'
 # MediaTek optimizations (MT7921/MT76/etc)
 options mt7921e disable_aspm=1 2>/dev/null || true
 options mt76_usb disable_usb_sg=1 2>/dev/null || true
@@ -208,7 +365,7 @@ EOF
       ;;
     intel)
       log_info "Applying Intel Wi-Fi driver optimizations..."
-      cat > /etc/modprobe.d/iwlwifi.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/iwlwifi.conf << 'EOF'
 # Intel Wi-Fi optimizations
 options iwlwifi power_save=0 uapsd_disable=1 11n_disable=0
 options iwlmvm power_scheme=1
@@ -216,7 +373,7 @@ EOF
       ;;
     atheros)
       log_info "Applying Qualcomm Atheros driver optimizations..."
-      cat > /etc/modprobe.d/ath_wifi.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/ath_wifi.conf << 'EOF'
 # Qualcomm Atheros Wi-Fi optimizations
 options ath10k_core skip_otp=y 2>/dev/null || true
 options ath11k_pci disable_aspm=1 2>/dev/null || true
@@ -225,7 +382,7 @@ EOF
       ;;
     broadcom)
       log_info "Applying Broadcom driver optimizations..."
-      cat > /etc/modprobe.d/broadcom.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/broadcom.conf << 'EOF'
 # Broadcom Wi-Fi optimizations
 options brcmfmac roamoff=1 2>/dev/null || true
 options wl interference=0 2>/dev/null || true
@@ -233,7 +390,7 @@ EOF
       ;;
     ralink)
       log_info "Applying Ralink/MediaTek Legacy optimizations..."
-      cat > /etc/modprobe.d/ralink.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/ralink.conf << 'EOF'
 # Ralink/MediaTek Legacy optimizations
 options rt2800usb nohwcrypt=0 2>/dev/null || true
 options rt2800pci nohwcrypt=0 2>/dev/null || true
@@ -241,14 +398,14 @@ EOF
       ;;
     marvell)
       log_info "Applying Marvell driver optimizations..."
-      cat > /etc/modprobe.d/marvell.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/marvell.conf << 'EOF'
 # Marvell Wi-Fi optimizations
 options mwifiex disable_auto_ds=1 2>/dev/null || true
 EOF
       ;;
     *)
       log_info "Applying universal Wi-Fi optimizations (driver-agnostic)..."
-      cat > /etc/modprobe.d/wifi_generic.conf << 'EOF'
+      create_tracked_file /etc/modprobe.d/wifi_generic.conf << 'EOF'
 # Universal Wi-Fi optimizations
 # These settings work across most Wi-Fi drivers
 EOF
@@ -259,23 +416,17 @@ EOF
     log_success "Created driver-specific configuration"
   fi
 
-  local UDEV_FILE="/etc/udev/rules.d/70-wifi-powersave.rules"
-  echo 'ACTION=="add", SUBSYSTEM=="net", KERNEL=="wl*", RUN+="/usr/sbin/iw dev %k set power_save off"' > "$UDEV_FILE"
-
-  local UUID=$(current_ssid_uuid)
-  if [[ -n "$UUID" ]]; then
-    backup_connection "$UUID"
-    echo "[PATCH] Adjusting NetworkManager connection UUID=$UUID"
-    nmcli connection modify "$UUID" ipv6.method ignore || true
-    nmcli connection modify "$UUID" ipv4.method auto || true
-    nmcli connection modify "$UUID" wifi.cloned-mac-address permanent || true
-  else
-    echo "[PATCH] No active Wi-Fi connection to tune"
-  fi
-
-  echo "[PATCH] Applying upload speed optimizations..."
+  # --- Global Setup ---
   
-  cat > /etc/modprobe.d/rtw89_advanced.conf << 'EOF'
+  # Measure Internet Bandwidth ONCE for all interfaces
+  # REPLACED with Link Statistics (v1.3.0)
+  log_info "Using Link Statistics for bandwidth estimation (faster/more reliable)..."
+  local global_download_speed=0
+  local global_upload_speed=0
+  
+  # Only create rtw89 config if that driver is actually in use
+  if [[ "$DRIVER_CATEGORY" == "rtw89" ]]; then
+    create_tracked_file /etc/modprobe.d/rtw89_advanced.conf << 'EOF'
 # RTL8852BE upload speed optimizations and bufferbloat mitigation
 options rtw89_8852be disable_clkreq=1
 options rtw89_pci disable_aspm=1 disable_clkreq=1
@@ -285,107 +436,100 @@ options rtw89_8852be thermal_th=85
 options rtw89_pci tx_queue_len=1000
 options rtw89_8852be tx_power_reduction=2
 EOF
+  fi
 
-  log_info "Configuring network queue discipline for bufferbloat control..."
-  tc qdisc del dev "$ifc" root 2>/dev/null || true
-  
-  local current_ssid
-  current_ssid=$(get_current_ssid)
-  local bandwidth="200mbit"
-  
-  if [[ -n "$current_ssid" ]]; then
-    log_info "Current network: $current_ssid"
-    
-    if load_network_profile "$current_ssid"; then
-      log_info "Loaded saved profile for $current_ssid: $BANDWIDTH"
-      bandwidth="$BANDWIDTH"
-    else
-      log_info "No profile found for $current_ssid, creating new profile..."
+  # Load IFB module for download shaping (support up to 4 interfaces)
+  if ! lsmod | grep -q ifb; then
+      modprobe ifb numifbs=4 2>/dev/null || log_warning "Could not load IFB module"
+  fi
+
+  # NOTE: wifi-cake-qdisc@.service REMOVED in v1.3.0
+  # The systemd service caused race conditions with the dispatcher.
+  # The dispatcher (99-wifi-auto-optimize) is now the single source of truth
+  # for applying CAKE on connection events.
+
+  # --- Per-Interface Loop ---
+  for ifc in "${interfaces[@]}"; do
+      log_info "--- Configuring interface: $ifc ---"
       
-      log_info "Checking network activity before bandwidth detection..."
-      local rx1 tx1 rx2 tx2 rx_rate tx_rate total_rate
-      rx1=$(cat "/sys/class/net/$ifc/statistics/rx_bytes" 2>/dev/null || echo 0)
-      tx1=$(cat "/sys/class/net/$ifc/statistics/tx_bytes" 2>/dev/null || echo 0)
-      sleep 2
-      rx2=$(cat "/sys/class/net/$ifc/statistics/rx_bytes" 2>/dev/null || echo 0)
-      tx2=$(cat "/sys/class/net/$ifc/statistics/tx_bytes" 2>/dev/null || echo 0)
-      rx_rate=$(( (rx2 - rx1) / 2048 ))
-      tx_rate=$(( (tx2 - tx1) / 2048 ))
-      total_rate=$((rx_rate + tx_rate))
-      
-      if [[ $total_rate -gt 500 ]]; then
-        log_warning "Network is BUSY (${total_rate} KB/s) - skipping bandwidth detection"
-        log_warning "Using safe default: ${bandwidth}"
-        log_warning "Profile will be created on next idle connection"
-      else
-        log_info "Network is IDLE (${total_rate} KB/s) - safe to detect bandwidth"
-        
-        local link_speed
-        local overhead_percent=85
-        
-        link_speed=$(iw dev "$ifc" link 2>/dev/null | grep -oP 'tx bitrate: \K[0-9]+' | head -1 || true)
-        
-        if [[ -z "$link_speed" ]]; then
-            link_speed=$(ethtool "$ifc" 2>/dev/null | grep -oP 'Speed: \K[0-9]+' | head -1 || true)
-            if [[ -n "$link_speed" ]]; then
-                overhead_percent=95
-                log_info "Ethernet detected, using aggressive ${overhead_percent}% limit"
-            fi
-        fi
-        
-        if [[ -n "$link_speed" && $link_speed -gt 0 ]]; then
-          local cake_limit=$((link_speed * overhead_percent / 100))
-          bandwidth="${cake_limit}mbit"
-          log_info "Detected link speed: ${link_speed}Mbit/s, setting CAKE to ${cake_limit}Mbit/s (${overhead_percent}%)"
-        else
-          log_warning "Could not detect link speed, using default ${bandwidth}"
-        fi
-        
-        save_network_profile "$current_ssid" "$bandwidth" "auto"
+      # 1. Power Save (Desktop)
+      if [[ $is_battery_device -eq 0 ]]; then
+          if iw dev "$ifc" set power_save off 2>/dev/null; then
+              track_change "POWER_SAVE" "$ifc"
+              log_success "Power saving DISABLED on $ifc"
+          fi
+          ethtool -s "$ifc" speed 1000 duplex full 2>/dev/null || true
+          /usr/local/bin/wifi-desktop-performance.sh "$ifc" 2>/dev/null || true
       fi
-    fi
-  else
-    log_warning "No active network detected, using default bandwidth"
-  fi
-  
-  if tc qdisc add dev "$ifc" root cake bandwidth "$bandwidth" diffserv4 dual-dsthost nat wash ack-filter 2>/dev/null; then
-    log_success "Applied CAKE qdisc with bandwidth ${bandwidth}"
-    if tc qdisc show dev "$ifc" | grep -q "cake"; then
-      log_info "CAKE qdisc verified active on $ifc"
-    fi
-  else
-    log_warning "CAKE unavailable, falling back to fq_codel"
-    if tc qdisc add dev "$ifc" root handle 1: fq_codel limit 300 target 2ms interval 50ms quantum 300 ecn 2>/dev/null; then
-      log_info "Applied aggressive fq_codel for bufferbloat control"
-    else
-      log_warning "Could not apply any queue discipline"
-    fi
-  fi
-  
-  echo "$bandwidth" > "$STATE_DIR/cake_bandwidth.txt"
-  
-  local saved_bandwidth
-  saved_bandwidth=$(cat "$STATE_DIR/cake_bandwidth.txt" 2>/dev/null || echo "200mbit")
-  
-  cat > /etc/systemd/system/wifi-cake-qdisc@.service <<EOF
-[Unit]
-Description=Apply CAKE qdisc to %I for bufferbloat control
-After=network-online.target sys-subsystem-net-devices-%i.device
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'tc qdisc del dev %I root 2>/dev/null || true; tc qdisc add dev %I root cake bandwidth ${saved_bandwidth} diffserv4 dual-dsthost nat wash ack-filter'
-ExecStop=/bin/sh -c 'test -d /sys/class/net/%I && tc qdisc del dev %I root 2>/dev/null || true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl enable "wifi-cake-qdisc@${ifc}.service" 2>/dev/null || log_warning "Could not enable CAKE systemd service"
-  systemctl daemon-reload 2>/dev/null || true
-  log_success "CAKE qdisc will persist across reboots"
+      
+      # 2. UDEV Rules (Power Save)
+      local UDEV_FILE="/etc/udev/rules.d/70-wifi-powersave-${ifc}.rules"
+      echo "ACTION==\"add\", SUBSYSTEM==\"net\", KERNEL==\"$ifc\", RUN+=\"/usr/sbin/iw dev %k set power_save off\"" | create_tracked_file "$UDEV_FILE"
+      
+      # 3. NM Connection UUID
+      local UUID
+      UUID=$(nmcli -t -f UUID,DEVICE connection show --active | grep ":$ifc" | cut -d: -f1 | head -1)
+      
+      if [[ -n "$UUID" ]]; then
+          backup_connection "$UUID"
+          echo "[PATCH] Adjusting NetworkManager connection UUID=$UUID ($ifc)"
+          nmcli connection modify "$UUID" ipv6.method ignore || true
+          nmcli connection modify "$UUID" ipv4.method auto || true
+          
+          local ifc_type=$(get_interface_type "$ifc")
+          if [[ "$ifc_type" == "wifi" ]]; then
+              nmcli connection modify "$UUID" wifi.cloned-mac-address permanent || true
+          fi
+      fi
+      
+      # 4. Bandwidth & CAKE
+      local ifc_type=$(get_interface_type "$ifc")
+      local link_speed=0
+      local overhead_percent=85
+      
+      if [[ "$ifc_type" == "ethernet" ]]; then
+          link_speed=$(ethtool "$ifc" 2>/dev/null | grep -oP 'Speed: \K[0-9]+' | head -1 || true)
+          overhead_percent=95
+      else
+          # Wi-Fi
+          link_speed=$(iw dev "$ifc" link 2>/dev/null | grep -oP 'tx bitrate: \K[0-9]+' | head -1 || true)
+          overhead_percent=85
+      fi
+      
+      # Calculate Download Limit
+      local bandwidth_limit
+      if [[ -n "$link_speed" && "$link_speed" -gt 0 ]]; then
+          local link_limit=$((link_speed * overhead_percent / 100))
+          
+          # Always use Link Speed (v1.3.0 change)
+          bandwidth_limit="$link_limit"
+          log_info "Using Link Speed limit: ${bandwidth_limit}Mbit/s (Link: ${link_speed}Mbit/s)"
+      else
+          bandwidth_limit="200" # Default
+          log_warning "Could not detect link speed, using default ${bandwidth_limit}Mbit/s"
+      fi
+      
+      [[ $bandwidth_limit -lt 1 ]] && bandwidth_limit=1
+      local bandwidth="${bandwidth_limit}mbit"
+      
+      # Calculate Upload Limit
+      # Use the same link-based limit for upload (symmetric assumption or TX rate)
+      local upload_limit="$bandwidth_limit"
+      [[ $upload_limit -lt 1 ]] && upload_limit=1
+      local upload_bandwidth="${upload_limit}mbit"
+      
+      # Apply CAKE (egress only - ingress shaping via IFB removed in v1.3.0)
+      # CAKE on egress handles bufferbloat; download shaping is less critical
+      if tc qdisc replace dev "$ifc" root cake bandwidth "$upload_bandwidth" diffserv4 dual-dsthost nat wash ack-filter 2>/dev/null; then
+          track_change "TC_QDISC" "$ifc"
+          log_success "Applied CAKE on $ifc (bandwidth: $upload_bandwidth)"
+      else
+          log_warning "Failed to apply CAKE on $ifc"
+      fi
+      
+      ethtool -K "$ifc" tso off gso off gro on 2>/dev/null || true
+      
+  done
   
   cat > /etc/systemd/system/wifi-optimizations-verify.service << 'EOF'
 [Unit]
@@ -403,14 +547,15 @@ WantedBy=multi-user.target
 EOF
 
   systemctl enable wifi-optimizations-verify.service 2>/dev/null || true
+  track_change "SYSTEMD_SERVICE" "wifi-optimizations-verify.service"
   log_success "Update protection enabled for immutable system"
   
   log_info "Setting up automatic network detection..."
-  cp "$PROJECT_ROOT/src/dispatcher.sh" /etc/NetworkManager/dispatcher.d/99-wifi-auto-optimize
+  cp_tracked "$PROJECT_ROOT/src/dispatcher.sh" /etc/NetworkManager/dispatcher.d/99-wifi-auto-optimize
   chmod +x /etc/NetworkManager/dispatcher.d/99-wifi-auto-optimize
   log_success "Automatic network optimization enabled - new networks will be configured automatically"
   
-  cp "$PROJECT_ROOT/config/99-wifi-upload-opt.conf" /etc/sysctl.d/99-wifi-upload-opt.conf
+  cp_tracked "$PROJECT_ROOT/config/99-wifi-upload-opt.conf" /etc/sysctl.d/99-wifi-upload-opt.conf
   sysctl -p /etc/sysctl.d/99-wifi-upload-opt.conf 2>/dev/null || true
 
   echo "[PATCH] Optimizing IRQ affinity..."
@@ -422,62 +567,10 @@ EOF
 
   ethtool -K "$ifc" tso off gso off gro on 2>/dev/null || true
 
-  if [[ "${NO_IWD:-0}" -eq 0 ]]; then
-      if enable_iwd; then
-          # Restart NetworkManager to apply the backend change immediately
-          log_info "Restarting NetworkManager to apply iwd backend..."
-          systemctl restart NetworkManager
-          
-          # Wait for NetworkManager to come back up and network to reconnect
-          log_info "Waiting for network to reconnect..."
-          local reconnect_timeout=30
-          local elapsed=0
-          local connected=false
-          
-          while [[ $elapsed -lt $reconnect_timeout ]]; do
-              sleep 2
-              elapsed=$((elapsed + 2))
-              
-              # Check if NetworkManager is running and if we have any active connection
-              if systemctl is-active --quiet NetworkManager; then
-                  if nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -q ":connected"; then
-                      connected=true
-                      log_success "Network reconnected successfully"
-                      
-                      # Verify actual connectivity to ensure network is fully operational
-                      log_info "Verifying internet connectivity..."
-                      local ping_success=false
-                      local ping_wait=0
-                      while [[ $ping_wait -lt 15 ]]; do
-                          if ping -c 1 -W 1 8.8.8.8 &>/dev/null; then
-                              ping_success=true
-                              log_success "Internet connectivity verified"
-                              break
-                          fi
-                          sleep 1
-                          ping_wait=$((ping_wait + 1))
-                      done
-                      
-                      if [[ "$ping_success" = false ]]; then
-                          log_warning "Internet check timed out, but network is connected. Proceeding..."
-                      fi
-                      break
-                  fi
-              fi
-              
-              if [[ $((elapsed % 10)) -eq 0 ]]; then
-                  log_info "Still waiting for network connection... (${elapsed}s elapsed)"
-              fi
-          done
-          
-          if [[ "$connected" = false ]]; then
-              log_warning "Network did not reconnect within ${reconnect_timeout}s. Continuing anyway..."
-              log_warning "You may need to manually reconnect to your network."
-          fi
-      fi
-  else
-      log_info "Skipping iwd enablement (--no-iwd flag used)"
-  fi
+  # NOTE: hifi-wifi no longer switches WiFi backends (removed in v1.2.1)
+  # - SteamOS: Use Developer Options → "Force WPA Supplicant" (iwd is default)
+  # - Bazzite: Use `ujust toggle-iwd` to switch backends
+  # We only optimize iwd settings if it's ALREADY the active backend
 
   if pidof iwd &>/dev/null || grep -q "wifi.backend=iwd" /etc/NetworkManager/conf.d/*.conf 2>/dev/null; then
     echo "[INFO] iNet Wireless Daemon (iwd) detected. Applying specific optimizations..."
@@ -486,7 +579,7 @@ EOF
     mkdir -p /etc/iwd
     
     if [[ ! -f "$iwd_conf" ]]; then
-      cat > "$iwd_conf" <<EOF
+      create_tracked_file "$iwd_conf" <<EOF
 [General]
 ControlPortOverNL80211=true
 RoamThreshold=-75
@@ -508,9 +601,21 @@ EOF
     fi
   fi
 
+  # Force NetworkManager to disable power saving
+  log_info "Configuring NetworkManager to disable Wi-Fi power saving..."
+  create_tracked_file /etc/NetworkManager/conf.d/99-hifi-wifi-powersave.conf << 'EOF'
+[connection]
+wifi.powersave=2
+EOF
+
   rfkill unblock wifi || true
 
   touch "$STATE_FLAG"
+  
+  # Mark apply as successfully completed - disable cleanup trap
+  APPLY_IN_PROGRESS=0
+  trap - EXIT ERR
+  
   echo "[PATCH] Applied with upload optimizations. Reconnect or reboot for full effect. Use --revert to undo."
 }
 
@@ -526,10 +631,12 @@ function revert_patches() {
   rm -f /etc/modprobe.d/ralink.conf /etc/modprobe.d/marvell.conf || true
   rm -f /etc/modprobe.d/wifi_generic.conf || true
   rm -f /etc/udev/rules.d/70-wifi-powersave.rules || true
+  rm -f /etc/udev/rules.d/70-wifi-powersave-*.rules || true
   rm -f /etc/udev/rules.d/70-wifi-power-ac.rules || true
   rm -f /usr/local/bin/wifi-power-manager.sh || true
   rm -f /usr/local/bin/wifi-desktop-performance.sh || true
   rm -f /etc/NetworkManager/dispatcher.d/99-wifi-auto-optimize || true
+  rm -f /etc/NetworkManager/conf.d/99-hifi-wifi-powersave.conf || true
   rm -f /etc/sysctl.d/99-wifi-upload-opt.conf || true
   
   # Remove iwd optimization config if we created it (check if it matches our signature)
@@ -555,8 +662,16 @@ function revert_patches() {
       is_wifi=false
   fi
   
-  # Revert backend to default (wpa_supplicant) ONLY if we created the override config
-  if [[ -f /etc/NetworkManager/conf.d/wifi_backend.conf ]] || [[ -f /etc/NetworkManager/conf.d/iwd.conf ]]; then
+  # Revert backend to default (wpa_supplicant) - be aggressive about cleanup
+  # Check for ANY hifi-wifi related backend configs (including legacy file names)
+  local backend_cleanup_needed=false
+  if [[ -f /etc/NetworkManager/conf.d/wifi_backend.conf ]] || \
+     [[ -f /etc/NetworkManager/conf.d/iwd.conf ]] || \
+     ls /etc/NetworkManager/conf.d/*hifi*.conf &>/dev/null 2>&1; then
+      backend_cleanup_needed=true
+  fi
+  
+  if [[ "$backend_cleanup_needed" == "true" ]]; then
       log_info "Reverting Wi-Fi backend to default (wpa_supplicant)..."
       
       # Backup network connection profiles before deletion
@@ -564,9 +679,11 @@ function revert_patches() {
       backup_dir=$(mktemp -d)
       cp -r /etc/NetworkManager/system-connections/. "$backup_dir/" 2>/dev/null || true
       
-      # Manual revert to avoid TUI and ensure consistency
+      # AGGRESSIVE cleanup: Remove ALL hifi-wifi related backend configs
+      # This ensures we don't leave any "poisoned" configs behind (fixes GitHub issue #5)
       rm -f /etc/NetworkManager/conf.d/iwd.conf
       rm -f /etc/NetworkManager/conf.d/wifi_backend.conf
+      rm -f /etc/NetworkManager/conf.d/*hifi*.conf 2>/dev/null || true
       
       # Unmask wpa_supplicant
       systemctl unmask wpa_supplicant.service 2>/dev/null || true
@@ -643,19 +760,25 @@ function revert_patches() {
   ifc=$(detect_interface) || true
   if [[ -n "$ifc" ]]; then
     tc qdisc del dev "$ifc" root 2>/dev/null || true
+    tc qdisc del dev "$ifc" ingress 2>/dev/null || true
     log_info "Removed CAKE/fq_codel from $ifc"
     # Reset ethtool settings to defaults
     ethtool -K "$ifc" tso on gso on gro on 2>/dev/null || true
-    
-    # Disable and remove systemd service for CAKE
-    if systemctl is-enabled "wifi-cake-qdisc@${ifc}.service" &>/dev/null; then
-      systemctl disable "wifi-cake-qdisc@${ifc}.service" 2>/dev/null || true
-      log_info "Disabled CAKE systemd service"
-    fi
   fi
   
-  # Remove systemd service files
+  # Clean up IFB interfaces
+  for ifb_dev in ifb0 ifb1 ifb2 ifb3; do
+    tc qdisc del dev "$ifb_dev" root 2>/dev/null || true
+  done
+  
+  # Disable and remove ALL systemd CAKE services (any interface)
+  systemctl stop 'wifi-cake-qdisc@*.service' 2>/dev/null || true
+  systemctl disable 'wifi-cake-qdisc@*.service' 2>/dev/null || true
   rm -f /etc/systemd/system/wifi-cake-qdisc@.service || true
+  
+  # Remove stale bandwidth files (no longer used)
+  rm -f "$STATE_DIR"/bandwidth_*.txt 2>/dev/null || true
+  rm -f "$STATE_DIR"/upload_bandwidth_*.txt 2>/dev/null || true
   
   # Disable and remove verification service
   if systemctl is-enabled wifi-optimizations-verify.service &>/dev/null; then

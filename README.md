@@ -9,11 +9,11 @@ hifi-wifi is a network optimization tool specifically targeting SteamOS and Bazz
 
 ## Features
 
-*   **Bufferbloat Mitigation**: Applies CAKE queue discipline with automatic bandwidth detection (85% for Wi-Fi, 95% for Ethernet).
-*   **Network Profiling**: Detects and profiles networks individually. Settings are saved and reapplied on reconnection.
+*   **Bufferbloat Mitigation**: Applies CAKE queue discipline with **Instant Link Statistics** (replaces slow speedtests) to dynamically adjust bandwidth limits.
+*   **Multi-Interface Support**: Optimizes ALL active network interfaces (Ethernet + Wi-Fi) simultaneously.
 *   **Power Management**: Automatically switches between performance mode (AC) and power-saving mode (Battery) on supported devices.
 *   **Hardware Support**: Optimizes settings for Realtek, MediaTek, Intel, Atheros, Broadcom, and Marvell chipsets.
-*   **Backend Switching**: Automatically switches to `iwd` (iNet Wireless Daemon) for improved roaming and connection speed on supported systems.
+*   **iwd Optimization**: If iwd is active on your system, applies optimized roaming and scanning settings.
 
 ## System Requirements
 
@@ -73,11 +73,9 @@ sudo hifi-wifi --status
 | `--revert` | Revert previously applied patches. |
 | `--status` | Show current patch status. |
 | `--list-backups` | List available connection backups. |
-| `--list-networks` | List saved network profiles. |
 | `--view-log` | View auto-optimization log. |
 | `--interface <IFACE>` | Specify Wi-Fi interface (auto-detect if omitted). |
 | `--no-diagnose` | Skip diagnostic sections (only apply/revert). |
-| `--no-iwd` | Do not switch backend to `iwd`. |
 | `--force-performance` | Disable power-saving even on battery (prevents jitter). |
 | `--dry-run` | Show what would be changed without making changes. |
 | `--quiet` | Minimal output. |
@@ -87,15 +85,15 @@ sudo hifi-wifi --status
 
 ### Network Profiling
 
-When connecting to a network, the tool:
-1.  Checks for an existing profile in `/var/lib/wifi_patch/networks/`.
-2.  If no profile exists, it monitors network activity.
-3.  If the network is idle, it detects link speed and creates a profile with a bandwidth limit:
-    *   **Wi-Fi**: 85% of detected speed (for stability).
-    *   **Ethernet**: 95% of detected speed (for performance).
-4.  Applies CAKE qdisc with the calculated limit.
+WhenInstant Link Statistics
 
-### Power Management
+hifi-wifi uses **Instant Link Statistics** to determine the optimal bandwidth limit for CAKE:
+1.  **Instant**: Link speed is detected in milliseconds using `iw` (Wi-Fi) or `ethtool` (Ethernet).
+2.  **Dynamic**: Adapts to your current link quality (e.g., moving closer/farther from the router).
+3.  **Smart Limits**:
+    *   **Wi-Fi**: 85% of link speed (for stability).
+    *   **Ethernet**: 95% of link speed (for performance).
+    *   **Minimum**: 1 Mbit floor to prevent connectivity loss
 
 *   **Desktop**: Power saving is always disabled.
 *   **Battery Devices**:
@@ -103,15 +101,14 @@ When connecting to a network, the tool:
     *   **Battery**: Power saving enabled.
     *   **Forced Performance**: Use `--force-performance` to disable power saving on battery.
 
-### Wi-Fi Backend (iwd)
+### Wi-Fi Backend
 
-On Bazzite and SteamOS, the script defaults to using `iwd` as the Wi-Fi backend for NetworkManager. This provides faster connection times and better roaming.
+hifi-wifi does **not** change your WiFi backend. Use your OS tools instead:
 
-To opt-out on Bazzite and stay on `wpa_supplicant`:
+*   **SteamOS**: Developer Options → "Force WPA Supplicant WiFi backend" (iwd is default)
+*   **Bazzite**: Run `ujust toggle-iwd` to switch between wpa_supplicant and iwd
 
-```bash
-sudo hifi-wifi --apply --no-iwd
-```
+If iwd is already active on your system, hifi-wifi will automatically apply iwd-specific optimizations.
 
 ## Supported Systems
 
