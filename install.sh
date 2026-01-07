@@ -33,29 +33,19 @@ fi
 if [[ "$ID" == "steamos" || "$ID_LIKE" == *"arch"* ]]; then
     # Check if 'cc' is missing
     if ! command -v cc &> /dev/null; then
-        echo -e "${BLUE}Linker (cc) not found. Preparing SteamOS for build...${NC}"
-        
-        # We need root for this
-        if [[ $EUID -ne 0 ]]; then
-            echo -e "${BLUE}Requesting sudo to install build dependencies (pacman)...${NC}"
-            sudo steamos-readonly disable || true
-            # Wait for filesystem to become writable
-            sleep 2
-            sudo pacman-key --init
-            sudo pacman-key --populate archlinux holo 2>/dev/null || sudo pacman-key --populate archlinux
-            sudo pacman -S --noconfirm --needed base-devel glibc linux-api-headers
-            # Re-enable readonly for safety
-            sudo steamos-readonly enable || true
-        else
-            steamos-readonly disable || true
-            # Wait for filesystem to become writable
-            sleep 2
-            pacman-key --init
-            pacman-key --populate archlinux holo 2>/dev/null || pacman-key --populate archlinux
-            pacman -S --noconfirm --needed base-devel glibc linux-api-headers
-            # Re-enable readonly for safety
-            steamos-readonly enable || true
-        fi
+        echo -e "${RED}Linker (cc) not found.${NC}"
+        echo -e "${BLUE}On SteamOS, you need to manually prepare the system first:${NC}"
+        echo ""
+        echo -e "  1. Disable readonly: ${BLUE}sudo steamos-readonly disable${NC}"
+        echo -e "  2. Check for sysexts: ${BLUE}systemd-sysext status${NC}"
+        echo -e "  3. If sysexts loaded:  ${BLUE}sudo systemd-sysext unmerge${NC}"
+        echo -e "  4. Initialize pacman:  ${BLUE}sudo pacman-key --init${NC}"
+        echo -e "  5. Populate keys:      ${BLUE}sudo pacman-key --populate archlinux${NC}"
+        echo -e "  6. Install tools:      ${BLUE}sudo pacman -S base-devel${NC}"
+        echo -e "  7. Re-run this script: ${BLUE}sudo ./install.sh${NC}"
+        echo ""
+        echo -e "${RED}Automated installation cannot proceed due to system extensions.${NC}"
+        exit 1
     fi
 fi
 

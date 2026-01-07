@@ -24,20 +24,45 @@ This version (v3.0) is a complete rewrite in Rust, offering improved stability, 
 
 ## Installation
 
-### Building from Source
+### SteamOS Users - Important First Step
 
-To install hifi-wifi v3.0, clone the repository and run the installation script. This will compile the binary and install the systemd service.
+**On SteamOS (Steam Deck), you must run the preparation script FIRST:**
 
 ```bash
 git clone -b dev https://github.com/doughty247/hifi-wifi.git
 cd hifi-wifi
-./install.sh
+sudo ./steamos-prep.sh
 ```
+
+This one-time setup:
+- Unmerges system extensions that block package installation
+- Disables the read-only filesystem
+- Installs build tools (gcc, make, etc.)
+- Sets up Rust if not already installed
+
+**After the prep script completes, you can run the normal install:**
+
+```bash
+sudo ./install.sh
+```
+
+### Bazzite / Other Linux
+
+For Bazzite and standard Linux distributions, the regular install script works directly:
+
+```bash
+git clone -b dev https://github.com/doughty247/hifi-wifi.git
+cd hifi-wifi
+sudo ./install.sh
+```
+
+### What the Installer Does
 
 The installer will:
 1.  Check for the Rust toolchain (installing `rustup` if missing).
 2.  Compile the release binary.
-3.  Install the binary to `/usr/local/bin/hifi-wifi`.
+3.  Install the binary to `/var/lib/hifi-wifi/` (survives updates).
+4.  Create a symlink at `/usr/local/bin/hifi-wifi`.
 4.  Enable and start the `hifi-wifi` systemd service.
 
 ## Usage
