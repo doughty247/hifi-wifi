@@ -3,8 +3,7 @@
 > **⚠️ NOTE: MAINTENANCE MODE / LEGACY**
 > This branch (`main`) contains the legacy shell-script version (v1.x) of hifi-wifi.
 > **A complete rewrite (v3.0) in Rust is currently in active development on the [`dev`](https://github.com/doughty247/hifi-wifi/tree/dev) branch.**
-> v3.0 features proper state management, zero runtime dependencies, and much higher stability.
-> Please switch to the `dev` branch to test the new Proof of Concept engine.
+> The `dev` branch is currently unstable and intended for developers only. Please stick to `main` for stable use.
 
 hifi-wifi is a network optimization tool specifically targeting SteamOS and Bazzite. It configures the CAKE queue discipline to mitigate bufferbloat and manages Wi-Fi power save modes based on power source.
 
