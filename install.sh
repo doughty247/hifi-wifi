@@ -25,6 +25,46 @@ as_user() {
     fi
 }
 
+# --- SteamOS/Bazzite Pre-Requisites Fix ---
+# Rustup fails in loops on SteamOS because 'cc' (linker) is missing.
+# We must ensure base-devel is installed.
+
+# Source os-release to detect distro
+if [ -f /etc/os-release ]; then
+    source /etc/os-release
+fi
+
+if [[ "$ID" == "steamos" || "$ID_LIKE" == *"arch"* ]]; then
+    # Only run this if we are seemingly on SteamOS or Arch
+    # Check if 'cc' is missing
+    if ! command -v cc &> /dev/null; then
+        echo -e "${BLUE}Linker (cc) not found. Preparing SteamOS for build...${NC}"
+        
+        # We need root for this
+        if [[ $EUID -ne 0 ]]; then
+            echo -e "${BLUE}Requesting sudo to install build dependencies (pacman)...${NC}"
+            sudo steamos-readonly disable || true
+            sudo pacman-key --init
+            sudo pacman-key --populate archlinux holo 2>/dev/null || sudo pacman-key --populate archlinux
+            sudo pacman -S --noconfirm --needed base-devel glibc linux-api-headers
+        else
+            steamos-readonly disable || true
+            pacman-key --init
+            pacman-key --populate archlinux holo 2>/dev/null || pacman-key --populate archlinux
+            pacman -S --noconfirm --needed base-devel glibc linux-api-headers
+        fi
+    fi
+fi
+
+# On Bazzite (Fedora Silverblue based), we might need to check for gcc too, 
+# but usually users should use 'ujust' or a container. 
+# Attempting a best-effort check if 'cc' is missing on Bazzite.
+if [[ "$ID" == "bazzite" ]] && ! command -v cc &> /dev/null; then
+     echo -e "${RED}Warning: 'cc' (gcc) linker not found.${NC}"
+     echo -e "On Bazzite, please run: ${BLUE}ujust install-rust${NC} or install development tools manually."
+     echo -e "Attempting to continue, but cargo build may fail..."
+fi
+
 echo -e "${BLUE}=== hifi-wifi v3.0 Installer ===${NC}"
 
 # 1. Rust Detection & Installation
