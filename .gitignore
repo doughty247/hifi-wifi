@@ -9,9 +9,8 @@
 # Runtime data (if any ends up here)
 *.flag
 
-/tests/*docs/v1.3.0-remediation-plan.md
-docs/v1.4.0-roadmap.md
-
+# Internal documentation (not for release)
+docs/
 
 # Added by cargo
 
