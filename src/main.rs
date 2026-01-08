@@ -234,11 +234,22 @@ fn run_revert() -> Result<()> {
     Ok(())
 }
 
+/// Check if we're running on SteamOS
+fn is_steamos() -> bool {
+    if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
+        content.contains("ID=steamos")
+    } else {
+        false
+    }
+}
+
 /// Self-healing routine to ensure the binary is accessible via CLI
+/// On SteamOS, this handles read-only filesystem after system updates
 fn ensure_symlinks() {
     use std::os::unix::fs::symlink;
     use std::path::Path;
-    use log::{info, warn};
+    use std::process::Command;
+    use log::{info, warn, debug};
 
     let target = "/var/lib/hifi-wifi/hifi-wifi";
     // Prefer /usr/local/bin as it's often writable/overlayed on Bazzite/Silverblue
@@ -249,16 +260,51 @@ fn ensure_symlinks() {
         return;
     }
 
-    if !Path::new(link_path).exists() {
-        info!("Self-Healing: Creating symlink {} -> {}", link_path, target);
-        if let Err(e) = symlink(target, link_path) {
-            warn!("Failed to create symlink at {}: {}", link_path, e);
-        } else {
-            info!("Symlink created successfully.");
+    // Check if symlink already exists and is correct
+    if Path::new(link_path).exists() {
+        if let Ok(existing_target) = std::fs::read_link(link_path) {
+            if existing_target.to_string_lossy() == target {
+                debug!("Symlink already exists and is correct");
+                return;
+            }
         }
+        // Symlink exists but points somewhere else - remove it
+        let _ = std::fs::remove_file(link_path);
+    }
+
+    info!("Self-Healing: Creating symlink {} -> {}", link_path, target);
+    
+    // On SteamOS, we need to disable read-only filesystem first
+    let steamos = is_steamos();
+    if steamos {
+        debug!("SteamOS detected, disabling read-only filesystem for symlink");
+        // Unmerge system extensions first
+        let _ = Command::new("systemd-sysext")
+            .arg("unmerge")
+            .output();
+        
+        // Disable read-only
+        let _ = Command::new("steamos-readonly")
+            .arg("disable")
+            .output();
+        
+        // Small delay for filesystem to settle
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // Try to create symlink
+    if let Err(e) = symlink(target, link_path) {
+        warn!("Failed to create symlink at {}: {}", link_path, e);
     } else {
-        // Optional: Check if it points to the right place and fix if broken?
-        // For now, if it exists, assume it's fine.
+        info!("Symlink created successfully.");
+    }
+
+    // Re-enable read-only on SteamOS
+    if steamos {
+        debug!("Re-enabling SteamOS read-only filesystem");
+        let _ = Command::new("steamos-readonly")
+            .arg("enable")
+            .output();
     }
 }
 
