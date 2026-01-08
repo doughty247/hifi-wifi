@@ -396,23 +396,53 @@ async fn run_status_async() -> Result<()> {
              format!("{}[N/A]{} (USB Device)", DIM, NC)
         } else {
             // Special mappings for drivers that report different names in /proc/interrupts
-            let search_term = if ifc.driver == "rtl8192ee" { "rtl_pci" } else { &ifc.driver };
+            // - rtl8192ee reports as "rtl_pci"
+            // - ath11k uses MSI-X with multiple IRQ vectors
+            let search_terms: Vec<&str> = match ifc.driver.as_str() {
+                "rtl8192ee" => vec!["rtl_pci"],
+                "ath11k_pci" | "ath11k" => vec!["ath11k"],
+                _ => vec![ifc.driver.as_str()],
+            };
 
-            let irq_line = irq_out.lines().find(|l| l.contains(search_term) || l.contains(&ifc.name));
-            if let Some(line) = irq_line {
-                 let irq_num = line.trim().split(':').next().unwrap_or("?");
-                 // Check affinity (try hex or decimal)
-                 if let Ok(affinity) = std::fs::read_to_string(format!("/proc/irq/{}/smp_affinity", irq_num)) {
-                     let aff = affinity.trim();
-                     // Check if it's pinned to CPU1 (mask 0x2 in various formats)
-                     let is_cpu1 = aff == "2" || aff == "02" || aff == "00000002" || aff == "000002";
-                     if is_cpu1 {
-                         format!("{}[OPTIMIZED]{} (CPU 1)", GREEN, NC)
+            // Find ALL matching IRQs
+            let irq_lines: Vec<&str> = irq_out.lines()
+                .filter(|l| search_terms.iter().any(|t| l.contains(t)) || l.contains(&ifc.name))
+                .collect();
+            
+            if !irq_lines.is_empty() {
+                 // Check if ALL IRQs are pinned to CPU1
+                 let mut all_optimized = true;
+                 let mut all_found = true;
+                 let mut total = 0;
+                 let mut optimized = 0;
+                 
+                 for line in &irq_lines {
+                     let irq_num = line.trim().split(':').next().unwrap_or("?");
+                     if let Ok(affinity) = std::fs::read_to_string(format!("/proc/irq/{}/smp_affinity", irq_num)) {
+                         total += 1;
+                         let aff = affinity.trim();
+                         // Check if pinned to CPU1 (mask 0x2 in various formats)
+                         let is_cpu1 = aff == "2" || aff == "02" || aff == "00000002" || aff == "000002";
+                         if is_cpu1 {
+                             optimized += 1;
+                         } else {
+                             all_optimized = false;
+                         }
                      } else {
-                         format!("{}[DEFAULT]{} (Mask: {})", YELLOW, NC, aff)
+                         all_found = false;
+                     }
+                 }
+                 
+                 if total == 0 || !all_found {
+                     format!("{}[UNKNOWN]{}", DIM, NC)
+                 } else if all_optimized {
+                     if total > 1 {
+                         format!("{}[OPTIMIZED]{} (CPU 1, {} vectors)", GREEN, NC, total)
+                     } else {
+                         format!("{}[OPTIMIZED]{} (CPU 1)", GREEN, NC)
                      }
                  } else {
-                     format!("{}[UNKNOWN]{}", DIM, NC)
+                     format!("{}[PARTIAL]{} ({}/{} pinned)", YELLOW, NC, optimized, total)
                  }
             } else {
                  format!("{}[NOT FOUND]{}", DIM, NC)

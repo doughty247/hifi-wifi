@@ -209,29 +209,49 @@ options mwifiex disable_auto_ds=1
             // We proceed anyway, but the warning is crucial for debugging
         }
 
-        // Read /proc/interrupts to find the Wi-Fi IRQ
+        // Read /proc/interrupts to find the Wi-Fi IRQ(s)
         let interrupts = fs::read_to_string("/proc/interrupts")
             .context("Failed to read /proc/interrupts")?;
 
         // Special mappings for drivers that report different names in /proc/interrupts
-        let search_term = if ifc.driver == "rtl8192ee" { "rtl_pci" } else { &ifc.driver };
+        // - rtl8192ee reports as "rtl_pci" 
+        // - ath11k uses MSI-X with multiple IRQ vectors (ath11k_pci:base, DP, CE0-CE11)
+        let search_terms: Vec<&str> = match ifc.driver.as_str() {
+            "rtl8192ee" => vec!["rtl_pci"],
+            "ath11k_pci" | "ath11k" => vec!["ath11k"],  // Matches all ath11k MSI-X vectors
+            _ => vec![ifc.driver.as_str()],
+        };
 
-        let irq = interrupts.lines()
-            .find(|line| line.contains(search_term) || line.contains(&ifc.name))
-            .and_then(|line| line.trim().split(':').next())
-            .map(|s| s.trim().to_string());
+        // Find ALL matching IRQs (important for MSI-X drivers like ath11k)
+        let irqs: Vec<String> = interrupts.lines()
+            .filter(|line| {
+                search_terms.iter().any(|term| line.contains(term)) || line.contains(&ifc.name)
+            })
+            .filter_map(|line| line.trim().split(':').next())
+            .map(|s| s.trim().to_string())
+            .collect();
 
-        if let Some(irq_num) = irq {
-            let affinity_path = format!("/proc/irq/{}/smp_affinity", irq_num);
-            
-            // Bind to CPU 1 (affinity mask 0x2)
-            if let Err(e) = fs::write(&affinity_path, "2") {
-                warn!("Failed to set IRQ affinity for {}: {}", irq_num, e);
-            } else {
-                info!("Wi-Fi IRQ {} bound to CPU 1", irq_num);
-            }
-        } else {
+        if irqs.is_empty() {
             debug!("Could not find IRQ for {} (driver: {})", ifc.name, ifc.driver);
+        } else {
+            // Pin ALL matching IRQs to CPU 1
+            let mut pinned = 0;
+            for irq_num in &irqs {
+                let affinity_path = format!("/proc/irq/{}/smp_affinity", irq_num);
+                
+                // Bind to CPU 1 (affinity mask 0x2)
+                if let Err(e) = fs::write(&affinity_path, "2") {
+                    warn!("Failed to set IRQ affinity for {}: {}", irq_num, e);
+                } else {
+                    pinned += 1;
+                }
+            }
+            
+            if irqs.len() > 1 {
+                info!("Wi-Fi {} IRQs bound to CPU 1 ({} vectors)", pinned, irqs.len());
+            } else {
+                info!("Wi-Fi IRQ {} bound to CPU 1", irqs[0]);
+            }
         }
 
         Ok(())

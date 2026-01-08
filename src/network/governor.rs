@@ -44,6 +44,8 @@ struct InterfaceState {
     last_rx_bytes: u64,
     last_tx_bytes: u64,
     last_stats_time: Option<Instant>,
+    /// Whether we have valid bandwidth data (false = CAKE disabled)
+    bandwidth_valid: bool,
 }
 
 impl InterfaceState {
@@ -68,6 +70,7 @@ impl InterfaceState {
             last_rx_bytes: 0,
             last_tx_bytes: 0,
             last_stats_time: None,
+            bandwidth_valid: false,
         }
     }
 }
@@ -181,24 +184,47 @@ impl Governor {
 
             // 4. Breathing CAKE (Dynamic QoS) with throughput monitoring
             if self.config.breathing_cake_enabled {
-                // Get bitrate - try NetworkManager first, fallback to iw
-                let effective_bitrate = if bitrate > 0 {
-                    bitrate
-                } else {
-                    Self::get_bitrate_from_iw(&interface).unwrap_or(0)
+                // Get bitrate from BOTH sources and average for stability
+                let nm_bitrate = bitrate;  // Already in Kbit/s from NetworkManager
+                let iw_bitrate = Self::get_bitrate_from_iw(&interface).unwrap_or(0);
+                
+                // Average both sources if both valid, otherwise use whichever is valid
+                // Reject readings below 54Mbit (MCS0 probe frames are garbage)
+                let min_valid_kbit = 54_000;  // 54 Mbit minimum (802.11g)
+                
+                let nm_valid = nm_bitrate >= min_valid_kbit;
+                let iw_valid = iw_bitrate >= min_valid_kbit;
+                
+                let effective_bitrate = match (nm_valid, iw_valid) {
+                    (true, true) => (nm_bitrate + iw_bitrate) / 2,  // Average both
+                    (true, false) => nm_bitrate,
+                    (false, true) => iw_bitrate,
+                    (false, false) => 0,  // Both invalid - will disable CAKE
                 };
                 
-                if effective_bitrate > 0 {
-                    if let Some(state) = self.interface_states.get_mut(&interface) {
-                        // Update throughput estimate from actual traffic
-                        Self::update_throughput_estimate(state, &interface);
-                        
+                if let Some(state) = self.interface_states.get_mut(&interface) {
+                    // Update throughput estimate from actual traffic
+                    Self::update_throughput_estimate(state, &interface);
+                    
+                    if effective_bitrate > 0 {
                         // Convert Kbit to Mbit and scale using overhead factor (default 0.85)
                         let bitrate_mbit = effective_bitrate / 1000;
                         let scaled_mbit = (bitrate_mbit as f64 * self.config.cake_overhead_factor) as u32;
                         
+                        debug!("CAKE: NM={}Kbit, iw={}Kbit, effective={}Kbit, scaled={}Mbit",
+                               nm_bitrate, iw_bitrate, effective_bitrate, scaled_mbit);
+                        
                         if state.tc_manager.update_bandwidth(scaled_mbit) {
                             let _ = state.tc_manager.apply_cake(&interface);
+                        }
+                        state.bandwidth_valid = true;
+                    } else {
+                        // Both sources invalid - disable CAKE rather than guess
+                        if state.bandwidth_valid {
+                            warn!("CAKE: No valid bitrate (NM={}, iw={}), disabling CAKE on {}",
+                                  nm_bitrate, iw_bitrate, interface);
+                            let _ = state.tc_manager.remove_cake(&interface);
+                            state.bandwidth_valid = false;
                         }
                     }
                 }
@@ -256,10 +282,25 @@ impl Governor {
             }
 
             // 5b. Power Save Management (Adaptive) - with hysteresis to prevent flapping
+            // FIXED: Also disable power save during ANY network activity, not just game mode
             {
-                let should_enable = self.power_manager.should_enable_power_save();
+                let base_should_enable = self.power_manager.should_enable_power_save();
                 
                 if let Some(state) = self.interface_states.get_mut(&interface) {
+                    // Check for active network usage (PPS > 50 = meaningful traffic)
+                    let pps = state.pps_monitor.sample(&interface);
+                    let has_network_activity = pps > 50;
+                    
+                    let in_game = state.game_mode_until
+                        .map(|until| Instant::now() < until)
+                        .unwrap_or(false);
+                    
+                    // Disable power save if:
+                    // 1. On AC power, OR
+                    // 2. Game mode active, OR  
+                    // 3. Any significant network activity (>50 PPS)
+                    let should_enable = base_should_enable && !in_game && !has_network_activity;
+                    
                     // Hysteresis: require 3 stable ticks before changing power save
                     // This prevents AC/battery flapping from causing jitter
                     if state.power_save_enabled != Some(should_enable) {
@@ -276,12 +317,15 @@ impl Governor {
                             if let Some(wifi_ifc) = wifi_interfaces.iter().find(|i| i.name == interface) {
                                 if should_enable {
                                     if let Ok(_) = self.wifi_manager.enable_power_save(wifi_ifc) {
-                                        info!("Power save ENABLED on {} (battery mode)", interface);
+                                        info!("Power save ENABLED on {} (battery, idle)", interface);
                                         state.power_save_enabled = Some(true);
                                     }
                                 } else {
                                     if let Ok(_) = self.wifi_manager.disable_power_save(wifi_ifc) {
-                                        info!("Power save DISABLED on {} (AC/Desktop mode)", interface);
+                                        let reason = if !base_should_enable { "AC power" }
+                                            else if in_game { "game mode" }
+                                            else { "network activity" };
+                                        info!("Power save DISABLED on {} ({})", interface, reason);
                                         state.power_save_enabled = Some(false);
                                     }
                                 }

@@ -25,7 +25,6 @@ pub enum DeviceType {
 /// Manages power-aware Wi-Fi settings
 pub struct PowerManager {
     device_type: DeviceType,
-    current_source: PowerSource,
 }
 
 impl PowerManager {
@@ -37,7 +36,6 @@ impl PowerManager {
         
         Self {
             device_type,
-            current_source,
         }
     }
 
@@ -110,32 +108,48 @@ impl PowerManager {
     }
 
     /// Detect current power source
+    /// FIXED: Collect ALL power supply info first, then decide (prevents race condition)
     pub fn detect_power_source() -> PowerSource {
-        // Method 1: Check AC adapter
         let power_supply = Path::new("/sys/class/power_supply");
+        
+        let mut ac_online = false;
+        let mut battery_discharging = false;
+        let mut battery_found = false;
         
         if let Ok(entries) = fs::read_dir(power_supply) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 
+                // Skip peripheral batteries
+                if name.contains("hidpp") || name.contains("hid") || 
+                   name.contains("mouse") || name.contains("keyboard") {
+                    continue;
+                }
+                
                 // Check AC adapters
-                if name.starts_with("AC") || name.starts_with("ADP") {
+                if name.starts_with("AC") || name.starts_with("ADP") || name.contains("ACAD") {
                     let online_path = entry.path().join("online");
                     if let Ok(status) = fs::read_to_string(&online_path) {
                         if status.trim() == "1" {
-                            return PowerSource::AC;
+                            ac_online = true;
                         }
                     }
                 }
 
                 // Check battery status
                 if name.starts_with("BAT") || name == "battery" {
+                    battery_found = true;
                     let status_path = entry.path().join("status");
                     if let Ok(status) = fs::read_to_string(&status_path) {
                         let status = status.trim();
                         match status {
-                            "Charging" | "Full" | "Not charging" => return PowerSource::AC,
-                            "Discharging" => return PowerSource::Battery,
+                            "Charging" | "Full" | "Not charging" => {
+                                // Battery connected to power = AC
+                                ac_online = true;
+                            }
+                            "Discharging" => {
+                                battery_discharging = true;
+                            }
                             _ => {}
                         }
                     }
@@ -143,11 +157,28 @@ impl PowerManager {
             }
         }
 
+        // AC takes priority - if adapter is online, we're on AC regardless of battery state
+        if ac_online {
+            return PowerSource::AC;
+        }
+        
+        // Only report battery if we found one and it's discharging
+        if battery_found && battery_discharging {
+            return PowerSource::Battery;
+        }
+        
+        // No battery = desktop = treat as AC
+        if !battery_found {
+            return PowerSource::AC;
+        }
+
         PowerSource::Unknown
     }
 
+    /// Get current power source (refreshed dynamically)
     pub fn power_source(&self) -> PowerSource {
-        self.current_source
+        // Always get fresh reading
+        Self::detect_power_source()
     }
 
     /// Get device type
@@ -156,12 +187,15 @@ impl PowerManager {
     }
 
     /// Should power saving be enabled based on current state?
+    /// FIXED: Now refreshes power source dynamically instead of using cached value
     pub fn should_enable_power_save(&self) -> bool {
+        let current_source = Self::detect_power_source();
+        
         match self.device_type {
             DeviceType::Desktop => false, // Always performance mode
             DeviceType::SteamDeck | DeviceType::Laptop => {
                 // Enable power save only when on battery
-                self.current_source == PowerSource::Battery
+                current_source == PowerSource::Battery
             }
         }
     }
