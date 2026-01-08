@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use log::{info, error, warn};
 
 use crate::config::loader::load_config;
-use crate::network::wifi::WifiManager;
+use crate::network::wifi::{WifiManager, WifiInterface};
 use crate::network::backend_tuner::BackendTuner;
 use crate::network::governor::Governor;
 use crate::system::power::PowerManager;
@@ -127,11 +127,31 @@ fn run_apply(config: &config::structs::Config) -> Result<()> {
             config.system.irq_affinity_enabled,
             config.system.driver_tweaks_enabled,
         );
-        sys_opt.apply(interfaces)?;
+        
+        // Only optimize connected/active interfaces
+        let active_interfaces: Vec<WifiInterface> = interfaces
+            .iter()
+            .filter(|ifc| wifi_mgr.is_interface_connected(ifc))
+            .cloned()
+            .collect();
+        
+        if active_interfaces.is_empty() {
+            warn!("No active network connections - skipping IRQ optimizations");
+        } else {
+            info!("Optimizing {} active interface(s)", active_interfaces.len());
+            sys_opt.apply(&active_interfaces)?;
+        }
     }
 
     // 4. Apply power-aware settings
     for ifc in interfaces {
+        // Skip disconnected interfaces
+        if !wifi_mgr.is_interface_connected(ifc) {
+            info!("Skipping {} (not connected)", ifc.name);
+            continue;
+        }
+        
+        info!("Optimizing connected interface: {}", ifc.name);
         let should_save = match config.power.wlan_power_save.as_str() {
             "on" => {
                 info!("Power save forced ON by config on {}", ifc.name);
@@ -402,11 +422,15 @@ async fn run_status_async() -> Result<()> {
     println!("{}{}{}┌─ Interfaces & Tweaks{}", BOLD, BLUE, NC, NC);
     
     if wifi_mgr.interfaces().is_empty() {
-         println!("{}│{}  {}No Wi-Fi interfaces detected{}", BLUE, NC, DIM, NC);
+         println!("{}│{}  {}No network interfaces detected{}", BLUE, NC, DIM, NC);
     }
 
     for ifc in wifi_mgr.interfaces() {
-        println!("{}│{}  {}{}{} (Driver: {}, {:?})", BLUE, NC, BOLD, ifc.name, NC, ifc.driver, ifc.category);
+        let ifc_type = match ifc.interface_type {
+            crate::network::wifi::InterfaceType::Wifi => "WiFi",
+            crate::network::wifi::InterfaceType::Ethernet => "Ethernet",
+        };
+        println!("{}│{}  {}{}{} (Type: {}, Driver: {}, {:?})", BLUE, NC, BOLD, ifc.name, NC, ifc_type, ifc.driver, ifc.category);
 
         // CAKE Status (tc)
         let qdisc_out = Command::new("tc")
@@ -426,20 +450,24 @@ async fn run_status_async() -> Result<()> {
              println!("{}│{}    ├─ CAKE:       {}[INACTIVE]{}", BLUE, NC, RED, NC);
         }
 
-        // Power Save (iw)
-        let ps_out = Command::new("iw")
-            .args(["dev", &ifc.name, "get", "power_save"])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default();
-        
-        let ps_status = if ps_out.contains("on") {
-             format!("{}[ON]{} (Power Saving)", YELLOW, NC)
+        // Power Save (iw) - WiFi only
+        if ifc.interface_type == crate::network::wifi::InterfaceType::Wifi {
+            let ps_out = Command::new("iw")
+                .args(["dev", &ifc.name, "get", "power_save"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            
+            let ps_status = if ps_out.contains("on") {
+                 format!("{}[ON]{} (Power Saving)", YELLOW, NC)
+            } else {
+                 format!("{}[OFF]{} (Performance)", GREEN, NC)
+            };
+            println!("{}│{}    ├─ Power Save: {}", BLUE, NC, ps_status);
         } else {
-             format!("{}[OFF]{} (Performance)", GREEN, NC)
-        };
-        println!("{}│{}    ├─ Power Save: {}", BLUE, NC, ps_status);
+            println!("{}│{}    ├─ Power Save: {}[N/A]{} (Ethernet)", DIM, NC, DIM, NC);
+        }
 
         // IRQ Affinity
         let irq_out = std::fs::read_to_string("/proc/interrupts").unwrap_or_default();
