@@ -115,11 +115,6 @@ impl TcManager {
         }
     }
 
-    /// Check if in game mode
-    pub fn is_game_mode(&self) -> bool {
-        self.game_mode_frozen
-    }
-
     /// Update the bandwidth with a new PHY rate sample
     /// Returns true if CAKE should be updated
     pub fn update_bandwidth(&mut self, phy_rate_mbit: u32) -> bool {
@@ -293,9 +288,9 @@ impl TcManager {
         Ok(())
     }
 
-    /// Get last applied bandwidth for status display
-    pub fn last_applied_bandwidth(&self) -> Option<u32> {
-        self.last_bandwidth
+    #[cfg(test)]
+    pub fn is_game_mode(&self) -> bool {
+        self.game_mode_frozen
     }
 
     #[cfg(test)]
