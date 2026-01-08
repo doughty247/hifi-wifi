@@ -175,13 +175,30 @@ fi
 
 $RUN_AS_ROOT ./target/release/hifi-wifi install
 
+# SteamOS: Handle read-only filesystem for symlink creation
+if [[ "$ID" == "steamos" ]]; then
+    if [[ ! -L /usr/local/bin/hifi-wifi ]]; then
+        echo -e "${BLUE}[SteamOS] Creating CLI symlink...${NC}"
+        # Ensure filesystem is writable
+        systemd-sysext unmerge 2>/dev/null || true
+        steamos-readonly disable 2>&1 | grep -v "Warning:" || true
+        sleep 1
+        
+        # Create symlink
+        ln -sf /var/lib/hifi-wifi/hifi-wifi /usr/local/bin/hifi-wifi 2>/dev/null || true
+        
+        # Re-enable readonly
+        steamos-readonly enable 2>&1 | grep -v "Warning:" || true
+    fi
+fi
+
 # Verify symlink exists and use absolute path if needed
 if [[ -L /usr/local/bin/hifi-wifi ]]; then
     HIFI_CMD="hifi-wifi"
 else
     echo -e "${BLUE}Using direct binary path (symlink not yet in PATH)${NC}"
-    H-e "${BLUE}Note:${NC} You may need to start a new shell or run: ${BLUE}hash -r${NC}"
-echo IFI_CMD="/var/lib/hifi-wifi/hifi-wifi"
+    echo -e "${BLUE}Note:${NC} You may need to start a new shell or run: ${BLUE}hash -r${NC}"
+    HIFI_CMD="/var/lib/hifi-wifi/hifi-wifi"
 fi
 
 $RUN_AS_ROOT $HIFI_CMD apply
