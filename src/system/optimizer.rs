@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-use crate::network::wifi::{DriverCategory, WifiInterface};
+use crate::network::wifi::{DriverCategory, WifiInterface, InterfaceType};
 
 /// System optimizer for kernel and driver tuning
 pub struct SystemOptimizer {
@@ -262,10 +262,54 @@ options mwifiex disable_auto_ds=1
     fn apply_ethtool_settings(&self, ifc: &WifiInterface) -> Result<()> {
         debug!("Applying ethtool settings for {}", ifc.name);
 
-        // Disable TSO/GSO, keep GRO enabled
+        // Disable TSO/GSO for all interfaces (reduces latency, CAKE handles segmentation)
         let _ = Command::new("ethtool")
             .args(["-K", &ifc.name, "tso", "off", "gso", "off", "gro", "on"])
             .output();
+
+        // Ethernet-specific optimizations for streaming/gaming
+        if ifc.interface_type == InterfaceType::Ethernet {
+            info!("Applying ethernet streaming optimizations for {}", ifc.name);
+            
+            // Disable Energy Efficient Ethernet (EEE) - causes micro-stutters in streaming
+            // EEE puts the link into low-power state between packets, causing 50-200us wakeup latency
+            let eee_result = Command::new("ethtool")
+                .args(["--set-eee", &ifc.name, "eee", "off"])
+                .output();
+            
+            match eee_result {
+                Ok(output) if output.status.success() => {
+                    info!("Disabled EEE (Energy Efficient Ethernet) on {} for low latency", ifc.name);
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stderr.contains("not supported") {
+                        debug!("EEE disable returned: {}", stderr.trim());
+                    }
+                }
+                Err(e) => debug!("EEE command failed: {}", e),
+            }
+
+            // Set initial low-latency coalescing defaults for ethernet
+            // The governor will dynamically adjust this based on CPU load
+            // rx-usecs=0, rx-frames=1 means "interrupt immediately on every packet"
+            let coal_result = Command::new("ethtool")
+                .args(["-C", &ifc.name, "rx-usecs", "0", "rx-frames", "1", "tx-usecs", "0", "tx-frames", "1"])
+                .output();
+            
+            match coal_result {
+                Ok(output) if output.status.success() => {
+                    info!("Set low-latency interrupt coalescing on {}", ifc.name);
+                }
+                Ok(_) => debug!("Coalescing settings may not be fully supported on {}", ifc.name),
+                Err(e) => debug!("Coalescing command failed: {}", e),
+            }
+
+            // Disable adaptive coalescing (we manage it ourselves based on CPU headroom)
+            let _ = Command::new("ethtool")
+                .args(["-C", &ifc.name, "adaptive-rx", "off", "adaptive-tx", "off"])
+                .output();
+        }
 
         Ok(())
     }

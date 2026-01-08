@@ -311,9 +311,17 @@ pub struct EthtoolManager;
 
 impl EthtoolManager {
     /// Enable interrupt coalescing (for high CPU scenarios)
+    /// Uses moderate coalescing to reduce CPU load while maintaining acceptable latency
     pub fn enable_coalescing(interface: &str) -> Result<()> {
         debug!("Enabling interrupt coalescing on {}", interface);
         
+        // Set moderate coalescing: wait up to 50us or 8 frames before interrupt
+        // This reduces CPU load significantly while keeping latency under 1ms
+        let _ = Command::new("ethtool")
+            .args(["-C", interface, "rx-usecs", "50", "rx-frames", "8", "tx-usecs", "50", "tx-frames", "8"])
+            .output();
+
+        // Also enable adaptive on supported cards as a fallback
         let _ = Command::new("ethtool")
             .args(["-C", interface, "adaptive-rx", "on"])
             .output();
@@ -321,14 +329,39 @@ impl EthtoolManager {
         Ok(())
     }
 
-    /// Disable interrupt coalescing (for low latency)
+    /// Disable interrupt coalescing (for low latency gaming/streaming)
+    /// Interrupts fire immediately on every packet for minimum latency
     pub fn disable_coalescing(interface: &str) -> Result<()> {
         debug!("Disabling interrupt coalescing on {}", interface);
         
+        // Zero coalescing: interrupt on every packet (lowest latency)
         let _ = Command::new("ethtool")
-            .args(["-C", interface, "adaptive-rx", "off"])
+            .args(["-C", interface, "rx-usecs", "0", "rx-frames", "1", "tx-usecs", "0", "tx-frames", "1"])
             .output();
 
+        // Disable adaptive coalescing
+        let _ = Command::new("ethtool")
+            .args(["-C", interface, "adaptive-rx", "off", "adaptive-tx", "off"])
+            .output();
+
+        Ok(())
+    }
+
+    /// Enable Energy Efficient Ethernet (for battery/power saving)
+    pub fn enable_eee(interface: &str) -> Result<()> {
+        debug!("Enabling EEE on {}", interface);
+        let _ = Command::new("ethtool")
+            .args(["--set-eee", interface, "eee", "on"])
+            .output();
+        Ok(())
+    }
+
+    /// Disable Energy Efficient Ethernet (for streaming/gaming)
+    pub fn disable_eee(interface: &str) -> Result<()> {
+        debug!("Disabling EEE on {}", interface);
+        let _ = Command::new("ethtool")
+            .args(["--set-eee", interface, "eee", "off"])
+            .output();
         Ok(())
     }
 }
