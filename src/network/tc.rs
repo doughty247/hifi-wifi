@@ -87,10 +87,12 @@ impl TcManager {
     /// Update throughput-based bandwidth estimate from actual bytes transferred
     /// This provides a reality check against PHY rate
     pub fn update_throughput(&mut self, bytes_per_sec: u64) {
-        // Convert to Mbit/s with some headroom (throughput * 1.2 to account for overhead)
-        let mbit = ((bytes_per_sec * 8) as f64 / 1_000_000.0 * 1.2) as u32;
+        // Convert to Mbit/s - NO headroom, use actual measured value
+        // The 85% scaling in governor provides the margin for CAKE
+        let mbit = ((bytes_per_sec * 8) as f64 / 1_000_000.0) as u32;
         if mbit > 0 {
             self.throughput_bandwidth = Some(mbit);
+            debug!("CAKE: Measured throughput {} Mbit/s", mbit);
         }
     }
 
