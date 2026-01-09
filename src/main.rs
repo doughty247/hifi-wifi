@@ -466,7 +466,24 @@ async fn run_status_async() -> Result<()> {
             };
             println!("{}│{}    ├─ Power Save: {}", BLUE, NC, ps_status);
         } else {
-            println!("{}│{}    ├─ Power Save: {}[N/A]{} (Ethernet)", DIM, NC, DIM, NC);
+            // For ethernet, show EEE status instead
+            let eee_out = Command::new("ethtool")
+                .args(["--show-eee", &ifc.name])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            
+            let eee_status = if eee_out.contains("EEE status: disabled") {
+                format!("{}[DISABLED]{} (Low Latency)", GREEN, NC)
+            } else if eee_out.contains("EEE status: enabled") {
+                format!("{}[ENABLED]{} (Power Saving)", YELLOW, NC)
+            } else if eee_out.contains("not supported") || eee_out.contains("Operation not supported") {
+                format!("{}[N/A]{} (Not Supported)", DIM, NC)
+            } else {
+                format!("{}[UNKNOWN]{}", DIM, NC)
+            };
+            println!("{}│{}    ├─ EEE:        {}", BLUE, NC, eee_status);
         }
 
         // IRQ Affinity
