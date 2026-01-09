@@ -175,6 +175,13 @@ fi
 
 $RUN_AS_ROOT ./target/release/hifi-wifi install
 
+# Bazzite/Fedora: Fix SELinux context for the installed binary
+# Without this, systemd cannot execute binaries in /var/lib/ (var_lib_t context)
+if command -v chcon &> /dev/null && [[ -f /var/lib/hifi-wifi/hifi-wifi ]]; then
+    echo -e "${BLUE}Setting SELinux context for binary...${NC}"
+    $RUN_AS_ROOT chcon -t bin_t /var/lib/hifi-wifi/hifi-wifi 2>/dev/null || true
+fi
+
 # SteamOS: Handle read-only filesystem for symlink creation
 if [[ "$ID" == "steamos" ]]; then
     if [[ ! -L /usr/local/bin/hifi-wifi ]]; then

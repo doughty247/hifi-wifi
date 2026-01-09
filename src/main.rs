@@ -730,6 +730,42 @@ fn run_install() -> Result<()> {
     perms.set_mode(0o755);
     fs::set_permissions(&target_bin, perms)?;
 
+    // Fix SELinux context on Fedora-based systems (Bazzite, etc.)
+    // Without this, systemd cannot execute the binary due to var_lib_t context
+    if std::path::Path::new("/usr/sbin/restorecon").exists() {
+        info!("Setting SELinux context for binary...");
+        // First try restorecon (uses default policy)
+        let restorecon = Command::new("restorecon")
+            .arg("-v")
+            .arg(&target_bin)
+            .output();
+        
+        // If restorecon doesn't set bin_t (var_lib default is var_lib_t), use chcon
+        if restorecon.is_ok() {
+            // Verify context - if still var_lib_t, force bin_t
+            let context_check = Command::new("ls")
+                .args(["-Z", target_bin.to_str().unwrap()])
+                .output();
+            
+            if let Ok(output) = context_check {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if stdout.contains("var_lib_t") {
+                    // Force bin_t context so systemd can execute it
+                    let _ = Command::new("chcon")
+                        .args(["-t", "bin_t", target_bin.to_str().unwrap()])
+                        .output();
+                    info!("Applied bin_t SELinux context");
+                }
+            }
+        }
+    } else if std::path::Path::new("/usr/bin/chcon").exists() {
+        // Fallback: direct chcon if restorecon not available
+        info!("Setting SELinux context (chcon fallback)...");
+        let _ = Command::new("chcon")
+            .args(["-t", "bin_t", target_bin.to_str().unwrap()])
+            .output();
+    }
+
     // Create systemd service
     // Per rewrite.md: Service config with capabilities
     let service_content = r#"[Unit]
