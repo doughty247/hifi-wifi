@@ -542,6 +542,9 @@ async fn run_status_async() -> Result<()> {
                      } else {
                          format!("{}[OPTIMIZED]{} (CPU 1)", GREEN, NC)
                      }
+                 } else if optimized == 0 {
+                     // No IRQs pinned = default system distribution
+                     format!("{}[DEFAULT]{} (System Managed)", DIM, NC)
                  } else {
                      format!("{}[PARTIAL]{} ({}/{} pinned)", YELLOW, NC, optimized, total)
                  }
