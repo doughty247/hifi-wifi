@@ -95,12 +95,23 @@ setup_steamos_build_env() {
     pacman-key --populate archlinux || true
     pacman-key --populate holo 2>/dev/null || true
     
-    # Sync package database
+    # Remove stale lock file if present
+    if [[ -f /var/lib/pacman/db.lck ]]; then
+        echo -e "${YELLOW}Removing stale pacman lock file...${NC}"
+        rm -f /var/lib/pacman/db.lck
+    fi
+    
+    # Sync package database (retry once on failure)
     echo -e "${BLUE}Syncing package database...${NC}"
-    pacman -Sy || {
-        echo -e "${RED}Package database sync failed (filesystem may still be read-only)${NC}"
-        exit 1
-    }
+    if ! pacman -Sy; then
+        echo -e "${YELLOW}First sync failed, retrying...${NC}"
+        sleep 2
+        pacman -Sy || {
+            echo -e "${RED}Package database sync failed${NC}"
+            echo -e "${YELLOW}Try: sudo rm /var/lib/pacman/db.lck && sudo pacman -Sy${NC}"
+            exit 1
+        }
+    fi
     
     # Install build dependencies
     echo -e "${BLUE}Installing build tools...${NC}"
