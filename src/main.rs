@@ -1214,15 +1214,26 @@ WantedBy=multi-user.target
         }
     }
     
-    // If we repaired anything, reload systemd
+    // If we repaired anything, reload systemd and apply optimizations
     if repaired {
-        info!("Bootstrap: Reloading systemd and starting services...");
+        info!("Bootstrap: Reloading systemd...");
         let _ = Command::new("systemctl").args(["daemon-reload"]).output();
         let _ = Command::new("systemctl").args(["enable", "hifi-wifi.service"]).output();
+        
+        // Apply optimizations BEFORE starting the service
+        // This restores sysctl, modprobe configs, etc. that were wiped
+        info!("Bootstrap: Applying optimizations (configs were wiped by SteamOS update)...");
+        let config = load_config();
+        if let Err(e) = run_apply(&config) {
+            error!("Bootstrap: Failed to apply optimizations: {}", e);
+        }
+        
+        // Now start the service (monitor mode)
+        info!("Bootstrap: Starting service...");
         let _ = Command::new("systemctl").args(["start", "hifi-wifi.service"]).output();
-        info!("Bootstrap: Repair complete - hifi-wifi restored");
+        info!("Bootstrap: Repair complete - hifi-wifi fully restored");
     } else {
-        // Just ensure service is running
+        // Service file exists - just ensure service is running
         let status = Command::new("systemctl")
             .args(["is-active", "--quiet", "hifi-wifi.service"])
             .status();
