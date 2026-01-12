@@ -720,8 +720,8 @@ ExecStart=/var/lib/hifi-wifi/hifi-wifi monitor
 Restart=on-failure
 RestartSec=5
 
-# Security hardening per rewrite.md
-ProtectSystem=full
+# Security hardening
+# Note: ProtectSystem cannot be used - we need to write to /etc/modprobe.d, /etc/sysctl.d, /etc/iwd
 ProtectHome=true
 NoNewPrivileges=false
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
@@ -1191,7 +1191,7 @@ Restart=on-failure
 RestartSec=5
 
 # Security hardening
-ProtectSystem=full
+# Note: ProtectSystem cannot be used - we need to write to /etc/modprobe.d, /etc/sysctl.d, /etc/iwd
 ProtectHome=true
 NoNewPrivileges=false
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN

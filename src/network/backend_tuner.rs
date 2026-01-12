@@ -2,7 +2,7 @@
 //!
 //! Applies optimizations specific to the active Wi-Fi backend.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use log::{info, debug, warn};
 use std::fs::{self, File};
 use std::io::Write;
@@ -107,9 +107,12 @@ impl BackendTuner {
             return self.update_iwd_config(&iwd_conf_path);
         }
 
-        // Create directory
-        fs::create_dir_all(iwd_conf_dir)
-            .context("Failed to create /etc/iwd directory")?;
+        // Create directory (may fail on read-only filesystem)
+        if let Err(e) = fs::create_dir_all(iwd_conf_dir) {
+            warn!("Could not create /etc/iwd directory (Read-only filesystem?): {}", e);
+            warn!("iwd optimizations will NOT be applied.");
+            return Ok(());
+        }
 
         let config = format!(r#"[General]
 # Use control port over nl80211 for better performance
@@ -136,23 +139,34 @@ BandModifier5GHz=2.0
 BandModifier6GHz=3.0
 "#, self.disable_periodic_scan);
 
-        let mut file = File::create(&iwd_conf_path)
-            .context("Failed to create iwd config")?;
-        file.write_all(config.as_bytes())?;
+        match File::create(&iwd_conf_path) {
+            Ok(mut file) => {
+                file.write_all(config.as_bytes())?;
+                info!("Created optimized /etc/iwd/main.conf");
 
-        info!("Created optimized /etc/iwd/main.conf");
-
-        // Restart iwd to apply changes
-        let _ = Command::new("systemctl")
-            .args(["restart", "iwd.service"])
-            .output();
+                // Restart iwd to apply changes
+                let _ = Command::new("systemctl")
+                    .args(["restart", "iwd.service"])
+                    .output();
+            }
+            Err(e) => {
+                warn!("Could not create iwd config (Read-only filesystem?): {}", e);
+                warn!("iwd optimizations will NOT be applied.");
+            }
+        }
 
         Ok(())
     }
 
     /// Update existing iwd config without full overwrite
     fn update_iwd_config(&self, path: &Path) -> Result<()> {
-        let content = fs::read_to_string(path)?;
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Could not read iwd config: {}", e);
+                return Ok(());
+            }
+        };
         
         // Check if DisablePeriodicScan is already set
         if content.contains("DisablePeriodicScan") {
@@ -162,14 +176,16 @@ BandModifier6GHz=3.0
 
         // Append Scan section if missing
         if !content.contains("[Scan]") && self.disable_periodic_scan {
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(path)?;
-            
-            writeln!(file, "\n[Scan]")?;
-            writeln!(file, "DisablePeriodicScan=true")?;
-            
-            info!("Added DisablePeriodicScan to existing iwd config");
+            match fs::OpenOptions::new().append(true).open(path) {
+                Ok(mut file) => {
+                    let _ = writeln!(file, "\n[Scan]");
+                    let _ = writeln!(file, "DisablePeriodicScan=true");
+                    info!("Added DisablePeriodicScan to existing iwd config");
+                }
+                Err(e) => {
+                    warn!("Could not update iwd config (Read-only filesystem?): {}", e);
+                }
+            }
         }
 
         Ok(())
