@@ -16,7 +16,7 @@ use crate::system::optimizer::SystemOptimizer;
 
 #[derive(Parser)]
 #[command(name = "hifi-wifi")]
-#[command(version = "3.0.0-beta.1")]
+#[command(version = "3.0.0-beta.2")]
 #[command(about = "High Fidelity WiFi optimizer for Linux Streaming Handhelds", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -834,9 +834,51 @@ WantedBy=multi-user.target
     // Create CLI symlink for user convenience
     ensure_symlinks();
     
-    // Install user-level bootstrap timer (survives SteamOS updates!)
-    // This runs on every login and repairs the system service if missing
+    // Install tmpfiles.d config for SteamOS persistence (recreates symlinks on every boot)
+    install_tmpfiles_config()?;
+    
+    // Install bootstrap timer as backup
     install_bootstrap_timer()?;
+    
+    Ok(())
+}
+
+/// Install tmpfiles.d config that recreates symlinks on every boot
+/// This is the PRIMARY persistence mechanism for SteamOS - it survives updates!
+fn install_tmpfiles_config() -> Result<()> {
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::process::Command;
+    
+    // tmpfiles.d in /etc is persistent on SteamOS!
+    let tmpfiles_dir = std::path::Path::new("/etc/tmpfiles.d");
+    let tmpfiles_path = tmpfiles_dir.join("hifi-wifi.conf");
+    
+    info!("Installing tmpfiles.d config for boot-time symlink restoration...");
+    
+    // Create directory if needed
+    fs::create_dir_all(tmpfiles_dir)?;
+    
+    // tmpfiles.d format: Type Path Mode User Group Age Argument
+    // L+ = create symlink, replace if exists
+    let tmpfiles_content = r#"# hifi-wifi - recreate symlinks on every boot (survives SteamOS updates)
+# CLI symlink
+L+ /usr/local/bin/hifi-wifi - - - - /var/lib/hifi-wifi/hifi-wifi
+# Systemd service symlinks (bootstrap timer restores the actual service)
+L+ /etc/systemd/system/hifi-wifi-bootstrap.service - - - - /var/lib/hifi-wifi/hifi-wifi-bootstrap.service
+L+ /etc/systemd/system/hifi-wifi-bootstrap.timer - - - - /var/lib/hifi-wifi/hifi-wifi-bootstrap.timer
+"#;
+
+    let mut file = File::create(&tmpfiles_path)?;
+    file.write_all(tmpfiles_content.as_bytes())?;
+    
+    info!("Created {}", tmpfiles_path.display());
+    info!("Symlinks will be automatically restored on every boot!");
+    
+    // Run tmpfiles now to apply immediately
+    let _ = Command::new("systemd-tmpfiles")
+        .args(["--create", tmpfiles_path.to_str().unwrap_or("hifi-wifi.conf")])
+        .output();
     
     Ok(())
 }
@@ -941,6 +983,7 @@ fn run_uninstall() -> Result<()> {
         "/var/lib/hifi-wifi/hifi-wifi-bootstrap.service",
         "/var/lib/hifi-wifi/hifi-wifi-bootstrap.timer",
         "/usr/local/bin/hifi-wifi",
+        "/etc/tmpfiles.d/hifi-wifi.conf",
     ];
     
     for path in &files_to_remove {
