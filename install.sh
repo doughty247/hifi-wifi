@@ -92,15 +92,10 @@ setup_steamos_build_env() {
         }
     fi
     
-    # Populate keyrings (try holo + archlinux, fallback to archlinux only)
+    # Populate keyrings - run separately, failures OK if already populated
     echo -e "${BLUE}Populating pacman keys...${NC}"
-    if ! pacman-key --populate archlinux holo 2>/dev/null; then
-        echo -e "${YELLOW}holo keyring unavailable, using archlinux only...${NC}"
-        pacman-key --populate archlinux || {
-            echo -e "${RED}pacman-key --populate failed${NC}"
-            exit 1
-        }
-    fi
+    pacman-key --populate archlinux || true
+    pacman-key --populate holo 2>/dev/null || true
     
     # Sync package database
     echo -e "${BLUE}Syncing package database...${NC}"
