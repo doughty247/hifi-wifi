@@ -111,11 +111,28 @@ echo -e "${BLUE}=== hifi-wifi v3.0 Installer ===${NC}"
 PRECOMPILED_BIN=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Look for pre-compiled binary in order of preference
+# Debug detection
+echo -e "${BLUE}Installer directory: $SCRIPT_DIR${NC}"
 if [[ -f "$SCRIPT_DIR/bin/hifi-wifi-x86_64" ]]; then
     PRECOMPILED_BIN="$SCRIPT_DIR/bin/hifi-wifi-x86_64"
+    echo -e "${GREEN}Found bundled binary at bin/hifi-wifi-x86_64${NC}"
 elif [[ -f "$SCRIPT_DIR/hifi-wifi-x86_64" ]]; then
     PRECOMPILED_BIN="$SCRIPT_DIR/hifi-wifi-x86_64"
+    echo -e "${GREEN}Found bundled binary in root${NC}"
+else
+    echo -e "${YELLOW}No pre-compiled binary found. Will require build tools.${NC}"
+    if [[ "$ID" == "steamos" ]]; then
+        echo -e "${YELLOW}Note: On SteamOS, it is strongly recommended to use the official release${NC}"
+        echo -e "${YELLOW}tarball which includes the pre-compiled binary, to avoid build issues.${NC}"
+        echo -e "${YELLOW}Download from: https://github.com/doughty247/hifi-wifi/releases${NC}"
+        
+        # If running from source on SteamOS without binary, warn user
+        read -p "Continue with build from source? (May fail on SteamOS) [Y/n] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]] && [[ -n $REPLY ]]; then
+            exit 1
+        fi
+    fi
 fi
 
 # Use pre-compiled binary if available (skips entire build toolchain)
