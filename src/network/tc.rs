@@ -131,17 +131,11 @@ impl TcManager {
             return false;
         }
 
-        // Option C: Use minimum of PHY rate and measured throughput
-        let effective_mbit = if let Some(throughput) = self.throughput_bandwidth {
-            // Use the lower of PHY rate or throughput-based estimate
-            // This catches cases where PHY shows 866Mbps but real throughput is 400Mbps
-            let min_val = phy_rate_mbit.min(throughput.max(50)); // Floor at 50Mbit
-            debug!("CAKE: PHY={}Mbit, Throughput={}Mbit, Using={}Mbit", 
-                   phy_rate_mbit, throughput, min_val);
-            min_val
-        } else {
-            phy_rate_mbit
-        };
+        // Use PHY rate as the primary signal
+        // Throughput monitoring is informational only - PHY rate changes based on signal quality
+        // and the driver/AP negotiate the best rate. Measuring actual throughput and capping
+        // to it creates a chicken-and-egg problem during speed tests.
+        let effective_mbit = phy_rate_mbit;
 
         // Stage 1: Add to rolling window
         self.sample_window.push_back(effective_mbit);
