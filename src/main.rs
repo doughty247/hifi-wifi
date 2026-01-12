@@ -16,7 +16,7 @@ use crate::system::optimizer::SystemOptimizer;
 
 #[derive(Parser)]
 #[command(name = "hifi-wifi")]
-#[command(version = "3.0.0")]
+#[command(version = "3.0.0-beta.1")]
 #[command(about = "High Fidelity WiFi optimizer for Linux Streaming Handhelds", long_about = None)]
 struct Cli {
     #[command(subcommand)]
