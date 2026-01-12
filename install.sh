@@ -127,39 +127,24 @@ else
             
             echo -e "${BLUE}[SteamOS] Initializing pacman...${NC}"
             if [[ ! -f /etc/pacman.d/gnupg/trustdb.gpg ]]; then
-                # Run pacman-key --init, capture status before piping
-                # We filter gpg: noise but need to detect real failures
-                set +e  # Temporarily disable exit on error
-                pacman-key --init 2>&1 | grep -v "^gpg:" 
-                INIT_STATUS=${PIPESTATUS[0]}
-                set -e
-                if [[ $INIT_STATUS -ne 0 ]]; then
-                    echo -e "${RED}pacman-key --init failed (exit $INIT_STATUS)${NC}"
+                pacman-key --init || {
+                    echo -e "${RED}pacman-key --init failed${NC}"
                     exit 1
-                fi
+                }
             fi
             
             echo -e "${BLUE}[SteamOS] Populating pacman keys...${NC}"
-            # Try archlinux + holo first, fall back to just archlinux
-            # We filter ==> progress lines but need to detect real failures
-            set +e
-            pacman-key --populate archlinux holo 2>&1 | grep -v "^==>"
-            POPULATE_STATUS=${PIPESTATUS[0]}
-            set -e
-            if [[ $POPULATE_STATUS -ne 0 ]]; then
+            # Try archlinux + holo, fallback to just archlinux if holo not available
+            if ! pacman-key --populate archlinux holo 2>/dev/null; then
                 echo -e "${YELLOW}holo keyring not found, trying archlinux only...${NC}"
-                set +e
-                pacman-key --populate archlinux 2>&1 | grep -v "^==>"
-                POPULATE_STATUS=${PIPESTATUS[0]}
-                set -e
-                if [[ $POPULATE_STATUS -ne 0 ]]; then
-                    echo -e "${RED}pacman-key --populate failed (exit $POPULATE_STATUS)${NC}"
+                if ! pacman-key --populate archlinux; then
+                    echo -e "${RED}pacman-key --populate failed${NC}"
                     exit 1
                 fi
             fi
             
             echo -e "${BLUE}[SteamOS] Syncing package database...${NC}"
-            if ! pacman -Sy 2>&1; then
+            if ! pacman -Sy; then
                 echo -e "${RED}Package database sync failed!${NC}"
                 echo -e "${YELLOW}This usually means the filesystem is still read-only somewhere.${NC}"
                 echo -e "${BLUE}Try: Reboot your Steam Deck and run the installer again.${NC}"
