@@ -60,6 +60,13 @@ async fn main() -> Result<()> {
         log::set_max_level(log::LevelFilter::Warn);
     }
 
+    // Self-repair: If CLI symlink is missing (SteamOS update wiped it), restore it
+    // This runs on EVERY invocation - makes hifi-wifi self-healing
+    // Must run before root check since status doesn't need root but repair does
+    if utils::privilege::is_root() {
+        quick_self_repair();
+    }
+
     // Root check (except for status command)
     if !matches!(cli.command, Some(Commands::Status)) && !utils::privilege::is_root() {
         error!("This application must be run as root.");
@@ -295,6 +302,103 @@ fn is_steamos() -> bool {
         content.contains("ID=steamos")
     } else {
         false
+    }
+}
+
+/// Quick self-repair: Restore CLI symlink and systemd service if missing
+/// This runs on EVERY root invocation to make hifi-wifi self-healing after SteamOS updates
+/// SteamOS wipes /etc and /usr on updates, but /var persists - so we repair from there
+fn quick_self_repair() {
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+    use std::process::Command;
+    
+    let binary_path = Path::new("/var/lib/hifi-wifi/hifi-wifi");
+    let symlink_path = Path::new("/usr/local/bin/hifi-wifi");
+    let service_path = Path::new("/etc/systemd/system/hifi-wifi.service");
+    
+    // Only repair if our binary exists in persistent storage
+    if !binary_path.exists() {
+        return;
+    }
+    
+    let mut needs_repair = false;
+    
+    // Check if CLI symlink is missing
+    if !symlink_path.exists() {
+        needs_repair = true;
+    }
+    
+    // Check if service file is missing
+    if !service_path.exists() {
+        needs_repair = true;
+    }
+    
+    if !needs_repair {
+        return;
+    }
+    
+    // On SteamOS, disable read-only filesystem for repairs
+    let steamos = is_steamos();
+    if steamos {
+        let _ = Command::new("systemd-sysext").arg("unmerge").output();
+        let _ = Command::new("steamos-readonly").arg("disable").output();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    
+    // Repair CLI symlink
+    if !symlink_path.exists() {
+        eprintln!("[hifi-wifi] Self-repair: Restoring CLI symlink...");
+        let _ = std::fs::remove_file(symlink_path); // Remove broken symlink if any
+        if symlink(binary_path, symlink_path).is_ok() {
+            eprintln!("[hifi-wifi] CLI symlink restored: {} -> {}", symlink_path.display(), binary_path.display());
+        }
+    }
+    
+    // Repair systemd service file
+    if !service_path.exists() {
+        eprintln!("[hifi-wifi] Self-repair: Restoring systemd service...");
+        let service_content = r#"[Unit]
+Description=hifi-wifi Network Optimizer
+Documentation=https://github.com/doughty247/hifi-wifi
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/var/lib/hifi-wifi/hifi-wifi monitor
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=false
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+
+# Resource limits
+MemoryMax=64M
+CPUQuota=10%
+
+[Install]
+WantedBy=multi-user.target
+"#;
+        if let Ok(mut file) = std::fs::File::create(service_path) {
+            use std::io::Write;
+            if file.write_all(service_content.as_bytes()).is_ok() {
+                eprintln!("[hifi-wifi] Systemd service restored");
+                // Reload and enable
+                let _ = Command::new("systemctl").args(["daemon-reload"]).output();
+                let _ = Command::new("systemctl").args(["enable", "hifi-wifi.service"]).output();
+                let _ = Command::new("systemctl").args(["start", "hifi-wifi.service"]).output();
+            }
+        }
+    }
+    
+    // Re-enable read-only on SteamOS
+    if steamos {
+        let _ = Command::new("steamos-readonly").arg("enable").output();
     }
 }
 
@@ -840,6 +944,11 @@ WantedBy=multi-user.target
     // Install bootstrap timer as backup
     install_bootstrap_timer()?;
     
+    // Install user-level auto-repair service for SteamOS (survives updates in ~/.config/)
+    if is_steamos() {
+        install_user_repair_service()?;
+    }
+    
     Ok(())
 }
 
@@ -961,6 +1070,131 @@ WantedBy=timers.target
     Ok(())
 }
 
+/// Install a user-level systemd service that auto-repairs hifi-wifi after SteamOS updates
+/// Lives in ~/.config/systemd/user/ which PERSISTS across SteamOS updates!
+fn install_user_repair_service() -> Result<()> {
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::process::Command;
+    use std::os::unix::fs::PermissionsExt;
+    
+    // Get the real user info
+    let sudo_user = std::env::var("SUDO_USER").unwrap_or_else(|_| "deck".to_string());
+    let home = std::process::Command::new("getent")
+        .args(["passwd", &sudo_user])
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split(':')
+                .nth(5)
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| format!("/home/{}", sudo_user));
+    
+    let user_systemd_dir = format!("{}/.config/systemd/user", home);
+    let repair_script_path = "/var/lib/hifi-wifi/repair.sh";
+    
+    info!("Installing user repair service in {}", user_systemd_dir);
+    
+    // Create user systemd directory
+    fs::create_dir_all(&user_systemd_dir)?;
+    
+    // Create a repair script that handles the sudo/polkit interaction
+    // This script only does work if repair is actually needed
+    let repair_script = r#"#!/bin/bash
+# hifi-wifi auto-repair script - runs at user login on SteamOS
+# Only performs repair if needed (symlink missing but binary exists)
+
+BINARY="/var/lib/hifi-wifi/hifi-wifi"
+SYMLINK="/usr/local/bin/hifi-wifi"
+SERVICE="/etc/systemd/system/hifi-wifi.service"
+
+# Exit early if no repair needed
+if [[ -x "$SYMLINK" ]] && [[ -f "$SERVICE" ]]; then
+    exit 0
+fi
+
+# Exit if binary doesn't exist (not installed)
+if [[ ! -x "$BINARY" ]]; then
+    exit 0
+fi
+
+# Repair needed - use pkexec for GUI-friendly privilege escalation
+# pkexec shows a nice authentication dialog if needed
+exec pkexec "$BINARY" bootstrap
+"#;
+
+    // Write repair script to persistent location
+    let mut script_file = File::create(repair_script_path)?;
+    script_file.write_all(repair_script.as_bytes())?;
+    let mut perms = fs::metadata(repair_script_path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(repair_script_path, perms)?;
+    
+    // Create polkit rule to allow passwordless bootstrap (better UX)
+    let polkit_dir = "/etc/polkit-1/rules.d";
+    if std::path::Path::new("/etc/polkit-1").exists() {
+        let _ = fs::create_dir_all(polkit_dir);
+        let polkit_rule = format!(r#"// Allow hifi-wifi bootstrap without password for {}
+polkit.addRule(function(action, subject) {{
+    if (action.id == "org.freedesktop.policykit.exec" &&
+        action.lookup("program") == "/var/lib/hifi-wifi/hifi-wifi" &&
+        subject.user == "{}") {{
+        return polkit.Result.YES;
+    }}
+}});
+"#, sudo_user, sudo_user);
+        
+        let polkit_path = format!("{}/49-hifi-wifi.rules", polkit_dir);
+        if let Ok(mut f) = File::create(&polkit_path) {
+            let _ = f.write_all(polkit_rule.as_bytes());
+            info!("Created polkit rule for passwordless repair");
+        }
+    }
+    
+    // Create user systemd service
+    let service_content = format!(r#"[Unit]
+Description=hifi-wifi Auto-Repair (restores after SteamOS updates)
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart={}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target
+"#, repair_script_path);
+
+    let service_path = format!("{}/hifi-wifi-repair.service", user_systemd_dir);
+    let mut service_file = File::create(&service_path)?;
+    service_file.write_all(service_content.as_bytes())?;
+    
+    // Fix ownership of user config directory
+    let uid_output = Command::new("id").args(["-u", &sudo_user]).output()?;
+    let gid_output = Command::new("id").args(["-g", &sudo_user]).output()?;
+    let uid: u32 = String::from_utf8_lossy(&uid_output.stdout).trim().parse().unwrap_or(1000);
+    let gid: u32 = String::from_utf8_lossy(&gid_output.stdout).trim().parse().unwrap_or(1000);
+    
+    // Recursively chown the .config/systemd directory
+    let _ = Command::new("chown")
+        .args(["-R", &format!("{}:{}", uid, gid), &format!("{}/.config/systemd", home)])
+        .output();
+    
+    // Enable the user service (must run as the user)
+    let _ = Command::new("sudo")
+        .args(["-u", &sudo_user, "systemctl", "--user", "daemon-reload"])
+        .output();
+    let _ = Command::new("sudo")
+        .args(["-u", &sudo_user, "systemctl", "--user", "enable", "hifi-wifi-repair.service"])
+        .output();
+    
+    info!("User repair service installed - will auto-repair at login after SteamOS updates");
+    
+    Ok(())
+}
+
 /// Uninstall the systemd service
 fn run_uninstall() -> Result<()> {
     use std::fs;
@@ -1003,11 +1237,97 @@ fn run_uninstall() -> Result<()> {
         let _ = fs::remove_file(binary_path);
     }
 
+    // Remove bashrc hook if present
+    remove_bashrc_hook();
+    
+    // Remove user repair service
+    remove_user_repair_service();
+
     // Revert optimizations
     run_revert()?;
 
     info!("\n=== Uninstallation Complete ===");
     Ok(())
+}
+
+/// Remove the bashrc auto-repair hook
+fn remove_bashrc_hook() {
+    // Get the real user's home directory
+    let home = std::env::var("SUDO_USER")
+        .ok()
+        .and_then(|user| {
+            std::process::Command::new("getent")
+                .args(["passwd", &user])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .split(':')
+                        .nth(5)
+                        .map(|s| s.to_string())
+                })
+        })
+        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/home/deck".to_string()));
+    
+    let bashrc_path = format!("{}/.bashrc", home);
+    
+    if let Ok(contents) = std::fs::read_to_string(&bashrc_path) {
+        // Remove the hook section
+        let hook_start = "# hifi-wifi auto-repair hook";
+        if contents.contains(hook_start) {
+            let new_contents: String = contents
+                .lines()
+                .filter(|line| {
+                    !line.contains("hifi-wifi") || line.contains("alias")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            
+            if let Ok(mut file) = std::fs::File::create(&bashrc_path) {
+                use std::io::Write;
+                let _ = file.write_all(new_contents.as_bytes());
+                info!("Removed bashrc hook");
+            }
+        }
+    }
+}
+
+/// Remove the user repair service
+fn remove_user_repair_service() {
+    use std::process::Command;
+    
+    let sudo_user = std::env::var("SUDO_USER").unwrap_or_else(|_| "deck".to_string());
+    let home = std::process::Command::new("getent")
+        .args(["passwd", &sudo_user])
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split(':')
+                .nth(5)
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| format!("/home/{}", sudo_user));
+    
+    // Disable and remove user service
+    let _ = Command::new("sudo")
+        .args(["-u", &sudo_user, "systemctl", "--user", "disable", "hifi-wifi-repair.service"])
+        .output();
+    let _ = Command::new("sudo")
+        .args(["-u", &sudo_user, "systemctl", "--user", "stop", "hifi-wifi-repair.service"])
+        .output();
+    
+    let service_path = format!("{}/.config/systemd/user/hifi-wifi-repair.service", home);
+    if std::path::Path::new(&service_path).exists() {
+        let _ = std::fs::remove_file(&service_path);
+        info!("Removed user repair service");
+    }
+    
+    // Remove repair script
+    let _ = std::fs::remove_file("/var/lib/hifi-wifi/repair.sh");
+    
+    // Remove polkit rule
+    let _ = std::fs::remove_file("/etc/polkit-1/rules.d/49-hifi-wifi.rules");
 }
 
 /// Turn off hifi-wifi (stop service, revert optimizations) for A/B testing
