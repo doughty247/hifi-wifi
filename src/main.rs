@@ -1154,9 +1154,11 @@ polkit.addRule(function(action, subject) {{
     }
     
     // Create user systemd service
+    // Note: With lingering enabled, this runs when user@.service starts at boot,
+    // which happens early - even before graphical session in SteamOS Game Mode
     let service_content = format!(r#"[Unit]
 Description=hifi-wifi Auto-Repair (restores after SteamOS updates)
-After=graphical-session.target
+After=network-online.target
 
 [Service]
 Type=oneshot
@@ -1182,6 +1184,14 @@ WantedBy=default.target
         .args(["-R", &format!("{}:{}", uid, gid), &format!("{}/.config/systemd", home)])
         .output();
     
+    // Enable lingering for the user - ensures user systemd instance starts at boot
+    // This is critical for SteamOS Game Mode where gamescope session might not
+    // trigger graphical-session.target the same way as KDE Plasma desktop
+    let _ = Command::new("loginctl")
+        .args(["enable-linger", &sudo_user])
+        .output();
+    info!("Enabled user lingering for early boot service start");
+    
     // Enable the user service (must run as the user)
     let _ = Command::new("sudo")
         .args(["-u", &sudo_user, "systemctl", "--user", "daemon-reload"])
@@ -1190,7 +1200,7 @@ WantedBy=default.target
         .args(["-u", &sudo_user, "systemctl", "--user", "enable", "hifi-wifi-repair.service"])
         .output();
     
-    info!("User repair service installed - will auto-repair at login after SteamOS updates");
+    info!("User repair service installed - will auto-repair at boot after SteamOS updates");
     
     Ok(())
 }
@@ -1328,6 +1338,12 @@ fn remove_user_repair_service() {
     
     // Remove polkit rule
     let _ = std::fs::remove_file("/etc/polkit-1/rules.d/49-hifi-wifi.rules");
+    
+    // Disable lingering (only if no other user services need it)
+    // Note: We disable this cautiously - user may have other services that need it
+    let _ = Command::new("loginctl")
+        .args(["disable-linger", &sudo_user])
+        .output();
 }
 
 /// Turn off hifi-wifi (stop service, revert optimizations) for A/B testing
