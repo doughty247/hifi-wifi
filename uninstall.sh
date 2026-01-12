@@ -63,7 +63,7 @@ if systemctl is-enabled --quiet hifi-wifi 2>/dev/null; then
 fi
 
 # 2. Remove systemd service file
-echo -e "${BLUE}[2/4] Removing systemd service...${NC}"
+echo -e "${BLUE}[2/5] Removing systemd service...${NC}"
 if [[ -f /etc/systemd/system/hifi-wifi.service ]]; then
     rm -f /etc/systemd/system/hifi-wifi.service
     systemctl daemon-reload
@@ -72,8 +72,37 @@ else
     echo "Service file not found."
 fi
 
-# 3. Remove binary and data directory
-echo -e "${BLUE}[3/4] Removing binaries and data...${NC}"
+# 3. Remove user repair service (SteamOS auto-repair)
+echo -e "${BLUE}[3/5] Removing user repair service...${NC}"
+SUDO_USER="${SUDO_USER:-deck}"
+USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+USER_HOME="${USER_HOME:-/home/$SUDO_USER}"
+
+# Disable and stop user service
+sudo -u "$SUDO_USER" systemctl --user disable hifi-wifi-repair.service 2>/dev/null || true
+sudo -u "$SUDO_USER" systemctl --user stop hifi-wifi-repair.service 2>/dev/null || true
+
+# Remove user service file
+if [[ -f "$USER_HOME/.config/systemd/user/hifi-wifi-repair.service" ]]; then
+    rm -f "$USER_HOME/.config/systemd/user/hifi-wifi-repair.service"
+    echo "Removed user repair service"
+fi
+
+# Reload user daemon
+sudo -u "$SUDO_USER" systemctl --user daemon-reload 2>/dev/null || true
+
+# Remove polkit rule
+if [[ -f /etc/polkit-1/rules.d/49-hifi-wifi.rules ]]; then
+    rm -f /etc/polkit-1/rules.d/49-hifi-wifi.rules
+    echo "Removed polkit rule"
+fi
+
+# Disable lingering (was enabled for Game Mode support)
+loginctl disable-linger "$SUDO_USER" 2>/dev/null || true
+echo "Disabled user lingering"
+
+# 4. Remove binary and data directory
+echo -e "${BLUE}[4/5] Removing binaries and data...${NC}"
 if [[ -d /var/lib/hifi-wifi ]]; then
     rm -rf /var/lib/hifi-wifi
     echo "Removed /var/lib/hifi-wifi"
@@ -85,8 +114,14 @@ if [[ -L /usr/local/bin/hifi-wifi ]]; then
     echo "Removed /usr/local/bin/hifi-wifi symlink"
 fi
 
-# 4. Remove config (optional - ask user)
-echo -e "${BLUE}[4/4] Cleaning up configuration...${NC}"
+# Remove repair script (stored with binary)
+if [[ -f /var/lib/hifi-wifi/repair.sh ]]; then
+    rm -f /var/lib/hifi-wifi/repair.sh
+    echo "Removed repair script"
+fi
+
+# 5. Remove config (optional - ask user)
+echo -e "${BLUE}[5/5] Cleaning up configuration...${NC}"
 if [[ -d /etc/hifi-wifi ]]; then
     read -p "Remove configuration files in /etc/hifi-wifi? [y/N] " -n 1 -r
     echo
