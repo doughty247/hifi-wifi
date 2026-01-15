@@ -44,15 +44,40 @@ pub struct AccessPoint {
 }
 
 impl AccessPoint {
-    /// Calculate roaming score (RSSI + band bias)
+    /// Calculate roaming score for band steering
+    /// 
+    /// The score considers:
+    /// 1. Signal strength (RSSI in dBm)
+    /// 2. Band bias (5GHz/6GHz preferred over 2.4GHz for gaming)
+    /// 3. Max bitrate (higher potential throughput = better)
+    /// 
+    /// For gaming, we prefer 5GHz/6GHz even with slightly weaker signal
+    /// because of lower latency and less interference.
     pub fn score(&self, bias_5ghz: i32, bias_6ghz: i32) -> i32 {
-        let bias = match self.band {
+        let band_bias = match self.band {
             WifiBand::Band2_4GHz => 0,
             WifiBand::Band5GHz => bias_5ghz,
             WifiBand::Band6GHz => bias_6ghz,
             WifiBand::Unknown => 0,
         };
-        self.signal_strength + bias
+        
+        // Throughput bonus: Add points for high-bitrate APs
+        // This accounts for wider channels (80MHz, 160MHz)
+        // Scale: 0-600Mbps = 0-10 points, capped at 10
+        let throughput_bonus = std::cmp::min(self.max_bitrate / 60000, 10) as i32;
+        
+        self.signal_strength + band_bias + throughput_bonus
+    }
+    
+    /// Check if signal is usable for the given band
+    /// 5GHz/6GHz need stronger signals due to higher path loss
+    pub fn signal_usable(&self, min_2g: i32, min_5g: i32, min_6g: i32) -> bool {
+        match self.band {
+            WifiBand::Band2_4GHz => self.signal_strength >= min_2g,
+            WifiBand::Band5GHz => self.signal_strength >= min_5g,
+            WifiBand::Band6GHz => self.signal_strength >= min_6g,
+            WifiBand::Unknown => false,
+        }
     }
 }
 
@@ -346,13 +371,55 @@ mod tests {
             frequency: 5180,
             band: WifiBand::Band5GHz,
             signal_strength: -60,
-            max_bitrate: 1000,
+            max_bitrate: 300000, // 300 Mbps - gives 5 points throughput bonus
         };
         
-        // Base score -60 + bias 15 = -45
-        assert_eq!(ap.score(15, 20), -45);
+        // Score = RSSI (-60) + band_bias (15) + throughput_bonus (5) = -40
+        assert_eq!(ap.score(15, 20), -40);
         
         // With higher bias
-        assert_eq!(ap.score(30, 20), -30);
+        assert_eq!(ap.score(30, 20), -25);
+        
+        // Test signal_usable per band
+        assert!(ap.signal_usable(-75, -72, -70)); // -60 is good for 5GHz
+        
+        let weak_ap = AccessPoint {
+            path: "/".to_string(),
+            ssid: "Test".to_string(),
+            bssid: "00:11:22:33:44:66".to_string(),
+            frequency: 5925, // 6GHz
+            band: WifiBand::Band6GHz,
+            signal_strength: -71, // Too weak for 6GHz threshold
+            max_bitrate: 600000,
+        };
+        assert!(!weak_ap.signal_usable(-75, -72, -70)); // -71 fails 6GHz threshold of -70
+    }
+    
+    #[test]
+    fn test_throughput_bonus() {
+        // Low bitrate AP
+        let slow_ap = AccessPoint {
+            path: "/".to_string(),
+            ssid: "Test".to_string(),
+            bssid: "00:11:22:33:44:55".to_string(),
+            frequency: 2412,
+            band: WifiBand::Band2_4GHz,
+            signal_strength: -50,
+            max_bitrate: 54000, // 54 Mbps - gives 0 points
+        };
+        assert_eq!(slow_ap.score(15, 25), -50); // No band bias, no throughput bonus
+        
+        // High bitrate 6GHz AP
+        let fast_ap = AccessPoint {
+            path: "/".to_string(),
+            ssid: "Test".to_string(),
+            bssid: "00:11:22:33:44:66".to_string(),
+            frequency: 6000,
+            band: WifiBand::Band6GHz,
+            signal_strength: -55,
+            max_bitrate: 1200000, // 1.2 Gbps - caps at 10 points
+        };
+        // Score = -55 + 25 (6GHz bias) + 10 (throughput cap) = -20
+        assert_eq!(fast_ap.score(15, 25), -20);
     }
 }

@@ -47,9 +47,15 @@ impl Default for GlobalConfig {
 pub struct WifiConfig {
     #[allow(dead_code)]
     pub enabled: bool,
-    pub min_signal_dbm: i32,
-    /// Band bias for scoring (5GHz gets +15, 6GHz gets +20)
+    /// Minimum signal for 2.4GHz (more tolerant)
+    pub min_signal_2g_dbm: i32,
+    /// Minimum signal for 5GHz (needs stronger signal)
+    pub min_signal_5g_dbm: i32,
+    /// Minimum signal for 6GHz (needs even stronger due to higher path loss)
+    pub min_signal_6g_dbm: i32,
+    /// Band bias for scoring (5GHz gets +15 - prefers 5GHz even with 15dB weaker signal)
     pub band_bias_5ghz: i32,
+    /// Band bias for 6GHz (gets +25 - less interference, 160MHz channels, ideal for gaming)
     pub band_bias_6ghz: i32,
 }
 
@@ -57,9 +63,12 @@ impl Default for WifiConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            min_signal_dbm: -75,
+            // Per-band thresholds: 5GHz/6GHz need stronger signals due to path loss
+            min_signal_2g_dbm: -75,
+            min_signal_5g_dbm: -72,  // 5GHz: slightly stricter
+            min_signal_6g_dbm: -70,  // 6GHz: even stricter (higher path loss)
             band_bias_5ghz: 15,  // Per rewrite.md
-            band_bias_6ghz: 20,  // Per rewrite.md
+            band_bias_6ghz: 25,  // Higher than 5GHz - 6GHz has less interference, better for gaming
         }
     }
 }

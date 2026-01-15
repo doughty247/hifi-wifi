@@ -747,6 +747,9 @@ WantedBy=multi-user.target
     Command::new("systemctl").args(["enable", "hifi-wifi.service"]).output()?;
     Command::new("systemctl").args(["start", "hifi-wifi.service"]).output()?;
 
+    // Install NetworkManager dispatcher for connection events (per roadmap-beta2.md)
+    install_nm_dispatcher()?;
+
     info!("\n=== Installation Complete ===");
     info!("Service installed and started.");
     info!("  Status: systemctl status hifi-wifi");
@@ -760,6 +763,69 @@ WantedBy=multi-user.target
         install_user_repair_service()?;
     }
     
+    Ok(())
+}
+
+/// Install NetworkManager dispatcher for connection events
+/// Per roadmap-beta2.md: This signals the daemon when WiFi reconnects
+fn install_nm_dispatcher() -> Result<()> {
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    
+    let dispatcher_dir = std::path::Path::new("/etc/NetworkManager/dispatcher.d");
+    let dispatcher_path = dispatcher_dir.join("99-hifi-wifi-connect");
+    
+    info!("Installing NetworkManager dispatcher: {}", dispatcher_path.display());
+    
+    // Create directory if needed (shouldn't be necessary, but be safe)
+    if !dispatcher_dir.exists() {
+        fs::create_dir_all(dispatcher_dir)?;
+    }
+    
+    // The dispatcher script - signals the daemon on connection up
+    let dispatcher_content = r#"#!/bin/bash
+# hifi-wifi NetworkManager dispatcher
+# Signals the daemon when WiFi connects so it can apply fresh optimizations
+# Per roadmap-beta2.md: This fixes the "reconnection problem" (Issue #10)
+
+INTERFACE="$1"
+ACTION="$2"
+
+# Only trigger on connection up for wireless interfaces
+[[ "$ACTION" != "up" ]] && exit 0
+
+# Check if this is a wireless interface
+if [[ ! -d "/sys/class/net/$INTERFACE/wireless" ]]; then
+    exit 0
+fi
+
+# Ensure run directory exists
+mkdir -p /run/hifi-wifi
+
+# Signal the daemon by touching the event file
+# The daemon watches this with inotify and triggers re-optimization
+touch /run/hifi-wifi/connection-changed
+
+logger -t hifi-wifi "Connection event: $INTERFACE $ACTION - signaled daemon"
+"#;
+
+    let mut file = File::create(&dispatcher_path)?;
+    file.write_all(dispatcher_content.as_bytes())?;
+    
+    // Must be executable
+    let mut perms = fs::metadata(&dispatcher_path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&dispatcher_path, perms)?;
+    
+    // Create the run directory and event file
+    let run_dir = std::path::Path::new("/run/hifi-wifi");
+    if !run_dir.exists() {
+        fs::create_dir_all(run_dir)?;
+    }
+    fs::write("/run/hifi-wifi/connection-changed", "")?;
+    
+    info!("NetworkManager dispatcher installed");
     Ok(())
 }
 
@@ -857,28 +923,29 @@ fn install_user_repair_service() -> Result<()> {
     fs::create_dir_all(&user_systemd_dir)?;
     
     // Create a repair script that handles the sudo/polkit interaction
-    // This script only does work if repair is actually needed (systemd service missing)
-    // NOTE: CLI access is now via PATH in .bashrc - no symlinks to repair!
+    // This script ensures hifi-wifi is running and optimizations are applied on EVERY boot
+    // It handles both SteamOS update recovery AND normal boot optimization
     let repair_script = r#"#!/bin/bash
-# hifi-wifi auto-repair script - runs at user login on SteamOS
-# Only performs repair if needed (systemd service missing but binary exists)
-# CLI access is via PATH in ~/.bashrc (persistent), no symlinks needed!
+# hifi-wifi auto-repair script - runs at user login
+# Ensures optimizations are applied on every boot (CAKE, power save, etc.)
+# Also handles SteamOS update recovery (recreates service file if wiped)
 
 BINARY="/var/lib/hifi-wifi/hifi-wifi"
 SERVICE="/etc/systemd/system/hifi-wifi.service"
-
-# Exit early if no repair needed (service exists)
-if [[ -f "$SERVICE" ]]; then
-    exit 0
-fi
 
 # Exit if binary doesn't exist (not installed)
 if [[ ! -x "$BINARY" ]]; then
     exit 0
 fi
 
-# Service missing - repair needed
-# Use pkexec for GUI-friendly privilege escalation
+# Check if service is already running with optimizations applied
+# If CAKE is active, we don't need to do anything
+if tc qdisc show 2>/dev/null | grep -q "cake"; then
+    exit 0
+fi
+
+# Service not running or optimizations not applied - run bootstrap
+# bootstrap will: recreate service file if missing, start service, apply optimizations
 exec pkexec "$BINARY" bootstrap
 "#;
 
@@ -983,6 +1050,7 @@ fn run_uninstall() -> Result<()> {
         "/etc/systemd/system/hifi-wifi-bootstrap.timer",
         "/var/lib/hifi-wifi/hifi-wifi-bootstrap.service",
         "/var/lib/hifi-wifi/hifi-wifi-bootstrap.timer",
+        "/etc/NetworkManager/dispatcher.d/99-hifi-wifi-connect",
     ];
     
     for path in &files_to_remove {
@@ -1153,9 +1221,11 @@ fn run_on() -> Result<()> {
     Ok(())
 }
 
-/// Bootstrap: Check if system service exists and repair if missing
-/// This is called by the user repair service on boot to survive SteamOS updates
-/// NOTE: CLI access is now via PATH in ~/.bashrc - no symlinks to repair!
+/// Bootstrap: Ensure hifi-wifi is running and optimizations are applied
+/// Called by the user repair service on EVERY boot to guarantee:
+/// 1. Service file exists (recreate if SteamOS update wiped it)
+/// 2. Service is running
+/// 3. Optimizations are applied (CAKE, power save, etc.)
 fn run_bootstrap() -> Result<()> {
     use std::fs::File;
     use std::io::Write;
@@ -1171,9 +1241,9 @@ fn run_bootstrap() -> Result<()> {
         return Ok(());
     }
     
-    let mut repaired = false;
+    let mut service_recreated = false;
     
-    // Check if main service file exists
+    // Step 1: Check if main service file exists, recreate if missing
     if !service_path.exists() {
         info!("Bootstrap: Service file missing (likely after SteamOS update), recreating...");
         
@@ -1207,41 +1277,44 @@ WantedBy=multi-user.target
         
         if let Ok(mut file) = File::create(service_path) {
             let _ = file.write_all(service_content.as_bytes());
-            repaired = true;
+            service_recreated = true;
             info!("Bootstrap: Service file recreated");
         } else {
             error!("Bootstrap: Failed to create service file");
         }
-    }
-    
-    // If we repaired anything, reload systemd and apply optimizations
-    if repaired {
+        
+        // Reload systemd after creating service file
         info!("Bootstrap: Reloading systemd...");
         let _ = Command::new("systemctl").args(["daemon-reload"]).output();
         let _ = Command::new("systemctl").args(["enable", "hifi-wifi.service"]).output();
-        
-        // Apply optimizations BEFORE starting the service
-        // This restores sysctl, modprobe configs, etc. that were wiped
-        info!("Bootstrap: Applying optimizations (configs were wiped by SteamOS update)...");
-        let config = load_config();
-        if let Err(e) = run_apply(&config) {
-            error!("Bootstrap: Failed to apply optimizations: {}", e);
-        }
-        
-        // Now start the service (monitor mode)
-        info!("Bootstrap: Starting service...");
+    }
+    
+    // Step 2: Always apply optimizations on bootstrap
+    // This ensures CAKE, power save, sysctl, etc. are applied on every boot
+    // even if service is about to start (monitor mode also calls apply, but
+    // this guarantees it happens immediately)
+    info!("Bootstrap: Applying optimizations...");
+    let config = load_config();
+    if let Err(e) = run_apply(&config) {
+        error!("Bootstrap: Failed to apply optimizations: {}", e);
+    }
+    
+    // Step 3: Ensure service is running
+    let service_running = Command::new("systemctl")
+        .args(["is-active", "--quiet", "hifi-wifi.service"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    
+    if !service_running {
+        info!("Bootstrap: Starting monitor service...");
         let _ = Command::new("systemctl").args(["start", "hifi-wifi.service"]).output();
-        info!("Bootstrap: Repair complete - hifi-wifi fully restored");
+    }
+    
+    if service_recreated {
+        info!("Bootstrap: Full repair complete - hifi-wifi restored after SteamOS update");
     } else {
-        // Service file exists - just ensure service is running
-        let status = Command::new("systemctl")
-            .args(["is-active", "--quiet", "hifi-wifi.service"])
-            .status();
-        
-        if status.map(|s| !s.success()).unwrap_or(true) {
-            info!("Bootstrap: Service not running, starting...");
-            let _ = Command::new("systemctl").args(["start", "hifi-wifi.service"]).output();
-        }
+        info!("Bootstrap: Optimizations applied successfully");
     }
     
     Ok(())

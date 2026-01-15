@@ -5,12 +5,16 @@
 //! - CPU Governor (Smart Coalescing)
 //! - Smart Band Steering (with Hysteresis)
 //! - Game Mode Detection (PPS) with CAKE freezing
+//! - Connection Event Handling (inotify-based, per roadmap-beta2.md)
 
 use anyhow::Result;
 use log::{info, debug, warn};
 use std::time::{Duration, Instant};
 use std::process::Command;
+use std::path::Path;
+use std::sync::mpsc::channel;
 use tokio::time;
+use notify::{Watcher, RecursiveMode, Config as NotifyConfig, RecommendedWatcher, Event, EventKind};
 
 use crate::config::structs::{GovernorConfig, WifiConfig};
 use crate::network::nm::NmClient;
@@ -19,6 +23,9 @@ use crate::network::stats::PpsMonitor;
 use crate::network::wifi::WifiManager;
 use crate::system::cpu::CpuMonitor;
 use crate::system::power::PowerManager;
+
+/// Path for connection event signaling (touched by NetworkManager dispatcher)
+const CONNECTION_EVENT_PATH: &str = "/run/hifi-wifi/connection-changed";
 
 /// Band steering candidate tracking for hysteresis
 #[derive(Debug, Default)]
@@ -116,18 +123,93 @@ impl Governor {
 
     /// Run the main governor loop
     /// Per rewrite.md: Tick Rate 2 seconds, non-blocking
+    /// Per roadmap-beta2.md: Watch for connection events via inotify
     pub async fn run(&mut self, tick_rate_secs: u64) -> Result<()> {
         info!("Governor starting (tick rate: {}s)", tick_rate_secs);
+        
+        // Setup inotify watcher for connection events
+        let (event_tx, event_rx) = channel();
+        let watcher_result = self.setup_connection_watcher(event_tx);
+        let _watcher = match watcher_result {
+            Ok(w) => {
+                info!("Connection event watcher active (watching {})", CONNECTION_EVENT_PATH);
+                Some(w)
+            }
+            Err(e) => {
+                warn!("Connection event watcher failed (will use polling only): {}", e);
+                None
+            }
+        };
         
         let mut interval = time::interval(Duration::from_secs(tick_rate_secs));
         
         loop {
+            // Check for connection events (non-blocking)
+            while let Ok(event) = event_rx.try_recv() {
+                if let Ok(Event { kind: EventKind::Create(_) | EventKind::Modify(_), .. }) = event {
+                    info!("Connection event detected - clearing bitrate cache and re-optimizing");
+                    self.handle_connection_event().await;
+                }
+            }
+            
             interval.tick().await;
             
             if let Err(e) = self.tick().await {
                 warn!("Governor tick error: {}", e);
             }
         }
+    }
+
+    /// Setup inotify watcher for connection events
+    /// The NetworkManager dispatcher touches /run/hifi-wifi/connection-changed on connect
+    fn setup_connection_watcher(&self, tx: std::sync::mpsc::Sender<notify::Result<Event>>) -> Result<RecommendedWatcher> {
+        use std::fs;
+        
+        // Ensure /run/hifi-wifi directory exists
+        let run_dir = Path::new("/run/hifi-wifi");
+        if !run_dir.exists() {
+            fs::create_dir_all(run_dir)?;
+        }
+        
+        // Create the file if it doesn't exist (so we can watch it)
+        let event_file = Path::new(CONNECTION_EVENT_PATH);
+        if !event_file.exists() {
+            fs::write(event_file, "")?;
+        }
+        
+        // Create watcher with reasonable poll interval
+        let config = NotifyConfig::default()
+            .with_poll_interval(Duration::from_millis(200));
+        
+        let mut watcher = RecommendedWatcher::new(tx, config)?;
+        watcher.watch(event_file, RecursiveMode::NonRecursive)?;
+        
+        Ok(watcher)
+    }
+
+    /// Handle a connection event (WiFi reconnect)
+    /// Per roadmap-beta2.md: Clear cache, wait for link stability, re-optimize
+    async fn handle_connection_event(&mut self) {
+        // Clear all cached bitrates - they're stale after reconnection
+        for (interface, state) in &mut self.interface_states {
+            if state.last_good_bitrate.is_some() {
+                info!("Clearing cached bitrate for {} (was {:?} Kbit/s)", 
+                      interface, state.last_good_bitrate);
+            }
+            state.last_good_bitrate = None;
+            state.bandwidth_valid = false;
+        }
+        
+        // Wait 1 second for link to stabilize (per legacy dispatcher behavior)
+        info!("Waiting 1s for link to stabilize...");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        
+        // Force immediate tick to apply fresh optimizations
+        if let Err(e) = self.tick().await {
+            warn!("Post-reconnect tick error: {}", e);
+        }
+        
+        info!("Post-reconnect optimization complete");
     }
 
     /// Single tick of the governor loop
@@ -146,6 +228,9 @@ impl Governor {
             .collect();
 
         for (interface, path, bitrate, active_ap) in device_infos {
+            info!("Processing interface: {}, active_ap: {:?}, band_steering_enabled: {}", 
+                  interface, active_ap.as_ref().map(|ap| &ap.bssid), self.config.band_steering_enabled);
+            
             // Get or create interface state
             if !self.interface_states.contains_key(&interface) {
                 self.interface_states.insert(
@@ -445,22 +530,52 @@ impl Governor {
                 if let Some(current_ap) = &active_ap {
                     let hysteresis_ticks = self.config.roam_hysteresis_ticks;
                     
+                    info!("Band steering: Checking for better AP (current: {} on {:?}, score: {})", 
+                           current_ap.bssid, current_ap.band, 
+                           current_ap.score(self.wifi_config.band_bias_5ghz, self.wifi_config.band_bias_6ghz));
+                    
                     // Get all visible APs
-                    if let Ok(access_points) = self.nm_client.get_access_points(&path).await {
-                        let bias_5 = self.wifi_config.band_bias_5ghz;
-                        let bias_6 = self.wifi_config.band_bias_6ghz;
-                        let min_signal = self.wifi_config.min_signal_dbm;
+                    match self.nm_client.get_access_points(&path).await {
+                        Ok(access_points) => {
+                            info!("Band steering: Found {} visible APs (current SSID: '{}')", access_points.len(), current_ap.ssid);
+                            info!("Band steering: access_points is_empty={}, len={}", access_points.is_empty(), access_points.len());
+                            
+                            if access_points.is_empty() {
+                                info!("Band steering: No APs returned from NetworkManager");
+                                continue;
+                            }
+                            
+                            let bias_5 = self.wifi_config.band_bias_5ghz;
+                            let bias_6 = self.wifi_config.band_bias_6ghz;
+                            let min_2g = self.wifi_config.min_signal_2g_dbm;
+                            let min_5g = self.wifi_config.min_signal_5g_dbm;
+                            let min_6g = self.wifi_config.min_signal_6g_dbm;
 
-                        let current_score = current_ap.score(bias_5, bias_6);
-                        
-                        // Find best AP with same SSID and good signal
-                        let best = access_points.iter()
-                            .filter(|ap| {
-                                ap.ssid == current_ap.ssid && 
-                                ap.bssid != current_ap.bssid &&
-                                ap.signal_strength >= min_signal
-                            })
-                            .max_by_key(|ap| ap.score(bias_5, bias_6));
+                            let current_score = current_ap.score(bias_5, bias_6);
+                            
+                            // First, log all APs to see what we have
+                            info!("Band steering: About to list {} APs...", access_points.len());
+                            for i in 0..access_points.len() {
+                                let ap = &access_points[i];
+                                info!("  [{}] AP: {} ({}), band={:?}, signal={}dBm, rate={}Mbps", 
+                                       i, ap.bssid, ap.ssid, ap.band, ap.signal_strength, ap.max_bitrate / 1000);
+                            }
+                            info!("Band steering: Done listing APs");
+                            
+                            // Find best AP with same SSID and usable signal for its band
+                            let best = access_points.iter()
+                                .filter(|ap| {
+                                    let same_ssid = ap.ssid == current_ap.ssid;
+                                    let different_bssid = ap.bssid != current_ap.bssid;
+                                    let signal_ok = ap.signal_usable(min_2g, min_5g, min_6g);
+                                    
+                                    info!("  AP {}: ssid={} (same={}), band={:?}, signal={}dBm (ok={}), max_rate={}Mbps, score={}", 
+                                           ap.bssid, ap.ssid, same_ssid, ap.band, ap.signal_strength, signal_ok,
+                                           ap.max_bitrate / 1000, ap.score(bias_5, bias_6));
+                                    
+                                    same_ssid && different_bssid && signal_ok
+                                })
+                                .max_by_key(|ap| ap.score(bias_5, bias_6));
 
                         if let Some(state) = self.interface_states.get_mut(&interface) {
                             if let Some(best_candidate) = best {
@@ -490,9 +605,16 @@ impl Governor {
                                     };
 
                                     if should_trigger {
-                                        info!("Band steering: {} -> {} (score: {} -> {})",
+                                        info!("Band steering: {} -> {} (score: {} -> {}, band: {:?} -> {:?})",
                                               current_ap.bssid, best_candidate.bssid, 
-                                              current_score, candidate_score);
+                                              current_score, candidate_score,
+                                              current_ap.band, best_candidate.band);
+                                        
+                                        // Clear cached bitrate - after roaming it will be stale
+                                        state.last_good_bitrate = None;
+                                        state.bandwidth_valid = false;
+                                        
+                                        // Request scan to hint firmware/driver about better AP
                                         let _ = self.nm_client.request_scan(&path).await;
                                         state.roam_candidate = None;
                                     }
@@ -502,6 +624,10 @@ impl Governor {
                             } else {
                                 state.roam_candidate = None;
                             }
+                        }
+                        }
+                        Err(e) => {
+                            debug!("Band steering: Failed to get APs: {}", e);
                         }
                     }
                 }
