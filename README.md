@@ -1,110 +1,100 @@
-# hifi-wifi (v3.0)
+> [!IMPORTANT]  
+> **Upgrading from v1.x?** Uninstall first: `cd legacy && sudo ./uninstall.sh && cd ..`
 
-hifi-wifi is a high-performance network optimization daemon specifically targeting SteamOS and Bazzite. It eliminates bufferbloat, prevents latency spikes, and intelligently manages power settings to ensure a lag-free gaming experience on handhelds.
+---
 
-This version (v3.0) is a complete rewrite in Rust, offering improved stability, lower resource usage, and seamless system integration compared to previous shell-script versions.
+## Bug Fixes
 
-## Features
+### WiFi Reconnection Stutters (Issue #10)
+**Before:** Games stutter after your Steam Deck wakes from sleep or switches networks. You had to manually reconnect WiFi to fix it.
 
-*   **Intelligent Traffic Shaping**: Dynamically applies and adjusts the CAKE queue discipline to eliminate bufferbloat without manual configuration.
-*   **Jitter Reduction**: Prioritizes gaming traffic and small packets to maintain consistent low latency.
-*   **Adaptive Power Management**:
-    *   **AC Power**: Disables Wi-Fi power saving for maximum stability.
-    *   **Battery**: Enables power saving to preserve battery life, but automatically switches to performance mode if network lag is detected.
-*   **Self-Healing**: Runs as a background daemon that constantly monitors network state, ensuring optimizations persist through connection drops, roaming, and sleep cycles.
-*   **Zero Configuration**: Works out of the box with sensible defaults for Steam Deck and similar hardware.
+**Now:** Automatically detects reconnections and clears stale data. Your games stay smooth without manual intervention.
 
-## System Requirements
+### Service Stability on SteamOS
+**Before:** Service crashed after SteamOS updates when trying to write configs to read-only `/etc`.
 
-*   Linux kernel 5.15 or newer (with `sch_cake` module)
-*   NetworkManager
-*   systemd
-*   Root access (sudo)
-*   Rust toolchain (cargo) for installation
+**Now:** Handles read-only filesystems gracefully. Service keeps running even if some optimizations can't be applied.
 
-## Installation
+### Optimizations After Updates
+**Before:** After SteamOS updates, optimizations (sysctl, modprobe) weren't reapplied until you manually restarted.
 
-### Quick Install (All Platforms)
+**Now:** All optimizations automatically restored on first boot after update.
 
-```bash
-git clone -b dev https://github.com/doughty247/hifi-wifi.git
-cd hifi-wifi
-sudo ./install.sh
-```
+**[View commits →](https://github.com/doughty247/hifi-wifi/compare/4066275...b1a95e4)**
 
-**On SteamOS (Steam Deck):** The installer will automatically detect your system and prepare the build environment if needed. This includes:
-- Unmerging system extensions
-- Disabling read-only filesystem
-- Installing build tools (one-time setup)
+---
 
-**On Bazzite/Other Linux:** The installer works directly without additional setup.
+## New Features
 
-### What the Installer Does
+### Automatic Fast WiFi Selection
+Your device now picks the fastest available WiFi connection, not just the strongest signal.
 
-The installer will:
-1.  Detect your platform (SteamOS, Bazzite, etc.)
-2.  Set up build environment if needed (SteamOS only, first run)
-3.  Check for the Rust toolchain (installing `rustup` if missing)
-4.  Compile the release binary
-5.  Install the binary to `/var/lib/hifi-wifi/` (survives updates)
-6.  Create a symlink at `/usr/local/bin/hifi-wifi`.
-4.  Enable and start the `hifi-wifi` systemd service.
+- Prefers 5GHz over 2.4GHz when both are available
+- Switches to faster networks more aggressively
+- **Experimental:** WiFi 6E (6GHz band) support
+- Better game streaming and faster downloads
 
-## Usage
+### SteamOS: Survives System Updates
+**Before:** SteamOS updates broke hifi-wifi. You had to reinstall.
 
-Once installed, hifi-wifi runs automatically in the background.
+**Now:** Persists across updates automatically. Install once, keep forever.
 
-### Managing the Service
+### SteamOS: No More Manual Fixes
+Service repairs itself automatically after updates. No more terminal commands to re-enable read-only mode or fix broken installations.
 
-Check service status:
-```bash
-systemctl status hifi-wifi
-```
+### Easy Developer Setup
+Want to help test or contribute? Installer now sets up Homebrew and Rust automatically on SteamOS. Just clone and run `./install.sh` - it handles everything.
 
-Restart the service:
-```bash
-sudo systemctl restart hifi-wifi
-```
+(Official releases still provide pre-compiled binaries - no build required for regular users)
 
-### CLI Commands
+### Other Improvements
+- CAKE works more consistently - speed tests reach full speeds instead of getting stuck at 50Mbit
+- Installer gives clearer feedback if something goes wrong
 
-Check current optimization status:
-```bash
-hifi-wifi status
-```
+---
 
-Monitor realtime operations (foreground mode):
-```bash
-sudo hifi-wifi monitor
-```
+## Testing Checklist
 
-Manually apply optimizations (one-shot):
-```bash
-sudo hifi-wifi apply
-```
+**Please test and report issues!** This helps everyone.
 
-Remove all optimizations:
-```bash
-sudo hifi-wifi revert
-```
+- [ ] Installer completes without errors
+- [ ] `hifi-wifi status` works after opening new terminal
+- [ ] Service survives reboot
+- [ ] WiFi disconnect/reconnect shows cache clearing in logs: `journalctl -u hifi-wifi -f`
+- [ ] Dual-band WiFi roams to better band
+- [ ] (SteamOS) Service persists after system update
 
-## Configuration
+**Report issues:** Attach output of `{ hifi-wifi status; journalctl -u hifi-wifi -n 100; } > report.txt` to [GitHub Issues](https://github.com/doughty247/hifi-wifi/issues)
 
-hifi-wifi operates with optimal defaults, but advanced users can configure specific behaviors.
+---
 
-**Config File**: `/etc/hifi-wifi/config.toml`
+## Commands
 
-The file is generated on first run. You can adjust parameters such as:
-*   Traffic shaping interfaces
-*   Power management aggressiveness
-*   Logging levels
+| Command | Description |
+|---------|-------------|
+| `hifi-wifi status` | Show current WiFi state and optimization status |
+| `sudo hifi-wifi monitor` | Watch live logs (Ctrl+C to exit) |
+| `sudo hifi-wifi on/off` | Start/stop the service |
+| `sudo hifi-wifi uninstall` | Remove hifi-wifi completely |
+| `journalctl -u hifi-wifi -n 50` | View last 50 log entries |
+| `journalctl -u hifi-wifi -f` | Follow logs in real-time |
 
-## Supported Systems
+---
 
-*   **Bazzite** (Recommended)
-*   **SteamOS** (Steam Deck LCD & OLED)
-*   **Arch Linux** (and derivatives)
+## Supported Platforms
 
-## Reporting Issues
+- **SteamOS 3.x** (Steam Deck LCD/OLED)
+- **Bazzite** (Well tested)
+- **Arch Linux** / **Fedora**
 
-Please report bugs on the GitHub Issue Tracker. Include the output of `hifi-wifi status` in your report.
+---
+
+## Known Issues
+
+- **Multiple networks**: May not prioritize ethernet over WiFi when both are connected.
+- **Homebrew warning**: "post-install step did not complete" - harmless, ignore it
+- **Command not found**: Open new terminal after install to load `hifi-wifi` command
+
+---
+
+**Full changelog:** [`4066275...b1a95e4`](https://github.com/doughty247/hifi-wifi/compare/4066275...b1a95e4)
