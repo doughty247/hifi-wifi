@@ -16,3 +16,5 @@ docs/
 
 /target
 tests/
+bin/
+*.tar.gz
