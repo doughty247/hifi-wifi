@@ -126,6 +126,7 @@ impl Default for BackendConfig {
 
 /// Governor-specific settings (the "brain" of hifi-wifi)
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct GovernorConfig {
     /// Enable dynamic CAKE bandwidth adjustment
     pub breathing_cake_enabled: bool,
