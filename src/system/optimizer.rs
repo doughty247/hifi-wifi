@@ -244,14 +244,15 @@ options mwifiex disable_auto_ds=1
         let search_terms: Vec<&str> = match ifc.driver.as_str() {
             "rtl8192ee" => vec!["rtl_pci"],
             "rtw88_8822ce" | "rtw88_pci" | "rtw_pci" => vec!["rtw88", "rtw_pci", &ifc.name],
-            "ath11k_pci" | "ath11k" => vec!["ath11k", "wcn", "MHI", &ifc.name],  // WCN6855 variants
+            "ath11k_pci" | "ath11k" => vec!["ath11k", "wcn", "mhi", "bhi", &ifc.name],  // WCN6855 variants
             _ => vec![ifc.driver.as_str(), &ifc.name],
         };
 
         // Find ALL matching IRQs (important for MSI-X drivers like ath11k)
         let irqs: Vec<String> = interrupts.lines()
             .filter(|line| {
-                search_terms.iter().any(|term| line.contains(term)) || line.contains(&ifc.name)
+                let lower = line.to_lowercase();
+                search_terms.iter().any(|term| lower.contains(&term.to_lowercase())) || lower.contains(&ifc.name.to_lowercase())
             })
             .filter_map(|line| line.trim().split(':').next())
             .map(|s| s.trim().to_string())
