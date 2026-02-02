@@ -457,11 +457,14 @@ async fn run_status_async() -> Result<()> {
             .unwrap_or_default();
         
         if qdisc_out.contains("cake") {
-             // Extract bandwidth if possible
+             // Extract bandwidth and RTT if possible
              let bw = qdisc_out.split("bandwidth ").nth(1)
                 .and_then(|s| s.split_whitespace().next())
                 .unwrap_or("unknown");
-             println!("{}│{}    ├─ CAKE:       {}[ACTIVE]{} Bandwidth: {}", BLUE, NC, GREEN, NC, bw);
+             let rtt = qdisc_out.split("rtt ").nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .unwrap_or("default");
+             println!("{}│{}    ├─ CAKE:       {}[ACTIVE]{} Bandwidth: {} RTT: {}", BLUE, NC, GREEN, NC, bw, rtt);
         } else {
              println!("{}│{}    ├─ CAKE:       {}[INACTIVE]{}", BLUE, NC, RED, NC);
         }
