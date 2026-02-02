@@ -8,6 +8,8 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use crate::network::tc::detect_gateway_rtt;
+
 /// Interface type (WiFi or Ethernet)
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterfaceType {
@@ -293,6 +295,7 @@ impl WifiManager {
             .args([
                 "qdisc", "replace", "dev", &ifc.name, "root", "cake",
                 "bandwidth", &bandwidth,
+                "rtt", detect_gateway_rtt(),
                 "diffserv4", "dual-dsthost", "nat", "wash", "ack-filter"
             ])
             .output()
