@@ -4,9 +4,9 @@
 //! fetching the latest upstream version from linux-firmware.git
 
 use anyhow::{Result, Context, bail};
-use std::fs::File;
-use std::io::{Read, BufReader};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// Firmware version information
 #[derive(Debug, Clone)]
@@ -87,39 +87,44 @@ pub fn detect_firmware_path() -> Result<PathBuf> {
 
 /// Extract version string from a zstd-compressed firmware file
 fn extract_version_from_zst(zst_path: &Path) -> Result<String> {
-    // Use zstd crate to decompress
-    let file = File::open(zst_path)
-        .with_context(|| format!("Failed to open {}", zst_path.display()))?;
+    // Use system zstd command to decompress (avoids C compilation issues)
+    let output = Command::new("zstd")
+        .args(["-d", "-c"])
+        .arg(zst_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("Failed to run zstd to decompress {}", zst_path.display()))?;
 
-    let decoder = zstd::stream::Decoder::new(file)
-        .with_context(|| format!("Failed to create zstd decoder for {}", zst_path.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("zstd decompression failed for {}: {}", zst_path.display(), stderr);
+    }
 
-    extract_version_from_reader(decoder)
+    extract_version_from_bytes(&output.stdout)
 }
 
 /// Extract version string from an uncompressed firmware file
 fn extract_version_from_raw(path: &Path) -> Result<String> {
-    let file = File::open(path)
+    let mut file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open {}", path.display()))?;
 
-    extract_version_from_reader(BufReader::new(file))
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+
+    extract_version_from_bytes(&data)
 }
 
-/// Extract QC_IMAGE_VERSION_STRING from a reader
+/// Extract QC_IMAGE_VERSION_STRING from bytes
 ///
 /// Searches through the binary for the version string pattern
-fn extract_version_from_reader<R: Read>(mut reader: R) -> Result<String> {
-    // Read the file in chunks to find the version string
+fn extract_version_from_bytes(data: &[u8]) -> Result<String> {
     // The version string is embedded in the binary as: QC_IMAGE_VERSION_STRING=<version>
     let pattern = b"QC_IMAGE_VERSION_STRING=";
 
-    // Read the entire file (firmware is ~5MB, manageable)
-    let mut data = Vec::new();
-    reader.read_to_end(&mut data)
-        .context("Failed to read firmware data")?;
-
     // Search for the pattern
-    if let Some(pos) = find_subsequence(&data, pattern) {
+    if let Some(pos) = find_subsequence(data, pattern) {
         let start = pos + pattern.len();
 
         // Find the end of the version string (null terminator or non-printable)
@@ -153,28 +158,27 @@ pub fn get_upstream_version() -> Result<FirmwareVersion> {
 
     let url = "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/main/ath11k/QCA2066/hw2.1/amss.bin";
 
-    // Use reqwest to fetch a partial file (first 1MB should contain version)
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .context("Failed to create HTTP client")?;
+    // Use system curl to fetch partial file (first 1MB should contain version)
+    let output = Command::new("curl")
+        .args([
+            "-sfL",                         // silent, fail on error, follow redirects
+            "--range", "0-1048575",         // First 1MB
+            "--max-time", "30",             // 30 second timeout
+            url,
+        ])
+        .output()
+        .context("Failed to run curl to fetch upstream firmware")?;
 
-    // Request with Range header for partial download
-    let response = client
-        .get(url)
-        .header("Range", "bytes=0-1048575")  // First 1MB
-        .send()
-        .context("Failed to fetch upstream firmware")?;
-
-    if !response.status().is_success() && response.status().as_u16() != 206 {
-        bail!("Failed to fetch upstream firmware: HTTP {}", response.status());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("Failed to fetch upstream firmware: {}", stderr);
     }
 
-    let data = response.bytes().context("Failed to read response body")?;
+    let data = &output.stdout;
 
     // Search for version string
     let pattern = b"QC_IMAGE_VERSION_STRING=";
-    if let Some(pos) = find_subsequence(&data, pattern) {
+    if let Some(pos) = find_subsequence(data, pattern) {
         let start = pos + pattern.len();
         let mut end = start;
         while end < data.len() && data[end] >= 0x20 && data[end] < 0x7F {

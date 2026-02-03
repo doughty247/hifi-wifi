@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -159,13 +159,19 @@ impl BackupManager {
             bail!("Backup amss.bin.zst not found");
         }
 
-        // Decompress and extract version
-        let file = File::open(&backup_amss)?;
-        let decoder = zstd::stream::Decoder::new(file)?;
+        // Decompress using system zstd command
+        let output = Command::new("zstd")
+            .args(["-d", "-c"])
+            .arg(&backup_amss)
+            .output()
+            .context("Failed to run zstd to decompress backup")?;
 
-        let mut data = Vec::new();
-        std::io::BufReader::new(decoder).read_to_end(&mut data)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("zstd decompression failed: {}", stderr);
+        }
 
+        let data = &output.stdout;
         let pattern = b"QC_IMAGE_VERSION_STRING=";
         if let Some(pos) = data.windows(pattern.len()).position(|w| w == pattern) {
             let start = pos + pattern.len();
@@ -319,18 +325,21 @@ fn calculate_file_hash(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Compress a file with zstd
+/// Compress a file with zstd using system command
 fn compress_file(src: &Path, dst: &Path) -> Result<()> {
-    let input = File::open(src)
-        .with_context(|| format!("Failed to open {} for compression", src.display()))?;
+    let output = Command::new("zstd")
+        .arg(format!("-{}", ZSTD_COMPRESSION_LEVEL))
+        .arg("-f")  // force overwrite
+        .arg("-o")
+        .arg(dst)
+        .arg(src)
+        .output()
+        .with_context(|| format!("Failed to run zstd to compress {}", src.display()))?;
 
-    let output = File::create(dst)
-        .with_context(|| format!("Failed to create {}", dst.display()))?;
-
-    let mut encoder = zstd::stream::Encoder::new(output, ZSTD_COMPRESSION_LEVEL)?;
-
-    std::io::copy(&mut std::io::BufReader::new(input), &mut encoder)?;
-    encoder.finish()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("zstd compression failed for {}: {}", src.display(), stderr);
+    }
 
     Ok(())
 }

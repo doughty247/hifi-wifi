@@ -3,9 +3,9 @@
 //! Downloads firmware files from GitLab and validates them before deployment.
 
 use anyhow::{Result, Context, bail};
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::firmware::version::FirmwareVersion;
 
@@ -35,24 +35,27 @@ const FIRMWARE_FILES: &[FirmwareFile] = &[
 struct FirmwareFile {
     name: &'static str,
     min_size: u64,
+    #[allow(dead_code)]
     description: &'static str,
 }
 
-/// Firmware downloader
-pub struct FirmwareDownloader {
-    client: reqwest::blocking::Client,
-}
+/// Firmware downloader using system curl
+pub struct FirmwareDownloader;
 
 impl FirmwareDownloader {
     /// Create a new downloader
     pub fn new() -> Result<Self> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))  // 2 min timeout for large files
-            .user_agent("hifi-wifi/3.0")
-            .build()
-            .context("Failed to create HTTP client")?;
+        // Verify curl is available
+        let output = Command::new("curl")
+            .arg("--version")
+            .output()
+            .context("curl command not found - please install curl")?;
 
-        Ok(Self { client })
+        if !output.status.success() {
+            bail!("curl command failed");
+        }
+
+        Ok(Self)
     }
 
     /// Download all firmware files to a staging directory
@@ -73,31 +76,36 @@ impl FirmwareDownloader {
         Ok(staging_dir)
     }
 
-    /// Download a single firmware file
+    /// Download a single firmware file using curl
     fn download_file(&self, file: &FirmwareFile, staging_dir: &Path) -> Result<()> {
         let url = format!("{}/{}", FIRMWARE_BASE_URL, file.name);
         let dest_path = staging_dir.join(file.name);
 
         print!("  Downloading {}... ", file.name);
-        std::io::stdout().flush().ok();
+        std::io::Write::flush(&mut std::io::stdout()).ok();
 
-        let response = self.client
-            .get(&url)
-            .send()
-            .with_context(|| format!("Failed to fetch {}", file.name))?;
+        let output = Command::new("curl")
+            .args([
+                "-sfL",                              // silent, fail on error, follow redirects
+                "--max-time", "120",                 // 2 min timeout for large files
+                "-o",
+            ])
+            .arg(&dest_path)
+            .arg(&url)
+            .output()
+            .with_context(|| format!("Failed to run curl to download {}", file.name))?;
 
-        let status = response.status();
-        if !status.is_success() {
+        if !output.status.success() {
             println!("FAILED");
-            bail!("Failed to download {}: HTTP {}", file.name, status);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Failed to download {}: {}", file.name, stderr);
         }
 
-        // Download to file
-        let bytes = response.bytes()
-            .with_context(|| format!("Failed to read {} response", file.name))?;
-
         // Validate size
-        let size = bytes.len() as u64;
+        let metadata = fs::metadata(&dest_path)
+            .with_context(|| format!("Failed to read downloaded {}", file.name))?;
+
+        let size = metadata.len();
         if size < file.min_size {
             println!("FAILED");
             bail!(
@@ -105,13 +113,6 @@ impl FirmwareDownloader {
                 file.name, size, file.min_size
             );
         }
-
-        // Write to staging
-        let mut dest_file = File::create(&dest_path)
-            .with_context(|| format!("Failed to create {}", dest_path.display()))?;
-
-        dest_file.write_all(&bytes)
-            .with_context(|| format!("Failed to write {}", dest_path.display()))?;
 
         let size_mb = size as f64 / 1_000_000.0;
         println!("{:.1} MB", size_mb);
