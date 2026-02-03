@@ -67,7 +67,7 @@ impl FirmwareDownloader {
             .prefix("hifi-firmware-")
             .tempdir()
             .context("Failed to create staging directory")?
-            .into_path();
+            .keep();
 
         for file in FIRMWARE_FILES {
             self.download_file(file, &staging_dir)?;

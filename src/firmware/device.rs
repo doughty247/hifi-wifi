@@ -21,7 +21,6 @@ pub struct DeviceInfo {
     // DMI info
     pub board_vendor: Option<String>,
     pub board_name: Option<String>,
-    pub product_name: Option<String>,
 
     // WiFi PCI IDs
     pub wifi_vendor: Option<String>,
@@ -39,7 +38,6 @@ impl DeviceInfo {
     pub fn detect() -> Self {
         let board_vendor = read_dmi("board_vendor");
         let board_name = read_dmi("board_name");
-        let product_name = read_dmi("product_name");
 
         // Try to find WiFi device - prefer wlan0, fall back to scanning
         let wifi_path = find_wifi_device_path();
@@ -69,7 +67,6 @@ impl DeviceInfo {
         Self {
             board_vendor,
             board_name,
-            product_name,
             wifi_vendor,
             wifi_device,
             wifi_subsys_vendor,
@@ -82,11 +79,6 @@ impl DeviceInfo {
     /// Check if this is a supported device (Steam Deck OLED with QCA2066)
     pub fn is_supported(&self) -> bool {
         self.dmi_valid && self.wifi_valid
-    }
-
-    /// Check if DMI indicates Steam Deck OLED
-    pub fn is_steam_deck_oled(&self) -> bool {
-        self.dmi_valid
     }
 
     /// Check if WiFi card is the supported QCA2066 variant

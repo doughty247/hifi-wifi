@@ -42,11 +42,6 @@ impl FirmwareVersion {
     pub fn is_valve_stock(&self) -> bool {
         self.version_string.starts_with("CI_WLAN")
     }
-
-    /// Check if this is upstream firmware (no CI_ prefix)
-    pub fn is_upstream(&self) -> bool {
-        self.version_string.starts_with("WLAN") && !self.version_string.starts_with("CI_WLAN")
-    }
 }
 
 /// Detect the firmware path for the QCA2066/ath11k device
@@ -206,12 +201,10 @@ mod tests {
             version_string: "CI_WLAN.HSP.1.1-03926.9.1-QCAHSPSWPL_V2_SILICONZ_CE-15".to_string(),
         };
         assert!(valve.is_valve_stock());
-        assert!(!valve.is_upstream());
 
         let upstream = FirmwareVersion {
             version_string: "WLAN.HSP.1.1-03926.13-QCAHSPSWPL_V2_SILICONZ_CE-2.52297.9".to_string(),
         };
         assert!(!upstream.is_valve_stock());
-        assert!(upstream.is_upstream());
     }
 }
