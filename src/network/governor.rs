@@ -58,6 +58,8 @@ struct InterfaceState {
     bandwidth_valid: bool,
     /// Last known good bitrate (Kbit/s) - used when current reading is garbage (MCS0 probes)
     last_good_bitrate: Option<u32>,
+    /// Bypass hysteresis for next power save application (for reconnection fix)
+    bypass_power_save_hysteresis: bool,
 }
 
 impl InterfaceState {
@@ -87,6 +89,7 @@ impl InterfaceState {
             last_stats_time: None,
             bandwidth_valid: false,
             last_good_bitrate: None,
+            bypass_power_save_hysteresis: false,
         }
     }
 }
@@ -95,6 +98,7 @@ impl InterfaceState {
 pub struct Governor {
     config: GovernorConfig,
     wifi_config: WifiConfig,
+    power_config: crate::config::structs::PowerConfig,
     nm_client: NmClient,
     cpu_monitor: CpuMonitor,
     power_manager: PowerManager,
@@ -104,7 +108,7 @@ pub struct Governor {
 
 impl Governor {
     /// Create a new Governor with the given configuration
-    pub async fn new(config: GovernorConfig, wifi_config: WifiConfig) -> Result<Self> {
+    pub async fn new(config: GovernorConfig, wifi_config: WifiConfig, power_config: crate::config::structs::PowerConfig) -> Result<Self> {
         let nm_client = NmClient::new().await?;
         let cpu_monitor = CpuMonitor::new(config.cpu_avg_window_size);
         let power_manager = PowerManager::new();
@@ -113,6 +117,7 @@ impl Governor {
         Ok(Self {
             config,
             wifi_config,
+            power_config,
             nm_client,
             cpu_monitor,
             power_manager,
@@ -190,7 +195,9 @@ impl Governor {
     /// Handle a connection event (WiFi reconnect)
     /// Per roadmap-beta2.md: Clear cache, wait for link stability, re-optimize
     async fn handle_connection_event(&mut self) {
-        // Clear all cached bitrates - they're stale after reconnection
+        // Clear all cached state - it's stale after reconnection
+        // FIX for Issue #16: NetworkManager resets power save to ON after reconnect,
+        // so we must clear our cached state to force re-application
         for (interface, state) in &mut self.interface_states {
             if state.last_good_bitrate.is_some() {
                 info!("Clearing cached bitrate for {} (was {:?} Kbit/s)", 
@@ -198,11 +205,46 @@ impl Governor {
             }
             state.last_good_bitrate = None;
             state.bandwidth_valid = false;
+            
+            // Reset power management state to force immediate re-application
+            // Issue #16: After reconnect, interface has power save ON (NM default)
+            // but our cache thinks it's still OFF, so hysteresis prevents fix
+            state.power_save_enabled = None;
+            state.power_save_stable_ticks = 0;
+            state.pending_power_save = None;
+            state.bypass_power_save_hysteresis = true;  // Skip hysteresis on next application
+            
+            // Also reset EEE and coalescing state for consistency
+            state.eee_enabled = None;
+            state.eee_stable_ticks = 0;
+            state.pending_eee = None;
+            state.coalescing_enabled = false;
+            state.coalescing_stable_ticks = 0;
+            state.pending_coalescing = None;
+            
+            info!("Cleared all cached state for {} (bitrate, power save, EEE, coalescing)", interface);
         }
         
         // Wait 1 second for link to stabilize (per legacy dispatcher behavior)
         info!("Waiting 1s for link to stabilize...");
         tokio::time::sleep(Duration::from_secs(1)).await;
+        
+        // FIX for Issue #15: Force immediate CAKE application after reconnection
+        // Don't wait for warmup samples - apply with conservative 100Mbit default
+        info!("Forcing immediate CAKE application on all interfaces (warmup bypass)");
+        for (interface, state) in &mut self.interface_states {
+            // Apply CAKE with conservative 100Mbit (will be adjusted by tick() once samples arrive)
+            let default_mbit = 100;
+            let scaled_mbit = (default_mbit as f64 * 0.85) as u32; // 85Mbit
+            if let Err(e) = state.tc_manager.apply_cake(interface) {
+                warn!("Failed to force-apply CAKE on {}: {}", interface, e);
+            } else {
+                // Inject the default into tc_manager so it has a baseline
+                state.tc_manager.update_bandwidth(scaled_mbit);
+                state.bandwidth_valid = true;
+                info!("Force-applied CAKE on {} at {}Mbit (will adjust dynamically)", interface, scaled_mbit);
+            }
+        }
         
         // Force immediate tick to apply fresh optimizations
         if let Err(e) = self.tick().await {
@@ -214,6 +256,19 @@ impl Governor {
 
     /// Single tick of the governor loop
     async fn tick(&mut self) -> Result<()> {
+        // 0. Ensure CAKE is applied on active Ethernet interfaces
+        for ifc in self.wifi_manager.interfaces() {
+            if ifc.interface_type == crate::network::wifi::InterfaceType::Ethernet
+                && self.wifi_manager.is_interface_connected(ifc)
+                && !Self::has_cake(&ifc.name)
+            {
+                let bandwidth = self.calculate_cake_bandwidth(ifc);
+                if let Err(e) = self.wifi_manager.apply_cake(ifc, bandwidth.max(1)) {
+                    warn!("Failed to apply CAKE on {}: {}", ifc.name, e);
+                }
+            }
+        }
+
         // 1. Sample CPU load
         let cpu_load = self.cpu_monitor.sample();
         debug!("Tick: CPU load {:.1}%", cpu_load * 100.0);
@@ -406,10 +461,15 @@ impl Governor {
                 }
             }
 
-            // 5b. Power Save Management (Adaptive) - with hysteresis to prevent flapping
-            // FIXED: Also disable power save during ANY network activity, not just game mode
+            // 5b. Power Save Management - Respects config: "on", "off", "adaptive"
+            // Issue #16: Allow users to force power save OFF permanently
             {
-                let base_should_enable = self.power_manager.should_enable_power_save();
+                // Check config override first
+                let base_should_enable = match self.power_config.wlan_power_save.as_str() {
+                    "on" => true,   // Force ON (user request)
+                    "off" => false, // Force OFF (Issue #16 fix - always disable)
+                    _ => self.power_manager.should_enable_power_save(), // Adaptive (default)
+                };
                 
                 if let Some(state) = self.interface_states.get_mut(&interface) {
                     // Check for active network usage (PPS > 50 = meaningful traffic)
@@ -428,6 +488,13 @@ impl Governor {
                     
                     // Hysteresis: require 3 stable ticks before changing power save
                     // This prevents AC/battery flapping from causing jitter
+                    // EXCEPT after reconnection (bypass flag set)
+                    let hysteresis_required = if state.bypass_power_save_hysteresis {
+                        0  // Immediate application after reconnection
+                    } else {
+                        3  // Normal hysteresis
+                    };
+                    
                     if state.power_save_enabled != Some(should_enable) {
                         if state.pending_power_save == Some(should_enable) {
                             state.power_save_stable_ticks += 1;
@@ -436,20 +503,25 @@ impl Governor {
                             state.power_save_stable_ticks = 1;
                         }
                         
-                        // Apply after 3 stable ticks (6 seconds) to avoid brief AC disconnects
-                        if state.power_save_stable_ticks >= 3 {
+                        // Apply after required ticks (0 for post-reconnect, 3 normally)
+                        if state.power_save_stable_ticks >= hysteresis_required {
                             let wifi_interfaces = self.wifi_manager.interfaces();
                             if let Some(wifi_ifc) = wifi_interfaces.iter().find(|i| i.name == interface) {
                                 if should_enable {
                                     if let Ok(_) = self.wifi_manager.enable_power_save(wifi_ifc) {
-                                        info!("Power save ENABLED on {} (battery, idle)", interface);
+                                        let mode = &self.power_config.wlan_power_save;
+                                        info!("Power save ENABLED on {} (mode: {}, battery, idle)", interface, mode);
                                         state.power_save_enabled = Some(true);
                                     }
                                 } else {
                                     if let Ok(_) = self.wifi_manager.disable_power_save(wifi_ifc) {
-                                        let reason = if !base_should_enable { "AC power" }
-                                            else if in_game { "game mode" }
-                                            else { "network activity" };
+                                        let mode = &self.power_config.wlan_power_save;
+                                        let reason = match mode.as_str() {
+                                            "off" => "forced OFF by config",
+                                            _ if !base_should_enable => "AC power",
+                                            _ if in_game => "game mode",
+                                            _ => "network activity"
+                                        };
                                         info!("Power save DISABLED on {} ({})", interface, reason);
                                         state.power_save_enabled = Some(false);
                                     }
@@ -457,11 +529,13 @@ impl Governor {
                             }
                             state.pending_power_save = None;
                             state.power_save_stable_ticks = 0;
+                            state.bypass_power_save_hysteresis = false;  // Reset bypass flag
                         }
                     } else {
                         // State matches, reset pending
                         state.pending_power_save = None;
                         state.power_save_stable_ticks = 0;
+                        state.bypass_power_save_hysteresis = false;  // Reset bypass flag
                     }
                 }
             }
@@ -717,6 +791,29 @@ impl Governor {
         }
         
         None
+    }
+
+    /// Check if CAKE qdisc is active on an interface
+    fn has_cake(interface: &str) -> bool {
+        let output = Command::new("tc")
+            .args(["qdisc", "show", "dev", interface])
+            .output();
+
+        if let Ok(output) = output {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return stdout.contains("cake");
+        }
+
+        false
+    }
+
+    /// Calculate CAKE bandwidth from link stats (fallback to 200Mbit)
+    fn calculate_cake_bandwidth(&self, ifc: &crate::network::wifi::WifiInterface) -> u32 {
+        match self.wifi_manager.get_link_stats(ifc) {
+            Ok(stats) if stats.tx_bitrate_mbps > 0.0 => (stats.tx_bitrate_mbps * 0.60) as u32,
+            Ok(_) => 200,
+            Err(_) => 200,
+        }
     }
 
     /// Update throughput estimate from /sys/class/net statistics

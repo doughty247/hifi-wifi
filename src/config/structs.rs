@@ -73,7 +73,7 @@ impl Default for WifiConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PowerConfig {
     #[allow(dead_code)]
     pub enabled: bool,

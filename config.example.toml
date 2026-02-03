@@ -1,0 +1,59 @@
+# hifi-wifi Configuration
+# Place this file at: /etc/hifi-wifi/config.toml
+# All settings are optional - defaults are used if omitted
+
+[global]
+tick_rate_secs = 2  # Governor loop interval
+
+[power]
+enabled = true
+# wlan_power_save options:
+#   "adaptive" (default) - Auto-disable on AC power, enable on battery when idle
+#   "off" - ALWAYS disabled (fixes Issue #16 - keeps power save OFF permanently)
+#   "on" - ALWAYS enabled (battery saving, may cause lag)
+wlan_power_save = "adaptive"
+
+[wifi]
+enabled = true
+# Signal thresholds for band steering (dBm)
+min_signal_2g_dbm = -75
+min_signal_5g_dbm = -72
+min_signal_6g_dbm = -70
+# Band bias (higher = more preference)
+band_bias_5ghz = 15
+band_bias_6ghz = 25
+
+[system]
+sysctl_enabled = true
+irq_affinity_enabled = true
+driver_tweaks_enabled = true
+
+[backend]
+# Disable iwd's periodic scanning for reduced latency
+iwd_periodic_scan_disable = true
+
+[governor]
+# Breathing CAKE (dynamic bandwidth adjustment)
+breathing_cake_enabled = true
+cake_median_window = 3
+cake_change_threshold_mbit = 15
+cake_change_threshold_pct = 0.15
+cake_overhead_factor = 0.85
+cake_hysteresis_up = 3    # Slow increases (prevent oscillation)
+cake_hysteresis_down = 1  # Fast decreases (prevent bufferbloat)
+
+# Game Mode Detection
+game_mode_enabled = true
+game_mode_pps_threshold = 200
+game_mode_cooldown_secs = 30
+game_mode_freeze_cake = true
+
+# CPU Governor (coalescing)
+cpu_coalescing_enabled = true
+cpu_coalescing_threshold = 0.7
+cpu_avg_window_size = 5
+
+# Band Steering
+band_steering_enabled = true
+band_steering_hysteresis_ticks = 3
+band_steering_min_improvement = 10

@@ -50,6 +50,7 @@ hifi-wifi runs automatically in the background. You don't need to do anything.
 |---------|-------------|
 | `hifi-wifi status` | Check if it's working |
 | `sudo hifi-wifi monitor` | Watch live activity (Ctrl+C to exit) |
+| `sudo hifi-wifi apply --force-performance` | Force power save OFF (max performance) |
 | `sudo hifi-wifi on/off` | Start/stop the service |
 | `sudo hifi-wifi uninstall` | Remove completely |
 

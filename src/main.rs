@@ -6,6 +6,8 @@ mod utils;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use log::{info, error, warn};
+use std::path::Path;
+use std::process::Command;
 
 use crate::config::loader::load_config;
 use crate::network::wifi::{WifiManager, WifiInterface};
@@ -16,7 +18,7 @@ use crate::system::optimizer::SystemOptimizer;
 
 #[derive(Parser)]
 #[command(name = "hifi-wifi")]
-#[command(version = "3.0.0-beta.2")]
+#[command(version = "3.0.0-beta.3")]
 #[command(about = "High Fidelity WiFi optimizer for Linux Streaming Handhelds", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -25,6 +27,10 @@ struct Cli {
     /// Run without making changes (show what would be done)
     #[arg(long, global = true)]
     dry_run: bool,
+    
+    /// Force power save OFF (disables WiFi power management permanently for maximum performance)
+    #[arg(long, global = true)]
+    force_performance: bool,
 }
 
 #[derive(Subcommand)]
@@ -68,6 +74,13 @@ async fn main() -> Result<()> {
     }
 
     let config = load_config();
+    
+    // Apply force-performance override to config
+    let mut config = config;
+    if cli.force_performance {
+        info!("--force-performance: Forcing power save OFF");
+        config.power.wlan_power_save = "off".to_string();
+    }
 
     match cli.command.unwrap_or(Commands::Apply) {
         Commands::Apply => {
@@ -218,6 +231,32 @@ fn run_apply(config: &config::structs::Config) -> Result<()> {
     }
 
     info!("\n=== Optimization Complete ===");
+    
+    // Smart UX: Auto-install and start service for persistence
+    let service_path = Path::new("/etc/systemd/system/hifi-wifi.service");
+    if !service_path.exists() {
+        info!("\nInstalling systemd service for persistent optimization...");
+        if let Err(e) = run_install() {
+            warn!("Failed to install service: {}. Optimizations won't persist.", e);
+            return Ok(());
+        }
+    }
+    
+    // Enable and start service for persistence across reboots
+    info!("Enabling and starting hifi-wifi daemon...");
+    let status = Command::new("systemctl")
+        .args(["enable", "--now", "hifi-wifi.service"])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            info!("hifi-wifi daemon active and enabled");
+        }
+        _ => {
+            warn!("Failed to enable/start daemon. Run: sudo systemctl enable --now hifi-wifi");
+        }
+    }
+    
     Ok(())
 }
 
@@ -308,7 +347,7 @@ async fn run_monitor(config: &config::structs::Config) -> Result<()> {
     run_apply(config)?;
 
     // Start the Governor
-    let mut governor = Governor::new(config.governor.clone(), config.wifi.clone()).await?;
+    let mut governor = Governor::new(config.governor.clone(), config.wifi.clone(), config.power.clone()).await?;
     
     info!("Governor initialized, entering main loop (tick: {}s)", 
           config.global.tick_rate_secs);
@@ -553,13 +592,25 @@ async fn run_status_async() -> Result<()> {
     println!("{}│{}  Backend: {:?}", BLUE, NC, backend.backend());
     
     let config = load_config();
-    let gov_status = if service_active { "Running" } else { "Stopped" };
+    let gov_status = if service_active {
+        format!("{}Active{}", GREEN, NC)
+    } else {
+        format!("{}Inactive{}", RED, NC)
+    };
     println!("{}│{}  Governor: {}", BLUE, NC, gov_status);
     println!("{}│{}    ├─ QoS Mode:   {}", BLUE, NC, if config.governor.breathing_cake_enabled { "Breathing CAKE (Dynamic)" } else { "Static CAKE" });
     println!("{}│{}    ├─ Game Mode:  {}", BLUE, NC, if config.governor.game_mode_enabled { "Available (PPS > 200)" } else { "Disabled" });
     println!("{}│{}    └─ Band Steer: {}", BLUE, NC, if config.governor.band_steering_enabled { "Available" } else { "Disabled" });
 
     println!("{}└{}", BLUE, NC);
+    
+    // Add fix suggestion if governor not running
+    if !service_active {
+        println!();
+        println!("{}{}{}┌─ Fix{}", BOLD, YELLOW, NC, NC);
+        println!("{}│{}  Run: {}sudo hifi-wifi apply{}", YELLOW, NC, BOLD, NC);
+        println!("{}└{}", YELLOW, NC);
+    }
     println!();
 
     // 5. Connection Details (NM)
