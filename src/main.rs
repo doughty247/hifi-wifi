@@ -2,6 +2,7 @@ mod network;
 mod system;
 mod config;
 mod utils;
+mod firmware;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -47,6 +48,11 @@ enum Commands {
     On,
     /// Bootstrap: Check and repair system service (runs on boot via user timer)
     Bootstrap,
+    /// Manage WiFi firmware updates (Steam Deck OLED only)
+    Firmware {
+        #[command(subcommand)]
+        action: firmware::FirmwareAction,
+    },
 }
 
 #[tokio::main]
@@ -55,13 +61,18 @@ async fn main() -> Result<()> {
     
     let cli = Cli::parse();
 
-    // Suppress INFO logs for status command (clean output)
-    if matches!(cli.command, Some(Commands::Status)) {
+    // Suppress INFO logs for status command and firmware status (clean output)
+    if matches!(cli.command, Some(Commands::Status))
+        || matches!(cli.command, Some(Commands::Firmware { action: firmware::FirmwareAction::Status { .. } }))
+    {
         log::set_max_level(log::LevelFilter::Warn);
     }
 
-    // Root check (except for status command)
-    if !matches!(cli.command, Some(Commands::Status)) && !utils::privilege::is_root() {
+    // Root check (except for status commands)
+    let needs_root = !matches!(cli.command, Some(Commands::Status))
+        && !matches!(cli.command, Some(Commands::Firmware { action: firmware::FirmwareAction::Status { .. } }));
+
+    if needs_root && !utils::privilege::is_root() {
         error!("This application must be run as root.");
         error!("Try: sudo hifi-wifi");
         std::process::exit(1);
@@ -101,6 +112,9 @@ async fn main() -> Result<()> {
         }
         Commands::Bootstrap => {
             run_bootstrap()?;
+        }
+        Commands::Firmware { action } => {
+            firmware::run_firmware(action, cli.dry_run)?;
         }
     }
 
@@ -401,6 +415,25 @@ async fn run_status_async() -> Result<()> {
     println!("{}│{}  Device: {:?}", BLUE, NC, power_mgr.device_type());
     let bat_pct = power_mgr.battery_percentage().map(|p| format!("{}%", p)).unwrap_or("N/A".to_string());
     println!("{}│{}  Power:  {:?} (Battery: {})", BLUE, NC, power_mgr.power_source(), bat_pct);
+
+    // Firmware info
+    if let Ok(fw_path) = crate::firmware::version::detect_firmware_path() {
+        if let Ok(fw_ver) = crate::firmware::version::FirmwareVersion::from_installed(&fw_path) {
+            let fw_type = if fw_ver.is_valve_stock() {
+                format!("{}(Valve stock){}", DIM, NC)
+            } else {
+                format!("{}(upstream){}", DIM, NC)
+            };
+            // Truncate version string for display
+            let ver_short = if fw_ver.version_string.len() > 40 {
+                format!("{}...", &fw_ver.version_string[..37])
+            } else {
+                fw_ver.version_string.clone()
+            };
+            println!("{}│{}  Network Card Firmware: {} {}", BLUE, NC, ver_short, fw_type);
+        }
+    }
+
     println!("{}└{}", BLUE, NC);
     println!();
 
