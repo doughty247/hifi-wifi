@@ -76,9 +76,14 @@ impl Default for WifiConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PowerConfig {
     #[allow(dead_code)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_adaptive")]
     pub wlan_power_save: String, // "on", "off", "adaptive"
 }
+
+fn default_true() -> bool { true }
+fn default_adaptive() -> String { "adaptive".to_string() }
 
 impl Default for PowerConfig {
     fn default() -> Self {
@@ -121,6 +126,7 @@ impl Default for BackendConfig {
 
 /// Governor-specific settings (the "brain" of hifi-wifi)
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct GovernorConfig {
     /// Enable dynamic CAKE bandwidth adjustment
     pub breathing_cake_enabled: bool,
@@ -158,6 +164,13 @@ pub struct GovernorConfig {
     
     /// Rolling average window size for CPU monitoring
     pub cpu_avg_window_size: usize,
+
+    /// Suppress iwd background scans to eliminate latency spikes
+    /// When true (default), the Governor aborts background scans every 500ms
+    /// while connected, reducing latency from ~20ms avg/170ms max to ~3.5ms avg/4ms max.
+    /// Disables roaming and band steering while active (scans resume if disconnected).
+    #[serde(default = "default_true")]
+    pub scan_suppress: bool,
 }
 
 impl Default for GovernorConfig {
@@ -183,6 +196,8 @@ impl Default for GovernorConfig {
             cpu_coalescing_threshold: 0.90,
             
             cpu_avg_window_size: 3,
+
+            scan_suppress: true,
         }
     }
 }

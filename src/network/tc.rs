@@ -7,6 +7,76 @@ use anyhow::{Context, Result};
 use log::{info, debug, warn};
 use std::process::Command;
 use std::collections::VecDeque;
+use std::sync::OnceLock;
+
+static GATEWAY_RTT: OnceLock<String> = OnceLock::new();
+
+/// Detect appropriate CAKE RTT by pinging the default gateway.
+/// Result is cached after first call.
+pub fn detect_gateway_rtt() -> &'static str {
+    GATEWAY_RTT.get_or_init(|| {
+        let rtt = measure_gateway_rtt();
+        info!("CAKE: Auto-detected gateway RTT -> using {}", rtt);
+        rtt
+    }).as_str()
+}
+
+fn measure_gateway_rtt() -> String {
+    // Get default gateway IP from routing table
+    let gateway_ip = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            stdout.split_whitespace()
+                .skip_while(|w| *w != "via")
+                .nth(1)
+                .map(|s| s.to_string())
+        });
+
+    let gateway_ip = match gateway_ip {
+        Some(ip) => ip,
+        None => {
+            debug!("Could not detect default gateway, using 50ms RTT");
+            return "50ms".to_string();
+        }
+    };
+
+    // Ping gateway 3 times with 1s timeout
+    let avg_ms = Command::new("ping")
+        .args(["-c", "3", "-W", "1", &gateway_ip])
+        .output()
+        .ok()
+        .and_then(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            // Parse "rtt min/avg/max/mdev = 1.234/2.345/3.456/0.567 ms"
+            stdout.lines()
+                .find(|l| l.contains("rtt") || l.contains("round-trip"))
+                .and_then(|l| l.split('=').nth(1))
+                .and_then(|s| s.split('/').nth(1))
+                .and_then(|s| s.trim().parse::<f64>().ok())
+        });
+
+    match avg_ms {
+        Some(rtt) if rtt < 5.0 => {
+            info!("Gateway RTT {:.1}ms (local WiFi)", rtt);
+            "20ms".to_string()
+        }
+        Some(rtt) if rtt < 20.0 => {
+            info!("Gateway RTT {:.1}ms (mesh/multi-hop)", rtt);
+            "50ms".to_string()
+        }
+        Some(rtt) => {
+            info!("Gateway RTT {:.1}ms (high latency path)", rtt);
+            "100ms".to_string()
+        }
+        None => {
+            debug!("Could not measure gateway RTT, using 50ms");
+            "50ms".to_string()
+        }
+    }
+}
 
 /// Traffic Control manager with asymmetric response
 /// 
@@ -235,6 +305,7 @@ impl TcManager {
             .args([
                 "qdisc", "replace", "dev", interface, "root", "cake",
                 "bandwidth", &format!("{}mbit", bandwidth_mbit),
+                "rtt", detect_gateway_rtt(),
                 "diffserv4",      // Differentiated services
                 "dual-dsthost",   // Fair queuing per destination
                 "nat",            // NAT awareness
@@ -253,6 +324,7 @@ impl TcManager {
                 .args([
                     "qdisc", "replace", "dev", interface, "root", "cake",
                     "bandwidth", &format!("{}mbit", bandwidth_mbit),
+                    "rtt", detect_gateway_rtt(),
                     "besteffort", "nat",
                 ])
                 .output()?;

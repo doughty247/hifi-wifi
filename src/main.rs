@@ -53,6 +53,18 @@ enum Commands {
     On,
     /// Bootstrap: Check and repair system service (runs on boot via user timer)
     Bootstrap,
+    /// Control WiFi power save mode (off/on/adaptive/status)
+    #[command(name = "power-save")]
+    PowerSave {
+        /// Mode: off (best performance), on (battery saving), adaptive (automatic), status (show current)
+        mode: String,
+    },
+    /// Control background scan suppression (on/off/status)
+    #[command(name = "scan-suppress")]
+    ScanSuppress {
+        /// Mode: on (suppress scans for lowest latency), off (allow scans for roaming), status (show current)
+        mode: String,
+    },
 }
 
 #[tokio::main]
@@ -61,13 +73,16 @@ async fn main() -> Result<()> {
     
     let cli = Cli::parse();
 
-    // Suppress INFO logs for status command (clean output)
-    if matches!(cli.command, Some(Commands::Status)) {
+    // Suppress INFO logs for status-like commands (clean output)
+    let is_status_cmd = matches!(cli.command, Some(Commands::Status))
+        || matches!(cli.command, Some(Commands::PowerSave { ref mode }) if mode == "status")
+        || matches!(cli.command, Some(Commands::ScanSuppress { ref mode }) if mode == "status");
+    if is_status_cmd {
         log::set_max_level(log::LevelFilter::Warn);
     }
 
-    // Root check (except for status command)
-    if !matches!(cli.command, Some(Commands::Status)) && !utils::privilege::is_root() {
+    // Root check (except for status commands)
+    if !is_status_cmd && !utils::privilege::is_root() {
         error!("This application must be run as root.");
         error!("Try: sudo hifi-wifi");
         std::process::exit(1);
@@ -114,6 +129,12 @@ async fn main() -> Result<()> {
         }
         Commands::Bootstrap => {
             run_bootstrap()?;
+        }
+        Commands::PowerSave { mode } => {
+            run_power_save(&mode, &config)?;
+        }
+        Commands::ScanSuppress { mode } => {
+            run_scan_suppress(&mode, &config)?;
         }
     }
 
@@ -164,6 +185,11 @@ fn run_apply(config: &config::structs::Config) -> Result<()> {
             info!("Optimizing {} active interface(s)", active_interfaces.len());
             sys_opt.apply(&active_interfaces)?;
         }
+    }
+
+    // 3b. Write persistent NetworkManager power save config (survives sleep/wake)
+    if let Err(e) = write_nm_powersave_config(&config.power.wlan_power_save) {
+        warn!("Failed to write NM powersave config: {}", e);
     }
 
     // 4. Apply power-aware settings
@@ -316,6 +342,9 @@ fn run_revert() -> Result<()> {
         }
     }
 
+    // Remove NM power save config
+    remove_nm_powersave_config();
+
     // Revert system optimizations
     let sys_opt = SystemOptimizer::default();
     sys_opt.revert()?;
@@ -467,11 +496,14 @@ async fn run_status_async() -> Result<()> {
             .unwrap_or_default();
         
         if qdisc_out.contains("cake") {
-             // Extract bandwidth if possible
+             // Extract bandwidth and RTT if possible
              let bw = qdisc_out.split("bandwidth ").nth(1)
                 .and_then(|s| s.split_whitespace().next())
                 .unwrap_or("unknown");
-             println!("{}│{}    ├─ CAKE:       {}[ACTIVE]{} Bandwidth: {}", BLUE, NC, GREEN, NC, bw);
+             let rtt = qdisc_out.split("rtt ").nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .unwrap_or("default");
+             println!("{}│{}    ├─ CAKE:       {}[ACTIVE]{} Bandwidth: {} RTT: {}", BLUE, NC, GREEN, NC, bw, rtt);
         } else {
              println!("{}│{}    ├─ CAKE:       {}[INACTIVE]{}", BLUE, NC, RED, NC);
         }
@@ -600,7 +632,13 @@ async fn run_status_async() -> Result<()> {
     println!("{}│{}  Governor: {}", BLUE, NC, gov_status);
     println!("{}│{}    ├─ QoS Mode:   {}", BLUE, NC, if config.governor.breathing_cake_enabled { "Breathing CAKE (Dynamic)" } else { "Static CAKE" });
     println!("{}│{}    ├─ Game Mode:  {}", BLUE, NC, if config.governor.game_mode_enabled { "Available (PPS > 200)" } else { "Disabled" });
-    println!("{}│{}    └─ Band Steer: {}", BLUE, NC, if config.governor.band_steering_enabled { "Available" } else { "Disabled" });
+    println!("{}│{}    ├─ Band Steer: {}", BLUE, NC, if config.governor.band_steering_enabled { "Available" } else { "Disabled" });
+    let scan_suppress_desc = if config.governor.scan_suppress {
+        format!("{}[ON]{} (Lowest Latency)", GREEN, NC)
+    } else {
+        format!("{}[OFF]{} (Roaming Enabled)", YELLOW, NC)
+    };
+    println!("{}│{}    └─ Scan Suppress: {}", BLUE, NC, scan_suppress_desc);
 
     println!("{}└{}", BLUE, NC);
     
@@ -838,7 +876,7 @@ fn install_nm_dispatcher() -> Result<()> {
     let dispatcher_content = r#"#!/bin/bash
 # hifi-wifi NetworkManager dispatcher
 # Signals the daemon when WiFi connects so it can apply fresh optimizations
-# Per roadmap-beta2.md: This fixes the "reconnection problem" (Issue #10)
+# Also enforces power save settings immediately on connection (belt-and-suspenders)
 
 INTERFACE="$1"
 ACTION="$2"
@@ -853,6 +891,16 @@ fi
 
 # Ensure run directory exists
 mkdir -p /run/hifi-wifi
+
+# Enforce power save setting from NM config (immediate, before daemon picks it up)
+NM_PS_CONF="/etc/NetworkManager/conf.d/99-hifi-wifi-powersave.conf"
+if [[ -f "$NM_PS_CONF" ]]; then
+    PS_VALUE=$(awk -F= '/wifi\.powersave/{gsub(/[^0-9]/,"",$2); print $2}' "$NM_PS_CONF" 2>/dev/null)
+    case "$PS_VALUE" in
+        2) iw dev "$INTERFACE" set power_save off 2>/dev/null ;;
+        3) iw dev "$INTERFACE" set power_save on 2>/dev/null ;;
+    esac
+fi
 
 # Signal the daemon by touching the event file
 # The daemon watches this with inotify and triggers re-optimization
@@ -1102,6 +1150,7 @@ fn run_uninstall() -> Result<()> {
         "/var/lib/hifi-wifi/hifi-wifi-bootstrap.service",
         "/var/lib/hifi-wifi/hifi-wifi-bootstrap.timer",
         "/etc/NetworkManager/dispatcher.d/99-hifi-wifi-connect",
+        "/etc/NetworkManager/conf.d/99-hifi-wifi-powersave.conf",
     ];
     
     for path in &files_to_remove {
@@ -1367,6 +1416,430 @@ WantedBy=multi-user.target
     } else {
         info!("Bootstrap: Optimizations applied successfully");
     }
-    
+
+    Ok(())
+}
+
+// ============================================================================
+// Power Save Control
+// ============================================================================
+
+/// Path for the persistent NetworkManager power save config
+const NM_POWERSAVE_CONF: &str = "/etc/NetworkManager/conf.d/99-hifi-wifi-powersave.conf";
+/// Path for the hifi-wifi config file
+const HIFI_CONFIG_PATH: &str = "/etc/hifi-wifi/config.toml";
+
+/// Write a NetworkManager config file that persistently controls WiFi power save.
+/// NM reads conf.d on every connection activation, so this survives sleep/wake.
+///
+/// wifi.powersave values:
+///   1 = ignore (use default / let hifi-wifi adaptive logic control it)
+///   2 = disable
+///   3 = enable
+fn write_nm_powersave_config(mode: &str) -> Result<()> {
+    use std::fs::{self, File};
+    use std::io::Write;
+
+    let nm_value = match mode {
+        "off" => 2,
+        "on" => 3,
+        _ => 1, // adaptive — NM ignores, hifi-wifi controls
+    };
+
+    let content = format!(
+        "# hifi-wifi WiFi power save configuration\n\
+         # Auto-generated by hifi-wifi — do not edit manually\n\
+         # Mode: {}\n\
+         [connection]\n\
+         wifi.powersave = {}\n",
+        mode, nm_value
+    );
+
+    let conf_dir = std::path::Path::new("/etc/NetworkManager/conf.d");
+    if !conf_dir.exists() {
+        fs::create_dir_all(conf_dir)?;
+    }
+
+    match File::create(NM_POWERSAVE_CONF) {
+        Ok(mut file) => {
+            file.write_all(content.as_bytes())?;
+            info!("Created NM power save config: {} (wifi.powersave={})", NM_POWERSAVE_CONF, nm_value);
+
+            // Reload NM to pick up the new config immediately
+            let _ = std::process::Command::new("nmcli")
+                .args(["general", "reload"])
+                .output();
+        }
+        Err(e) => {
+            warn!("Could not create NM powersave config (Read-only filesystem?): {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove the persistent NetworkManager power save config
+fn remove_nm_powersave_config() {
+    if std::path::Path::new(NM_POWERSAVE_CONF).exists() {
+        let _ = std::fs::remove_file(NM_POWERSAVE_CONF);
+        info!("Removed NM power save config: {}", NM_POWERSAVE_CONF);
+
+        // Reload NM so it stops enforcing the old setting
+        let _ = std::process::Command::new("nmcli")
+            .args(["general", "reload"])
+            .output();
+    }
+}
+
+/// Write the hifi-wifi config file with the specified power save mode
+fn write_hifi_config(mode: &str) -> Result<()> {
+    use std::fs::{self, File};
+    use std::io::Write;
+
+    let config_dir = std::path::Path::new("/etc/hifi-wifi");
+    fs::create_dir_all(config_dir)?;
+
+    // Read existing config or start fresh
+    let existing = fs::read_to_string(HIFI_CONFIG_PATH).unwrap_or_default();
+
+    // Update or insert the power save setting
+    let new_content = if existing.contains("[power]") {
+        // Replace existing wlan_power_save line
+        let mut result = String::new();
+        let mut in_power_section = false;
+        let mut replaced = false;
+        for line in existing.lines() {
+            if line.trim() == "[power]" {
+                in_power_section = true;
+                result.push_str(line);
+                result.push('\n');
+            } else if line.trim().starts_with('[') {
+                if in_power_section && !replaced {
+                    // [power] section existed but had no wlan_power_save — insert before next section
+                    result.push_str(&format!("wlan_power_save = \"{}\"\n", mode));
+                    replaced = true;
+                }
+                in_power_section = false;
+                result.push_str(line);
+                result.push('\n');
+            } else if in_power_section && line.trim().starts_with("wlan_power_save") {
+                result.push_str(&format!("wlan_power_save = \"{}\"", mode));
+                result.push('\n');
+                replaced = true;
+            } else {
+                result.push_str(line);
+                result.push('\n');
+            }
+        }
+        if in_power_section && !replaced {
+            result.push_str(&format!("wlan_power_save = \"{}\"", mode));
+            result.push('\n');
+        }
+        result
+    } else {
+        // No [power] section exists — append it
+        let mut result = existing;
+        if !result.is_empty() && !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push_str(&format!("\n[power]\nenabled = true\nwlan_power_save = \"{}\"\n", mode));
+        result
+    };
+
+    let mut file = File::create(HIFI_CONFIG_PATH)?;
+    file.write_all(new_content.as_bytes())?;
+    info!("Updated config: {} (wlan_power_save = \"{}\")", HIFI_CONFIG_PATH, mode);
+
+    Ok(())
+}
+
+/// Control WiFi power save mode
+fn run_power_save(mode: &str, config: &config::structs::Config) -> Result<()> {
+    use std::process::Command;
+
+    // ANSI Colors
+    const GREEN: &str = "\x1b[0;32m";
+    const YELLOW: &str = "\x1b[0;33m";
+    const BLUE: &str = "\x1b[0;34m";
+    const BOLD: &str = "\x1b[1m";
+    const NC: &str = "\x1b[0m";
+
+    match mode {
+        "status" => {
+            println!();
+            println!("{}{}Power Save Status{}", BOLD, BLUE, NC);
+            println!("{}─────────────────────{}", BLUE, NC);
+
+            // Show configured mode
+            let configured = &config.power.wlan_power_save;
+            let mode_display = match configured.as_str() {
+                "off" => format!("{}OFF{} (Maximum Performance)", GREEN, NC),
+                "on" => format!("{}ON{} (Battery Saving)", YELLOW, NC),
+                _ => format!("{}ADAPTIVE{} (Automatic)", BLUE, NC),
+            };
+            println!("  Config mode: {}", mode_display);
+
+            // Show NM persistent config
+            if std::path::Path::new(NM_POWERSAVE_CONF).exists() {
+                let nm_content = std::fs::read_to_string(NM_POWERSAVE_CONF).unwrap_or_default();
+                let nm_val = nm_content.lines()
+                    .find(|l| l.contains("wifi.powersave"))
+                    .and_then(|l| l.split('=').nth(1))
+                    .map(|v| v.trim())
+                    .unwrap_or("?");
+                let nm_desc = match nm_val {
+                    "2" => "disable (persistent)",
+                    "3" => "enable (persistent)",
+                    "1" => "ignore (adaptive)",
+                    _ => "unknown",
+                };
+                println!("  NM config:   wifi.powersave = {} ({})", nm_val, nm_desc);
+            } else {
+                println!("  NM config:   not set");
+            }
+
+            // Show actual iw state per interface
+            let wifi_mgr = WifiManager::new_quiet()?;
+            for ifc in wifi_mgr.interfaces() {
+                if ifc.interface_type != crate::network::wifi::InterfaceType::Wifi {
+                    continue;
+                }
+                let ps_out = Command::new("iw")
+                    .args(["dev", &ifc.name, "get", "power_save"])
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default();
+
+                let actual = if ps_out.contains("off") {
+                    format!("{}OFF{}", GREEN, NC)
+                } else if ps_out.contains("on") {
+                    format!("{}ON{}", YELLOW, NC)
+                } else {
+                    "unknown".to_string()
+                };
+                println!("  {}: power_save = {}", ifc.name, actual);
+            }
+            println!();
+        }
+        "off" | "on" | "adaptive" => {
+            let mode_desc = match mode {
+                "off" => "OFF (Maximum Performance — persists across sleep/reboot)",
+                "on" => "ON (Battery Saving — persists across sleep/reboot)",
+                _ => "ADAPTIVE (Automatic based on AC/battery)",
+            };
+            info!("Setting WiFi power save to: {}", mode_desc);
+
+            // 1. Write hifi-wifi config file
+            write_hifi_config(mode)?;
+
+            // 2. Write persistent NM config
+            write_nm_powersave_config(mode)?;
+
+            // 3. Apply immediately via iw on all connected WiFi interfaces
+            let wifi_mgr = WifiManager::new()?;
+            for ifc in wifi_mgr.interfaces() {
+                if ifc.interface_type != crate::network::wifi::InterfaceType::Wifi {
+                    continue;
+                }
+                if !wifi_mgr.is_interface_connected(ifc) {
+                    continue;
+                }
+                match mode {
+                    "off" => {
+                        wifi_mgr.disable_power_save(ifc)?;
+                        info!("Power save disabled on {}", ifc.name);
+                    }
+                    "on" => {
+                        wifi_mgr.enable_power_save(ifc)?;
+                        info!("Power save enabled on {}", ifc.name);
+                    }
+                    _ => {
+                        // Adaptive: let the governor handle it
+                        info!("Power save set to adaptive on {} (governor will manage)", ifc.name);
+                    }
+                }
+            }
+
+            // 4. Restart service if running so Governor picks up the new config
+            let service_running = Command::new("systemctl")
+                .args(["is-active", "--quiet", "hifi-wifi.service"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            if service_running {
+                info!("Restarting hifi-wifi service to apply new config...");
+                let _ = Command::new("systemctl").args(["restart", "hifi-wifi.service"]).output();
+            }
+
+            info!("Power save mode set to '{}' successfully", mode);
+        }
+        _ => {
+            error!("Invalid mode: '{}'. Use: off, on, adaptive, or status", mode);
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Scan Suppression Control
+// ============================================================================
+
+/// Control background scan suppression
+fn run_scan_suppress(mode: &str, config: &config::structs::Config) -> Result<()> {
+    use std::process::Command;
+
+    // ANSI Colors
+    const GREEN: &str = "\x1b[0;32m";
+    const YELLOW: &str = "\x1b[0;33m";
+    const BLUE: &str = "\x1b[0;34m";
+    const BOLD: &str = "\x1b[1m";
+    const NC: &str = "\x1b[0m";
+
+    match mode {
+        "status" => {
+            println!();
+            println!("{}{}Scan Suppression Status{}", BOLD, BLUE, NC);
+            println!("{}──────────────────────────{}", BLUE, NC);
+
+            let configured = config.governor.scan_suppress;
+            let mode_display = if configured {
+                format!("{}ON{} (Background scans suppressed — lowest latency)", GREEN, NC)
+            } else {
+                format!("{}OFF{} (Background scans allowed — roaming enabled)", YELLOW, NC)
+            };
+            println!("  Config: {}", mode_display);
+
+            // Check if service is running
+            let service_active = Command::new("systemctl")
+                .args(["is-active", "--quiet", "hifi-wifi.service"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            if service_active {
+                println!("  Service: {}Running{} (scan suppress {})",
+                    GREEN, NC,
+                    if configured { "active" } else { "inactive" });
+            } else {
+                println!("  Service: {}Not running{}", YELLOW, NC);
+            }
+
+            // Show current scan state via iw
+            let wifi_mgr = WifiManager::new_quiet()?;
+            for ifc in wifi_mgr.interfaces() {
+                if ifc.interface_type != crate::network::wifi::InterfaceType::Wifi {
+                    continue;
+                }
+                // Quick test: trigger scan abort and check if scan was active
+                let scan_out = Command::new("iw")
+                    .args(["dev", &ifc.name, "scan", "abort"])
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
+                    .unwrap_or_default();
+
+                let scan_state = if scan_out.contains("No such") {
+                    "no active scan"
+                } else {
+                    "scan aborted (was in progress)"
+                };
+                println!("  {}: {}", ifc.name, scan_state);
+            }
+            println!();
+        }
+        "on" | "off" => {
+            let enable = mode == "on";
+            let desc = if enable {
+                "ON (suppress background scans — lowest latency, disables roaming)"
+            } else {
+                "OFF (allow background scans — roaming enabled)"
+            };
+            info!("Setting scan suppression to: {}", desc);
+
+            // Update config file
+            write_scan_suppress_config(enable)?;
+
+            // Restart service if running so Governor picks up the new config
+            let service_running = Command::new("systemctl")
+                .args(["is-active", "--quiet", "hifi-wifi.service"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            if service_running {
+                info!("Restarting hifi-wifi service to apply new config...");
+                let _ = Command::new("systemctl").args(["restart", "hifi-wifi.service"]).output();
+            }
+
+            info!("Scan suppression set to '{}' successfully", mode);
+        }
+        _ => {
+            error!("Invalid mode: '{}'. Use: on, off, or status", mode);
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+/// Write the scan_suppress setting to the hifi-wifi config file
+fn write_scan_suppress_config(enable: bool) -> Result<()> {
+    use std::fs::{self, File};
+    use std::io::Write;
+
+    let config_dir = std::path::Path::new("/etc/hifi-wifi");
+    fs::create_dir_all(config_dir)?;
+
+    let existing = fs::read_to_string(HIFI_CONFIG_PATH).unwrap_or_default();
+    let value_str = if enable { "true" } else { "false" };
+
+    let new_content = if existing.contains("[governor]") {
+        let mut result = String::new();
+        let mut in_governor_section = false;
+        let mut replaced = false;
+        for line in existing.lines() {
+            if line.trim() == "[governor]" {
+                in_governor_section = true;
+                result.push_str(line);
+                result.push('\n');
+            } else if line.trim().starts_with('[') {
+                if in_governor_section && !replaced {
+                    result.push_str(&format!("scan_suppress = {}\n", value_str));
+                    replaced = true;
+                }
+                in_governor_section = false;
+                result.push_str(line);
+                result.push('\n');
+            } else if in_governor_section && line.trim().starts_with("scan_suppress") {
+                result.push_str(&format!("scan_suppress = {}", value_str));
+                result.push('\n');
+                replaced = true;
+            } else {
+                result.push_str(line);
+                result.push('\n');
+            }
+        }
+        if in_governor_section && !replaced {
+            result.push_str(&format!("scan_suppress = {}", value_str));
+            result.push('\n');
+        }
+        result
+    } else {
+        let mut result = existing;
+        if !result.is_empty() && !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push_str(&format!("\n[governor]\nscan_suppress = {}\n", value_str));
+        result
+    };
+
+    let mut file = File::create(HIFI_CONFIG_PATH)?;
+    file.write_all(new_content.as_bytes())?;
+    info!("Updated config: {} (scan_suppress = {})", HIFI_CONFIG_PATH, value_str);
+
     Ok(())
 }
