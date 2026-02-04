@@ -60,8 +60,6 @@ struct InterfaceState {
     bandwidth_valid: bool,
     /// Last known good bitrate (Kbit/s) - used when current reading is garbage (MCS0 probes)
     last_good_bitrate: Option<u32>,
-    /// Bypass hysteresis for next power save application (for reconnection fix)
-    bypass_power_save_hysteresis: bool,
 }
 
 impl InterfaceState {
@@ -91,7 +89,6 @@ impl InterfaceState {
             last_stats_time: None,
             bandwidth_valid: false,
             last_good_bitrate: None,
-            bypass_power_save_hysteresis: false,
         }
     }
 }
@@ -221,6 +218,9 @@ impl Governor {
             state.bandwidth_valid = false;
             state.power_save_enabled = None; // Force re-apply on next tick
         }
+        
+        // Clear gateway RTT cache - may have changed (VPN, roaming, multi-hop)
+        crate::network::tc::reset_gateway_rtt_cache();
         
         // Wait 1 second for link to stabilize (per legacy dispatcher behavior)
         info!("Waiting 1s for link to stabilize...");

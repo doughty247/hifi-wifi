@@ -18,3 +18,4 @@ docs/
 tests/
 bin/
 *.tar.gz
+/forks/

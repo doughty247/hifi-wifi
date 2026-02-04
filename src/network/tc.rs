@@ -7,18 +7,37 @@ use anyhow::{Context, Result};
 use log::{info, debug, warn};
 use std::process::Command;
 use std::collections::VecDeque;
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
-static GATEWAY_RTT: OnceLock<String> = OnceLock::new();
+static GATEWAY_RTT: RwLock<Option<String>> = RwLock::new(None);
+
+/// Reset gateway RTT cache (call on connection events)
+pub fn reset_gateway_rtt_cache() {
+    if let Ok(mut cache) = GATEWAY_RTT.write() {
+        *cache = None;
+        debug!("Gateway RTT cache cleared");
+    }
+}
 
 /// Detect appropriate CAKE RTT by pinging the default gateway.
-/// Result is cached after first call.
-pub fn detect_gateway_rtt() -> &'static str {
-    GATEWAY_RTT.get_or_init(|| {
-        let rtt = measure_gateway_rtt();
-        info!("CAKE: Auto-detected gateway RTT -> using {}", rtt);
-        rtt
-    }).as_str()
+/// Result is cached after first call per connection.
+pub fn detect_gateway_rtt() -> String {
+    // Try to read cached value
+    if let Ok(cache) = GATEWAY_RTT.read() {
+        if let Some(ref cached) = *cache {
+            return cached.clone();
+        }
+    }
+    
+    // Measure and cache
+    let rtt = measure_gateway_rtt();
+    info!("CAKE: Auto-detected gateway RTT -> using {}", rtt);
+    
+    if let Ok(mut cache) = GATEWAY_RTT.write() {
+        *cache = Some(rtt.clone());
+    }
+    
+    rtt
 }
 
 fn measure_gateway_rtt() -> String {
@@ -305,7 +324,7 @@ impl TcManager {
             .args([
                 "qdisc", "replace", "dev", interface, "root", "cake",
                 "bandwidth", &format!("{}mbit", bandwidth_mbit),
-                "rtt", detect_gateway_rtt(),
+                "rtt", &detect_gateway_rtt(),
                 "diffserv4",      // Differentiated services
                 "dual-dsthost",   // Fair queuing per destination
                 "nat",            // NAT awareness
@@ -324,7 +343,7 @@ impl TcManager {
                 .args([
                     "qdisc", "replace", "dev", interface, "root", "cake",
                     "bandwidth", &format!("{}mbit", bandwidth_mbit),
-                    "rtt", detect_gateway_rtt(),
+                    "rtt", &detect_gateway_rtt(),
                     "besteffort", "nat",
                 ])
                 .output()?;

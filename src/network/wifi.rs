@@ -290,12 +290,13 @@ impl WifiManager {
         info!("Applying CAKE qdisc on {} with {}mbit bandwidth", ifc.name, bandwidth_mbps);
         
         let bandwidth = format!("{}mbit", bandwidth_mbps);
+        let rtt = detect_gateway_rtt();
         
         let output = Command::new("tc")
             .args([
                 "qdisc", "replace", "dev", &ifc.name, "root", "cake",
                 "bandwidth", &bandwidth,
-                "rtt", detect_gateway_rtt(),
+                "rtt", &rtt,
                 "diffserv4", "dual-dsthost", "nat", "wash", "ack-filter"
             ])
             .output()
