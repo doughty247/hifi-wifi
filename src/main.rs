@@ -27,10 +27,6 @@ struct Cli {
     /// Run without making changes (show what would be done)
     #[arg(long, global = true)]
     dry_run: bool,
-    
-    /// Force power save OFF (disables WiFi power management permanently for maximum performance)
-    #[arg(long, global = true)]
-    force_performance: bool,
 }
 
 #[derive(Subcommand)]
@@ -89,13 +85,6 @@ async fn main() -> Result<()> {
     }
 
     let config = load_config();
-    
-    // Apply force-performance override to config
-    let mut config = config;
-    if cli.force_performance {
-        info!("--force-performance: Forcing power save OFF");
-        config.power.wlan_power_save = "off".to_string();
-    }
 
     match cli.command.unwrap_or(Commands::Apply) {
         Commands::Apply => {
