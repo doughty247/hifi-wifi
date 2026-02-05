@@ -11,6 +11,7 @@ use anyhow::Result;
 use log::{info, debug, warn};
 use std::time::{Duration, Instant};
 use std::process::{Command, Stdio};
+use tokio::process::Command as TokioCommand;
 use std::path::Path;
 use std::sync::mpsc::channel;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -827,7 +828,15 @@ impl Governor {
 /// The abort command is a no-op when no scan is in progress (returns ENOENT, harmless).
 /// Only aborts when the flag is set (interface is connected). When disconnected, scans
 /// are allowed so reconnection can proceed.
+///
+/// Uses tokio::process::Command for non-blocking subprocess execution to avoid
+/// blocking the async runtime and causing micro-stuttering during streaming.
 async fn scan_abort_task(active: Arc<AtomicBool>) {
+    // Cache the interface list to avoid reading /sys every tick
+    // Refresh every 10 ticks (5 seconds) to pick up hotplug changes
+    let mut cached_interfaces: Vec<String> = Vec::new();
+    let mut cache_refresh_counter = 0u32;
+
     let mut interval = time::interval(Duration::from_millis(500));
 
     loop {
@@ -837,14 +846,21 @@ async fn scan_abort_task(active: Arc<AtomicBool>) {
             continue;
         }
 
-        // Find connected WiFi interfaces and abort their scans
-        let interfaces = find_wifi_interfaces();
-        for ifc in &interfaces {
-            let _ = Command::new("iw")
+        // Refresh interface cache every 10 ticks (5 seconds)
+        cache_refresh_counter += 1;
+        if cache_refresh_counter >= 10 || cached_interfaces.is_empty() {
+            cached_interfaces = find_wifi_interfaces();
+            cache_refresh_counter = 0;
+        }
+
+        // Abort scans on all connected WiFi interfaces using async subprocess
+        for ifc in &cached_interfaces {
+            let _ = TokioCommand::new("iw")
                 .args(["dev", ifc, "scan", "abort"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .output();
+                .output()
+                .await;
         }
     }
 }

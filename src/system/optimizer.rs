@@ -45,11 +45,6 @@ impl SystemOptimizer {
             }
         }
 
-        // Apply NAPI busy polling per interface
-        for ifc in interfaces {
-            self.apply_napi_tuning(&ifc.name);
-        }
-
         // Apply ethtool optimizations
         for ifc in interfaces {
             self.apply_ethtool_settings(ifc)?;
@@ -77,10 +72,6 @@ impl SystemOptimizer {
             ("net.ipv4.tcp_keepalive_intvl", "10"),
             ("net.ipv4.tcp_keepalive_probes", "6"),
             ("net.ipv4.tcp_tw_reuse", "1"),
-            // NAPI busy polling: kernel polls NIC for packets in tight loop
-            // instead of waiting for interrupts, reducing per-packet latency by ~50-100us
-            ("net.core.busy_poll", "50"),
-            ("net.core.busy_read", "50"),
         ];
 
         let sysctl_path = Path::new("/etc/sysctl.d/99-hifi-wifi.conf");
@@ -135,28 +126,6 @@ impl SystemOptimizer {
         }
 
         Ok(())
-    }
-
-    /// Apply per-interface NAPI busy polling parameters
-    ///
-    /// Configures the kernel to defer hard IRQs and use GRO flush timeout,
-    /// allowing busy polling to batch packet processing and reduce latency.
-    fn apply_napi_tuning(&self, interface: &str) {
-        let napi_defer_path = format!("/sys/class/net/{}/napi_defer_hard_irqs", interface);
-        let gro_flush_path = format!("/sys/class/net/{}/gro_flush_timeout", interface);
-
-        match fs::write(&napi_defer_path, "2") {
-            Ok(_) => debug!("Set napi_defer_hard_irqs=2 for {}", interface),
-            Err(e) => debug!("Could not set napi_defer_hard_irqs for {}: {}", interface, e),
-        }
-
-        // 20000ns = 20us flush timeout
-        match fs::write(&gro_flush_path, "20000") {
-            Ok(_) => debug!("Set gro_flush_timeout=20000 for {}", interface),
-            Err(e) => debug!("Could not set gro_flush_timeout for {}: {}", interface, e),
-        }
-
-        info!("NAPI busy polling configured for {}", interface);
     }
 
     /// Apply driver-specific module parameters
