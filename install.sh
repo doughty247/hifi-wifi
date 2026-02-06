@@ -12,7 +12,7 @@ readonly YELLOW='\033[1;33m'
 readonly RED='\033[0;31m'
 readonly NC='\033[0m'
 
-echo -e "${BLUE}=== hifi-wifi v3.0.0-beta3 Installer ===${NC}\n"
+echo -e "${BLUE}=== hifi-wifi v3.0.0-rc1 Installer ===${NC}\n"
 
 # ============================================================================
 # Helper Functions
@@ -314,7 +314,7 @@ apply_optimizations() {
 
 # Offer reboot
 offer_reboot() {
-    echo -e "${GREEN}Success! hifi-wifi v3.0.0-beta3 is installed and active.${NC}\n"
+    echo -e "${GREEN}Success! hifi-wifi v3.0.0-rc1 is installed and active.${NC}\n"
     echo -e "  Check status:    ${BLUE}hifi-wifi status${NC}"
     echo -e "  Live monitoring: ${BLUE}sudo hifi-wifi monitor${NC}"
     echo -e "  Service logs:    ${BLUE}journalctl -u hifi-wifi -f${NC}\n"
@@ -407,7 +407,7 @@ main() {
         echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
         echo -e "${YELLOW}║              ⚠️  PRE-RELEASE SOFTWARE WARNING  ⚠️              ║${NC}"
         echo -e "${YELLOW}╠══════════════════════════════════════════════════════════════╣${NC}"
-        echo -e "${YELLOW}║  This is hifi-wifi v3.0.0-beta3 - a TESTING release.         ║${NC}"
+        echo -e "${YELLOW}║  This is hifi-wifi v3.0.0-rc1 - a RELEASE CANDIDATE.        ║${NC}"
         echo -e "${YELLOW}║                                                              ║${NC}"
         echo -e "${YELLOW}║  • NOT recommended for production use                        ║${NC}"
         echo -e "${YELLOW}║  • May contain bugs or unexpected behavior                   ║${NC}"

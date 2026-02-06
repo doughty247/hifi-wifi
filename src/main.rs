@@ -18,7 +18,7 @@ use crate::system::optimizer::SystemOptimizer;
 
 #[derive(Parser)]
 #[command(name = "hifi-wifi")]
-#[command(version = "3.0.0-beta.3")]
+#[command(version = "3.0.0-rc.1")]
 #[command(about = "High Fidelity WiFi optimizer for Linux Streaming Handhelds", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -77,11 +77,9 @@ async fn main() -> Result<()> {
         log::set_max_level(log::LevelFilter::Warn);
     }
 
-    // Root check (except for status commands)
+    // Root check (except for status commands) - auto-elevate with sudo
     if !is_status_cmd && !utils::privilege::is_root() {
-        error!("This application must be run as root.");
-        error!("Try: sudo hifi-wifi");
-        std::process::exit(1);
+        utils::privilege::require_root();
     }
 
     let config = load_config();
