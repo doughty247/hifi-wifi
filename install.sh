@@ -365,23 +365,42 @@ main() {
     
     # Step 1: Check for pre-compiled binary
     echo -e "${BLUE}[1/5] Checking for pre-compiled binary...${NC}"
-    local precompiled_bin=$(find_precompiled_binary)
     
-    if [[ -n "$precompiled_bin" ]]; then
-        echo -e "${GREEN}Found: $precompiled_bin${NC}"
+    # First check if binary exists in bin/ (release package)
+    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -f "$script_dir/bin/hifi-wifi" ]]; then
+        echo -e "${GREEN}Found release binary: bin/hifi-wifi${NC}"
         
         # Verify architecture
-        if ! file "$precompiled_bin" | grep -q "x86-64"; then
+        if ! file "$script_dir/bin/hifi-wifi" | grep -q "x86-64"; then
             echo -e "${RED}Error: Binary is not x86_64 architecture${NC}"
             exit 1
         fi
         
-        # Copy to target/release
+        # Copy to target/release for install step
         mkdir -p target/release
-        cp "$precompiled_bin" target/release/hifi-wifi
+        cp "$script_dir/bin/hifi-wifi" target/release/hifi-wifi
         chmod +x target/release/hifi-wifi
-        echo -e "${GREEN}Using pre-compiled binary (skipping build)${NC}\n"
-    else
+        echo -e "${GREEN}Using release binary (skipping build)${NC}\n"
+    else    echo -e "${YELLOW}No pre-compiled binary found. Will build from source.${NC}\n"
+            
+            local precompiled_bin=$(find_precompiled_binary)
+        
+        if [[ -n "$precompiled_bin" ]]; then
+            echo -e "${GREEN}Found: $precompiled_bin${NC}"
+            
+            # Verify architecture
+            if ! file "$precompiled_bin" | grep -q "x86-64"; then
+                echo -e "${RED}Error: Binary is not x86_64 architecture${NC}"
+                exit 1
+            fi
+            
+            # Copy to target/release
+            mkdir -p target/release
+            cp "$precompiled_bin" target/release/hifi-wifi
+            chmod +x target/release/hifi-wifi
+            echo -e "${GREEN}Using pre-compiled binary (skipping build)${NC}\n"
+        else
         echo -e "${YELLOW}No pre-compiled binary found. Will build from source.${NC}\n"
         
         # Pre-release warning for source builds
@@ -401,38 +420,39 @@ main() {
             echo -e "Build environment persists across SteamOS updates.\n"
         fi
         
-        read -p "I understand this is pre-release software for testing only. Continue? [y/N] " -n 1 -r
-        echo
-        [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
-        
-        # Step 2: Setup build environment (SteamOS uses Homebrew, others use system packages)
-        if [[ "$distro_id" == "steamos" ]]; then
-            echo -e "${BLUE}[2/5] Setting up Homebrew build environment...${NC}"
-            setup_steamos_build_env
-        elif [[ "$distro_id" == *"arch"* ]]; then
-            if ! command -v cc &>/dev/null; then
-                echo -e "${BLUE}[2/5] Setting up build environment...${NC}"
-                # Arch but not SteamOS - use pacman directly
-                sudo pacman -Sy --noconfirm --needed base-devel
+            read -p "I understand this is pre-release software for testing only. Continue? [y/N] " -n 1 -r
+            echo
+            [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
+            
+            # Step 2: Setup build environment (SteamOS uses Homebrew, others use system packages)
+            if [[ "$distro_id" == "steamos" ]]; then
+                echo -e "${BLUE}[2/5] Setting up Homebrew build environment...${NC}"
+                setup_steamos_build_env
+            elif [[ "$distro_id" == *"arch"* ]]; then
+                if ! command -v cc &>/dev/null; then
+                    echo -e "${BLUE}[2/5] Setting up build environment...${NC}"
+                    # Arch but not SteamOS - use pacman directly
+                    sudo pacman -Sy --noconfirm --needed base-devel
+                else
+                    echo -e "${BLUE}[2/5] Build tools already installed${NC}\n"
+                fi
             else
-                echo -e "${BLUE}[2/5] Build tools already installed${NC}\n"
+                echo -e "${BLUE}[2/5] Build environment check...${NC}"
+                if ! command -v cc &>/dev/null && [[ "$distro_id" == "bazzite" ]]; then
+                    echo -e "${YELLOW}gcc not found. On Bazzite, run: ${BLUE}ujust install-rust${NC}\n"
+                else
+                    echo -e "${GREEN}Build tools available${NC}\n"
+                fi
             fi
-        else
-            echo -e "${BLUE}[2/5] Build environment check...${NC}"
-            if ! command -v cc &>/dev/null && [[ "$distro_id" == "bazzite" ]]; then
-                echo -e "${YELLOW}gcc not found. On Bazzite, run: ${BLUE}ujust install-rust${NC}\n"
-            else
-                echo -e "${GREEN}Build tools available${NC}\n"
-            fi
+            
+            # Step 3: Setup Rust
+            echo -e "${BLUE}[3/5] Setting up Rust toolchain...${NC}"
+            setup_rust
+            
+            # Step 4: Build
+            echo -e "${BLUE}[4/5] Building from source...${NC}"
+            build_from_source
         fi
-        
-        # Step 3: Setup Rust
-        echo -e "${BLUE}[3/5] Setting up Rust toolchain...${NC}"
-        setup_rust
-        
-        # Step 4: Build
-        echo -e "${BLUE}[4/5] Building from source...${NC}"
-        build_from_source
     fi
     
     # Step 5: Install
