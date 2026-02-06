@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
 }
 
 fn run_apply(config: &config::structs::Config) -> Result<()> {
-    info!("=== hifi-wifi v3.0 ===");
+    info!("=== hifi-wifi ===");
     info!("Applying Wi-Fi optimizations...\n");
 
     // 1. Detect Wi-Fi interfaces
@@ -355,7 +355,7 @@ fn is_steamos() -> bool {
 
 /// Run the Governor in monitor mode (daemon)
 async fn run_monitor(config: &config::structs::Config) -> Result<()> {
-    info!("=== hifi-wifi v3.0 Monitor Mode ===");
+    info!("=== hifi-wifi Monitor Mode ===");
 
     info!("Starting continuous optimization daemon...\n");
 
@@ -432,7 +432,7 @@ async fn run_status_async() -> Result<()> {
 
     println!();
     println!("{}{}{}", BOLD, CYAN, "══════════════════════════════════════");
-    println!("       hifi-wifi v3.0 Status");
+    println!("       hifi-wifi Status");
     println!("{}{}{}", BOLD, CYAN, "══════════════════════════════════════");
     println!();
 
