@@ -1,20 +1,19 @@
 # hifi-wifi
 
-**Stop WiFi lag on your Steam Deck and Linux gaming devices.**
+**Lightweight, system-wide network optimizer for Linux gaming devices.**
 
-hifi-wifi automatically optimizes your network for gaming - no configuration needed. It eliminates bufferbloat, reduces latency spikes, and keeps your connection smooth during game streaming and online play.
+hifi-wifi automatically optimizes your network for low latency, eliminating bufferbloat and reducing packet loss during online gaming and high-bitrate game streaming (Moonlight/Sunshine). It runs as a native background service requiring zero configuration.
 
 ---
 
-## What It Does
+## Key Features
 
-- **Eliminates stuttering** during online gaming and game streaming
-- **Suppresses latency spikes** caused by background WiFi scanning (170ms → 4ms)
-- **Picks the fastest WiFi** automatically (prefers 5GHz/6GHz over 2.4GHz)
-- **Reduces lag** with intelligent traffic shaping (CAKE qdisc)
-- **Saves battery** on Steam Deck while maintaining performance
-- **Survives updates** on SteamOS - install once, keep forever
-- **Self-healing** - automatically recovers after sleep, roaming, or system updates
+* **Low-Overhead Daemon**: Written in native Rust, running as a systemd service with a minimal CPU and memory footprint (<5MB RAM).
+* **Real-time Performance Governor**: Dynamically manages traffic shaping queues, schedules CPU coalescing, and pins network IRQs during high-throughput gaming sessions.
+* **BBR Congestion Control**: Enforces TCP BBR congestion control globally to maintain high throughput and reduce packet retransmission on wireless links.
+* **Direct PCIe & Link Power Override**: Manages PCIe ASPM states and runtime power management directly via sysfs to ensure hardware responsiveness under load.
+* **Intelligent Band Steering**: Scores and steers connections to the optimal frequency band (prefers 5GHz/6GHz based on SNR) without losing roaming capabilities.
+* **Unified Network Identity**: Persistent options to override system hostname and MAC address randomization directly from a single configuration file.
 
 ---
 
