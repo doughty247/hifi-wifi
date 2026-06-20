@@ -36,6 +36,11 @@ impl SystemOptimizer {
         if self.driver_tweaks_enabled {
             for ifc in interfaces {
                 self.apply_driver_config(&ifc.category)?;
+                if ifc.interface_type == InterfaceType::Wifi {
+                    if let Err(e) = self.apply_pcie_aspm_sysfs(&ifc.name, true) {
+                        warn!("Failed to disable PCIe ASPM sysfs for {}: {}", ifc.name, e);
+                    }
+                }
             }
         }
 
@@ -67,6 +72,9 @@ impl SystemOptimizer {
             ("net.ipv4.tcp_wmem", "4096 65536 4194304"),
             ("net.ipv4.tcp_fastopen", "3"),
             ("net.core.netdev_max_backlog", "2000"),
+            ("net.core.netdev_budget", "600"),
+            ("net.core.netdev_budget_usecs", "8000"),
+            ("net.ipv4.tcp_slow_start_after_idle", "0"),
             ("net.ipv4.tcp_ecn", "1"),
             ("net.ipv4.tcp_keepalive_time", "60"),
             ("net.ipv4.tcp_keepalive_intvl", "10"),
@@ -340,6 +348,47 @@ options mwifiex disable_auto_ds=1
         Ok(())
     }
 
+    /// Enable (disable ASPM / enforce power on) or disable (restore ASPM / auto power) PCIe ASPM for the interface
+    fn apply_pcie_aspm_sysfs(&self, iface_name: &str, enable: bool) -> Result<()> {
+        let device_path = format!("/sys/class/net/{}/device", iface_name);
+        let device_path = match fs::canonicalize(&device_path) {
+            Ok(p) => p,
+            Err(_) => {
+                debug!("Interface {} does not have a physical sysfs device path", iface_name);
+                return Ok(());
+            }
+        };
+
+        let link_dir = device_path.join("link");
+        if link_dir.is_dir() {
+            let val = if enable { "0" } else { "1" };
+            let aspm_files = [
+                "l0s_aspm", "l1_aspm", "l1_1_aspm", "l1_2_aspm",
+                "l1_1_pcipm", "l1_2_pcipm"
+            ];
+            for filename in &aspm_files {
+                let filepath = link_dir.join(filename);
+                if filepath.exists() {
+                    match fs::write(&filepath, val) {
+                        Ok(_) => debug!("Set ASPM state in {} to {}", filepath.display(), val),
+                        Err(e) => debug!("Failed to write to {} (unsupported or permission denied): {}", filepath.display(), e),
+                    }
+                }
+            }
+        }
+
+        let power_control = device_path.join("power").join("control");
+        if power_control.exists() {
+            let val = if enable { "on" } else { "auto" };
+            match fs::write(&power_control, val) {
+                Ok(_) => info!("Set runtime PCI power control to '{}' for {}", val, iface_name),
+                Err(e) => warn!("Failed to write to {} (runtime power control): {}", power_control.display(), e),
+            }
+        }
+
+        Ok(())
+    }
+
     /// Revert all system optimizations
     pub fn revert(&self) -> Result<()> {
         info!("Reverting system optimizations...");
@@ -357,6 +406,20 @@ options mwifiex disable_auto_ds=1
         for file in modprobe_files {
             let path = Path::new("/etc/modprobe.d").join(file);
             let _ = fs::remove_file(path);
+        }
+
+        // Revert PCIe ASPM for any WiFi interface we find in /sys/class/net
+        if let Ok(entries) = fs::read_dir("/sys/class/net") {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let iface_name = entry.file_name().to_string_lossy().into_owned();
+                let device_path = format!("/sys/class/net/{}/device", iface_name);
+                if Path::new(&device_path).exists() {
+                    let phy_path = format!("/sys/class/net/{}/phy80211", iface_name);
+                    if Path::new(&phy_path).exists() || iface_name.starts_with('w') {
+                        let _ = self.apply_pcie_aspm_sysfs(&iface_name, false);
+                    }
+                }
+            }
         }
 
         info!("System optimizations reverted");
