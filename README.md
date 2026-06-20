@@ -53,9 +53,9 @@ hifi-wifi runs automatically in the background. You don't need to do anything.
 | `sudo hifi-wifi power-save off` | Maximum WiFi performance (persists across sleep/reboot) |
 | `sudo hifi-wifi power-save adaptive` | Automatic power save based on AC/battery (default) |
 | `hifi-wifi power-save status` | Show current power save mode and actual state |
-| `sudo hifi-wifi scan-suppress on` | Suppress background scans for lowest latency (default) |
-| `sudo hifi-wifi scan-suppress off` | Allow background scans (enables roaming) |
-| `hifi-wifi scan-suppress status` | Show current scan suppression state |
+| `sudo hifi-wifi scan on` | Allow background scans (enables roaming) (default) |
+| `sudo hifi-wifi scan off` | Suppress background scans for lowest latency |
+| `hifi-wifi scan status` | Show current background scanning state |
 | `sudo hifi-wifi on/off` | Start/stop the service |
 | `sudo hifi-wifi uninstall` | Remove completely |
 
@@ -96,20 +96,20 @@ This persists across sleep, reboot, and SteamOS updates. To revert to automatic 
 sudo hifi-wifi power-save adaptive
 ```
 
-### Scan Suppression
+### Background Scanning & Roaming
 
-WiFi drivers perform background channel scans every ~15 seconds, causing **170ms latency spikes** that affect gaming and streaming. hifi-wifi suppresses these scans by default, reducing latency to **~3.5ms average / 4ms max**.
+WiFi drivers perform background channel scans every ~15 seconds, causing **170ms latency spikes** that affect gaming and streaming. By default, hifi-wifi now leaves background scanning ON to ensure smooth WiFi roaming between access points.
 
-The tradeoff: with scan suppression on, WiFi roaming between access points is disabled. For most users (single AP, fixed location), this is the right default. If you have multiple access points and need roaming:
+If you do not need roaming (e.g. single access point, stationary gaming/streaming), you can disable background scanning (suppress scans) to reduce latency to **~3.5ms average / 4ms max**:
 
 ```bash
-sudo hifi-wifi scan-suppress off
+sudo hifi-wifi scan off
 ```
 
-To re-enable (recommended for gaming):
+To re-enable background scanning (and restore roaming):
 
 ```bash
-sudo hifi-wifi scan-suppress on
+sudo hifi-wifi scan on
 ```
 
 **Config File:** `/etc/hifi-wifi/config.toml` (created on first run)

@@ -129,12 +129,12 @@ setup_homebrew_build_deps() {
     local HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"
     eval "$($HOMEBREW_PREFIX/bin/brew shellenv)"
     
-    # Install gcc (includes everything needed for Rust compilation)
+    # Install gcc (includes everything needed for Rust compilation) and iproute2 (for tc)
     # Note: brew install may return non-zero for post-install warnings
     if [[ $EUID -eq 0 ]] && [[ -n "$SUDO_USER" ]]; then
-        sudo -u "$SUDO_USER" "$HOMEBREW_PREFIX/bin/brew" install gcc || true
+        sudo -u "$SUDO_USER" "$HOMEBREW_PREFIX/bin/brew" install gcc iproute2 || true
     else
-        brew install gcc || true
+        brew install gcc iproute2 || true
     fi
     
     # Verify GCC actually works by finding the versioned binary
@@ -267,6 +267,12 @@ install_service() {
     if command -v chcon &>/dev/null && [[ -f /var/lib/hifi-wifi/hifi-wifi ]]; then
         echo -e "${BLUE}Setting SELinux context...${NC}"
         $run_as_root chcon -t bin_t /var/lib/hifi-wifi/hifi-wifi 2>/dev/null || true
+    fi
+
+    # Link Homebrew-installed tc to /usr/local/sbin/tc if not present in system PATH
+    if ! command -v tc &>/dev/null && [[ -x "/home/linuxbrew/.linuxbrew/sbin/tc" ]]; then
+        echo -e "${BLUE}Linking Homebrew tc to system path...${NC}"
+        $run_as_root ln -sf /home/linuxbrew/.linuxbrew/sbin/tc /usr/local/sbin/tc
     fi
     
     echo -e "${GREEN}Service installed${NC}\n"

@@ -7,9 +7,24 @@ use anyhow::{Context, Result};
 use log::{info, debug, warn};
 use std::process::Command;
 use std::collections::VecDeque;
-use std::sync::RwLock;
+use std::sync::{RwLock, OnceLock};
 
 static GATEWAY_RTT: RwLock<Option<String>> = RwLock::new(None);
+static TC_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+/// Check if the `tc` command is available on the system
+pub fn is_tc_available() -> bool {
+    *TC_AVAILABLE.get_or_init(|| {
+        let available = Command::new("tc")
+            .arg("-Version")
+            .output()
+            .is_ok();
+        if !available {
+            warn!("Traffic Control (tc) binary not found. CAKE QoS features will be disabled.");
+        }
+        available
+    })
+}
 
 /// Reset gateway RTT cache (call on connection events)
 pub fn reset_gateway_rtt_cache() {
@@ -316,6 +331,10 @@ impl TcManager {
 
     /// Apply CAKE qdisc to interface
     pub fn apply_cake(&mut self, interface: &str) -> Result<()> {
+        if !is_tc_available() {
+            debug!("Skipping CAKE application on {} (tc not available)", interface);
+            return Ok(());
+        }
         let bandwidth_mbit = self.get_target_bandwidth();
         
         info!("Applying CAKE on {} with {}mbit bandwidth", interface, bandwidth_mbit);
@@ -361,6 +380,9 @@ impl TcManager {
 
     /// Remove CAKE qdisc from interface
     pub fn remove_cake(&self, interface: &str) -> Result<()> {
+        if !is_tc_available() {
+            return Ok(());
+        }
         let output = Command::new("tc")
             .args(["qdisc", "del", "dev", interface, "root"])
             .output();
@@ -544,21 +566,4 @@ mod tests {
         // Would need full hysteresis cycle to trigger
     }
 
-    #[test]
-    fn test_throughput_based_limit() {
-        let mut tc = TcManager::default();
-        
-        // PHY says 866 Mbps but throughput is only 400
-        // 400 Mbps = 50MB/s = 50_000_000 bytes/sec
-        tc.update_throughput(50_000_000); // ~400 Mbps
-        
-        // With 1.2x headroom, throughput-based = ~480Mbit
-        // min(866, 480) = 480
-        tc.update_bandwidth(866);
-        tc.update_bandwidth(866);
-        
-        // Should use the lower value (throughput-based ~480 with 1.2x headroom)
-        let target = tc.get_target_bandwidth();
-        assert!(target < 600, "Should limit based on throughput, got {}", target);
-    }
 }

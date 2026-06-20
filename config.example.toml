@@ -57,3 +57,8 @@ cpu_avg_window_size = 5
 band_steering_enabled = true
 band_steering_hysteresis_ticks = 3
 band_steering_min_improvement = 10
+
+# Suppress background scanning to eliminate latency spikes (at the expense of roaming)
+#   false (default) - Roaming enabled, allows background scans
+#   true - Lowest latency, disables roaming (recommended for stationary/online gaming)
+scan_suppress = false

@@ -55,10 +55,10 @@ enum Commands {
         /// Mode: off (best performance), on (battery saving), adaptive (automatic), status (show current)
         mode: String,
     },
-    /// Control background scan suppression (on/off/status)
-    #[command(name = "scan-suppress")]
-    ScanSuppress {
-        /// Mode: on (suppress scans for lowest latency), off (allow scans for roaming), status (show current)
+    /// Control background scanning / roaming (on/off/status)
+    #[command(name = "scan")]
+    Scan {
+        /// Mode: on (allow scans for roaming), off (suppress scans for lowest latency), status (show current)
         mode: String,
     },
 }
@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
     // Suppress INFO logs for status-like commands (clean output)
     let is_status_cmd = matches!(cli.command, Some(Commands::Status))
         || matches!(cli.command, Some(Commands::PowerSave { ref mode }) if mode == "status")
-        || matches!(cli.command, Some(Commands::ScanSuppress { ref mode }) if mode == "status");
+        || matches!(cli.command, Some(Commands::Scan { ref mode }) if mode == "status");
     if is_status_cmd {
         log::set_max_level(log::LevelFilter::Warn);
     }
@@ -120,10 +120,10 @@ async fn main() -> Result<()> {
         Commands::PowerSave { mode } => {
             run_power_save(&mode, &config)?;
         }
-        Commands::ScanSuppress { mode } => {
-            run_scan_suppress(&mode, &config)?;
+        Commands::Scan { mode } => {
+            run_scan(&mode, &config)?;
         }
-    }
+}
 
     Ok(())
 }
@@ -620,12 +620,12 @@ async fn run_status_async() -> Result<()> {
     println!("{}│{}    ├─ QoS Mode:   {}", BLUE, NC, if config.governor.breathing_cake_enabled { "Breathing CAKE (Dynamic)" } else { "Static CAKE" });
     println!("{}│{}    ├─ Game Mode:  {}", BLUE, NC, if config.governor.game_mode_enabled { "Available (PPS > 200)" } else { "Disabled" });
     println!("{}│{}    ├─ Band Steer: {}", BLUE, NC, if config.governor.band_steering_enabled { "Available" } else { "Disabled" });
-    let scan_suppress_desc = if config.governor.scan_suppress {
-        format!("{}[ON]{} (Lowest Latency)", GREEN, NC)
+    let scan_desc = if !config.governor.scan_suppress {
+        format!("{}[ON]{} (Roaming Enabled)", GREEN, NC)
     } else {
-        format!("{}[OFF]{} (Roaming Enabled)", YELLOW, NC)
+        format!("{}[OFF]{} (Lowest Latency)", YELLOW, NC)
     };
-    println!("{}│{}    └─ Scan Suppress: {}", BLUE, NC, scan_suppress_desc);
+    println!("{}│{}    └─ Background Scan: {}", BLUE, NC, scan_desc);
 
     println!("{}└{}", BLUE, NC);
     
@@ -1478,39 +1478,28 @@ fn remove_nm_powersave_config() {
     }
 }
 
-/// Write the hifi-wifi config file with the specified power save mode
-fn write_hifi_config(mode: &str) -> Result<()> {
-    use std::fs::{self, File};
-    use std::io::Write;
+fn generate_new_config_content(existing: &str, section: &str, key: &str, value: &str) -> String {
+    let section_header = format!("[{}]", section);
 
-    let config_dir = std::path::Path::new("/etc/hifi-wifi");
-    fs::create_dir_all(config_dir)?;
-
-    // Read existing config or start fresh
-    let existing = fs::read_to_string(HIFI_CONFIG_PATH).unwrap_or_default();
-
-    // Update or insert the power save setting
-    let new_content = if existing.contains("[power]") {
-        // Replace existing wlan_power_save line
+    if existing.contains(&section_header) {
         let mut result = String::new();
-        let mut in_power_section = false;
+        let mut in_section = false;
         let mut replaced = false;
         for line in existing.lines() {
-            if line.trim() == "[power]" {
-                in_power_section = true;
+            if line.trim() == section_header {
+                in_section = true;
                 result.push_str(line);
                 result.push('\n');
             } else if line.trim().starts_with('[') {
-                if in_power_section && !replaced {
-                    // [power] section existed but had no wlan_power_save — insert before next section
-                    result.push_str(&format!("wlan_power_save = \"{}\"\n", mode));
+                if in_section && !replaced {
+                    result.push_str(&format!("{} = {}\n", key, value));
                     replaced = true;
                 }
-                in_power_section = false;
+                in_section = false;
                 result.push_str(line);
                 result.push('\n');
-            } else if in_power_section && line.trim().starts_with("wlan_power_save") {
-                result.push_str(&format!("wlan_power_save = \"{}\"", mode));
+            } else if in_section && line.trim().starts_with(key) {
+                result.push_str(&format!("{} = {}", key, value));
                 result.push('\n');
                 replaced = true;
             } else {
@@ -1518,26 +1507,45 @@ fn write_hifi_config(mode: &str) -> Result<()> {
                 result.push('\n');
             }
         }
-        if in_power_section && !replaced {
-            result.push_str(&format!("wlan_power_save = \"{}\"", mode));
+        if in_section && !replaced {
+            result.push_str(&format!("{} = {}", key, value));
             result.push('\n');
         }
         result
     } else {
-        // No [power] section exists — append it
-        let mut result = existing;
+        let mut result = existing.to_string();
         if !result.is_empty() && !result.ends_with('\n') {
             result.push('\n');
         }
-        result.push_str(&format!("\n[power]\nenabled = true\nwlan_power_save = \"{}\"\n", mode));
+        if section == "power" {
+            result.push_str(&format!("\n[{}]\nenabled = true\n{} = {}\n", section, key, value));
+        } else {
+            result.push_str(&format!("\n[{}]\n{} = {}\n", section, key, value));
+        }
         result
-    };
+    }
+}
+
+fn write_config_value(section: &str, key: &str, value: &str) -> Result<()> {
+    use std::fs::{self, File};
+    use std::io::Write;
+
+    let config_dir = std::path::Path::new("/etc/hifi-wifi");
+    fs::create_dir_all(config_dir)?;
+
+    let existing = fs::read_to_string(HIFI_CONFIG_PATH).unwrap_or_default();
+    let new_content = generate_new_config_content(&existing, section, key, value);
 
     let mut file = File::create(HIFI_CONFIG_PATH)?;
     file.write_all(new_content.as_bytes())?;
-    info!("Updated config: {} (wlan_power_save = \"{}\")", HIFI_CONFIG_PATH, mode);
+    info!("Updated config: {} ({} = {})", HIFI_CONFIG_PATH, key, value);
 
     Ok(())
+}
+
+/// Write the hifi-wifi config file with the specified power save mode
+fn write_hifi_config(mode: &str) -> Result<()> {
+    write_config_value("power", "wlan_power_save", &format!("\"{}\"", mode))
 }
 
 /// Control WiFi power save mode
@@ -1675,8 +1683,8 @@ fn run_power_save(mode: &str, config: &config::structs::Config) -> Result<()> {
 // Scan Suppression Control
 // ============================================================================
 
-/// Control background scan suppression
-fn run_scan_suppress(mode: &str, config: &config::structs::Config) -> Result<()> {
+/// Control background scanning / roaming
+fn run_scan(mode: &str, config: &config::structs::Config) -> Result<()> {
     use std::process::Command;
 
     // ANSI Colors
@@ -1689,14 +1697,14 @@ fn run_scan_suppress(mode: &str, config: &config::structs::Config) -> Result<()>
     match mode {
         "status" => {
             println!();
-            println!("{}{}Scan Suppression Status{}", BOLD, BLUE, NC);
-            println!("{}──────────────────────────{}", BLUE, NC);
+            println!("{}{}Background Scanning Status{}", BOLD, BLUE, NC);
+            println!("{}────────────────────────────{}", BLUE, NC);
 
-            let configured = config.governor.scan_suppress;
-            let mode_display = if configured {
-                format!("{}ON{} (Background scans suppressed — lowest latency)", GREEN, NC)
+            let scan_suppress = config.governor.scan_suppress;
+            let mode_display = if !scan_suppress {
+                format!("{}ON{} (Background scans allowed — roaming enabled)", GREEN, NC)
             } else {
-                format!("{}OFF{} (Background scans allowed — roaming enabled)", YELLOW, NC)
+                format!("{}OFF{} (Background scans suppressed — lowest latency)", YELLOW, NC)
             };
             println!("  Config: {}", mode_display);
 
@@ -1708,9 +1716,9 @@ fn run_scan_suppress(mode: &str, config: &config::structs::Config) -> Result<()>
                 .unwrap_or(false);
 
             if service_active {
-                println!("  Service: {}Running{} (scan suppress {})",
+                println!("  Service: {}Running{} (scanning {})",
                     GREEN, NC,
-                    if configured { "active" } else { "inactive" });
+                    if !scan_suppress { "active" } else { "inactive" });
             } else {
                 println!("  Service: {}Not running{}", YELLOW, NC);
             }
@@ -1739,16 +1747,16 @@ fn run_scan_suppress(mode: &str, config: &config::structs::Config) -> Result<()>
             println!();
         }
         "on" | "off" => {
-            let enable = mode == "on";
-            let desc = if enable {
-                "ON (suppress background scans — lowest latency, disables roaming)"
+            let scan_on = mode == "on";
+            let desc = if scan_on {
+                "ON (allow background scans — roaming enabled)"
             } else {
-                "OFF (allow background scans — roaming enabled)"
+                "OFF (suppress background scans — lowest latency, disables roaming)"
             };
-            info!("Setting scan suppression to: {}", desc);
+            info!("Setting background scanning to: {}", desc);
 
-            // Update config file
-            write_scan_suppress_config(enable)?;
+            // Update config file (scan_on = true means scan_suppress = false)
+            write_scan_suppress_config(!scan_on)?;
 
             // Restart service if running so Governor picks up the new config
             let service_running = Command::new("systemctl")
@@ -1762,7 +1770,7 @@ fn run_scan_suppress(mode: &str, config: &config::structs::Config) -> Result<()>
                 let _ = Command::new("systemctl").args(["restart", "hifi-wifi.service"]).output();
             }
 
-            info!("Scan suppression set to '{}' successfully", mode);
+            info!("Background scanning set to '{}' successfully", mode);
         }
         _ => {
             error!("Invalid mode: '{}'. Use: on, off, or status", mode);
@@ -1774,59 +1782,46 @@ fn run_scan_suppress(mode: &str, config: &config::structs::Config) -> Result<()>
 }
 
 /// Write the scan_suppress setting to the hifi-wifi config file
-fn write_scan_suppress_config(enable: bool) -> Result<()> {
-    use std::fs::{self, File};
-    use std::io::Write;
+fn write_scan_suppress_config(suppress: bool) -> Result<()> {
+    write_config_value("governor", "scan_suppress", &suppress.to_string())
+}
 
-    let config_dir = std::path::Path::new("/etc/hifi-wifi");
-    fs::create_dir_all(config_dir)?;
+#[cfg(test)]
+mod main_tests {
+    use super::generate_new_config_content;
 
-    let existing = fs::read_to_string(HIFI_CONFIG_PATH).unwrap_or_default();
-    let value_str = if enable { "true" } else { "false" };
+    #[test]
+    fn test_generate_new_config_empty() {
+        let existing = "";
+        let expected = "\n[governor]\nscan_suppress = true\n";
+        assert_eq!(generate_new_config_content(existing, "governor", "scan_suppress", "true"), expected);
+    }
 
-    let new_content = if existing.contains("[governor]") {
-        let mut result = String::new();
-        let mut in_governor_section = false;
-        let mut replaced = false;
-        for line in existing.lines() {
-            if line.trim() == "[governor]" {
-                in_governor_section = true;
-                result.push_str(line);
-                result.push('\n');
-            } else if line.trim().starts_with('[') {
-                if in_governor_section && !replaced {
-                    result.push_str(&format!("scan_suppress = {}\n", value_str));
-                    replaced = true;
-                }
-                in_governor_section = false;
-                result.push_str(line);
-                result.push('\n');
-            } else if in_governor_section && line.trim().starts_with("scan_suppress") {
-                result.push_str(&format!("scan_suppress = {}", value_str));
-                result.push('\n');
-                replaced = true;
-            } else {
-                result.push_str(line);
-                result.push('\n');
-            }
-        }
-        if in_governor_section && !replaced {
-            result.push_str(&format!("scan_suppress = {}", value_str));
-            result.push('\n');
-        }
-        result
-    } else {
-        let mut result = existing;
-        if !result.is_empty() && !result.ends_with('\n') {
-            result.push('\n');
-        }
-        result.push_str(&format!("\n[governor]\nscan_suppress = {}\n", value_str));
-        result
-    };
+    #[test]
+    fn test_generate_new_config_power_empty() {
+        let existing = "";
+        let expected = "\n[power]\nenabled = true\nwlan_power_save = \"off\"\n";
+        assert_eq!(generate_new_config_content(existing, "power", "wlan_power_save", "\"off\""), expected);
+    }
 
-    let mut file = File::create(HIFI_CONFIG_PATH)?;
-    file.write_all(new_content.as_bytes())?;
-    info!("Updated config: {} (scan_suppress = {})", HIFI_CONFIG_PATH, value_str);
+    #[test]
+    fn test_generate_new_config_section_exists_no_key() {
+        let existing = "[governor]\nbreathing_cake_enabled = true\n";
+        let expected = "[governor]\nbreathing_cake_enabled = true\nscan_suppress = true\n";
+        assert_eq!(generate_new_config_content(existing, "governor", "scan_suppress", "true"), expected);
+    }
 
-    Ok(())
+    #[test]
+    fn test_generate_new_config_key_exists() {
+        let existing = "[governor]\nscan_suppress = false\n";
+        let expected = "[governor]\nscan_suppress = true\n";
+        assert_eq!(generate_new_config_content(existing, "governor", "scan_suppress", "true"), expected);
+    }
+
+    #[test]
+    fn test_generate_new_config_multiple_sections() {
+        let existing = "[power]\nenabled = true\nwlan_power_save = \"off\"\n\n[governor]\nscan_suppress = false\n";
+        let expected = "[power]\nenabled = true\nwlan_power_save = \"off\"\n\n[governor]\nscan_suppress = true\n";
+        assert_eq!(generate_new_config_content(existing, "governor", "scan_suppress", "true"), expected);
+    }
 }

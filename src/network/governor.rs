@@ -816,6 +816,9 @@ impl Governor {
 
     /// Check if CAKE qdisc is active on an interface
     fn has_cake(interface: &str) -> bool {
+        if !crate::network::tc::is_tc_available() {
+            return true; // Pretend it has cake so we don't try to apply it
+        }
         let output = Command::new("tc")
             .args(["qdisc", "show", "dev", interface])
             .output();

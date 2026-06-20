@@ -83,6 +83,7 @@ pub struct PowerConfig {
 }
 
 fn default_true() -> bool { true }
+fn default_false() -> bool { false }
 fn default_adaptive() -> String { "adaptive".to_string() }
 
 impl Default for PowerConfig {
@@ -166,10 +167,10 @@ pub struct GovernorConfig {
     pub cpu_avg_window_size: usize,
 
     /// Suppress iwd background scans to eliminate latency spikes
-    /// When true (default), the Governor aborts background scans every 500ms
+    /// When true, the Governor aborts background scans every 500ms
     /// while connected, reducing latency from ~20ms avg/170ms max to ~3.5ms avg/4ms max.
     /// Disables roaming and band steering while active (scans resume if disconnected).
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub scan_suppress: bool,
 }
 
@@ -197,7 +198,7 @@ impl Default for GovernorConfig {
             
             cpu_avg_window_size: 3,
 
-            scan_suppress: true,
+            scan_suppress: false,
         }
     }
 }
