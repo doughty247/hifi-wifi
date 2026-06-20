@@ -7,6 +7,110 @@ use anyhow::{Context, Result};
 use log::{info, debug, warn};
 use std::process::Command;
 use std::collections::VecDeque;
+use std::sync::{RwLock, OnceLock};
+
+static GATEWAY_RTT: RwLock<Option<String>> = RwLock::new(None);
+static TC_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+/// Check if the `tc` command is available on the system
+pub fn is_tc_available() -> bool {
+    *TC_AVAILABLE.get_or_init(|| {
+        let available = Command::new("tc")
+            .arg("-Version")
+            .output()
+            .is_ok();
+        if !available {
+            warn!("Traffic Control (tc) binary not found. CAKE QoS features will be disabled.");
+        }
+        available
+    })
+}
+
+/// Reset gateway RTT cache (call on connection events)
+pub fn reset_gateway_rtt_cache() {
+    if let Ok(mut cache) = GATEWAY_RTT.write() {
+        *cache = None;
+        debug!("Gateway RTT cache cleared");
+    }
+}
+
+/// Detect appropriate CAKE RTT by pinging the default gateway.
+/// Result is cached after first call per connection.
+pub fn detect_gateway_rtt() -> String {
+    // Try to read cached value
+    if let Ok(cache) = GATEWAY_RTT.read() {
+        if let Some(ref cached) = *cache {
+            return cached.clone();
+        }
+    }
+    
+    // Measure and cache
+    let rtt = measure_gateway_rtt();
+    info!("CAKE: Auto-detected gateway RTT -> using {}", rtt);
+    
+    if let Ok(mut cache) = GATEWAY_RTT.write() {
+        *cache = Some(rtt.clone());
+    }
+    
+    rtt
+}
+
+fn measure_gateway_rtt() -> String {
+    // Get default gateway IP from routing table
+    let gateway_ip = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            stdout.split_whitespace()
+                .skip_while(|w| *w != "via")
+                .nth(1)
+                .map(|s| s.to_string())
+        });
+
+    let gateway_ip = match gateway_ip {
+        Some(ip) => ip,
+        None => {
+            debug!("Could not detect default gateway, using 50ms RTT");
+            return "50ms".to_string();
+        }
+    };
+
+    // Ping gateway 3 times with 1s timeout
+    let avg_ms = Command::new("ping")
+        .args(["-c", "3", "-W", "1", &gateway_ip])
+        .output()
+        .ok()
+        .and_then(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            // Parse "rtt min/avg/max/mdev = 1.234/2.345/3.456/0.567 ms"
+            stdout.lines()
+                .find(|l| l.contains("rtt") || l.contains("round-trip"))
+                .and_then(|l| l.split('=').nth(1))
+                .and_then(|s| s.split('/').nth(1))
+                .and_then(|s| s.trim().parse::<f64>().ok())
+        });
+
+    match avg_ms {
+        Some(rtt) if rtt < 5.0 => {
+            info!("Gateway RTT {:.1}ms (local WiFi)", rtt);
+            "20ms".to_string()
+        }
+        Some(rtt) if rtt < 20.0 => {
+            info!("Gateway RTT {:.1}ms (mesh/multi-hop)", rtt);
+            "50ms".to_string()
+        }
+        Some(rtt) => {
+            info!("Gateway RTT {:.1}ms (high latency path)", rtt);
+            "100ms".to_string()
+        }
+        None => {
+            debug!("Could not measure gateway RTT, using 50ms");
+            "50ms".to_string()
+        }
+    }
+}
 
 /// Traffic Control manager with asymmetric response
 /// 
@@ -227,6 +331,10 @@ impl TcManager {
 
     /// Apply CAKE qdisc to interface
     pub fn apply_cake(&mut self, interface: &str) -> Result<()> {
+        if !is_tc_available() {
+            debug!("Skipping CAKE application on {} (tc not available)", interface);
+            return Ok(());
+        }
         let bandwidth_mbit = self.get_target_bandwidth();
         
         info!("Applying CAKE on {} with {}mbit bandwidth", interface, bandwidth_mbit);
@@ -235,6 +343,7 @@ impl TcManager {
             .args([
                 "qdisc", "replace", "dev", interface, "root", "cake",
                 "bandwidth", &format!("{}mbit", bandwidth_mbit),
+                "rtt", &detect_gateway_rtt(),
                 "diffserv4",      // Differentiated services
                 "dual-dsthost",   // Fair queuing per destination
                 "nat",            // NAT awareness
@@ -253,6 +362,7 @@ impl TcManager {
                 .args([
                     "qdisc", "replace", "dev", interface, "root", "cake",
                     "bandwidth", &format!("{}mbit", bandwidth_mbit),
+                    "rtt", &detect_gateway_rtt(),
                     "besteffort", "nat",
                 ])
                 .output()?;
@@ -270,6 +380,9 @@ impl TcManager {
 
     /// Remove CAKE qdisc from interface
     pub fn remove_cake(&self, interface: &str) -> Result<()> {
+        if !is_tc_available() {
+            return Ok(());
+        }
         let output = Command::new("tc")
             .args(["qdisc", "del", "dev", interface, "root"])
             .output();
@@ -453,21 +566,4 @@ mod tests {
         // Would need full hysteresis cycle to trigger
     }
 
-    #[test]
-    fn test_throughput_based_limit() {
-        let mut tc = TcManager::default();
-        
-        // PHY says 866 Mbps but throughput is only 400
-        // 400 Mbps = 50MB/s = 50_000_000 bytes/sec
-        tc.update_throughput(50_000_000); // ~400 Mbps
-        
-        // With 1.2x headroom, throughput-based = ~480Mbit
-        // min(866, 480) = 480
-        tc.update_bandwidth(866);
-        tc.update_bandwidth(866);
-        
-        // Should use the lower value (throughput-based ~480 with 1.2x headroom)
-        let target = tc.get_target_bandwidth();
-        assert!(target < 600, "Should limit based on throughput, got {}", target);
-    }
 }

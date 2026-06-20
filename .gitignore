@@ -18,3 +18,5 @@ docs/
 tests/
 bin/
 *.tar.gz
+/forks/
+release-build/

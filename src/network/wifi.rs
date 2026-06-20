@@ -8,6 +8,8 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use crate::network::tc::{detect_gateway_rtt, is_tc_available};
+
 /// Interface type (WiFi or Ethernet)
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterfaceType {
@@ -285,14 +287,20 @@ impl WifiManager {
 
     /// Apply CAKE qdisc for bufferbloat mitigation
     pub fn apply_cake(&self, ifc: &WifiInterface, bandwidth_mbps: u32) -> Result<()> {
+        if !is_tc_available() {
+            debug!("Skipping CAKE application on {} (tc not available)", ifc.name);
+            return Ok(());
+        }
         info!("Applying CAKE qdisc on {} with {}mbit bandwidth", ifc.name, bandwidth_mbps);
         
         let bandwidth = format!("{}mbit", bandwidth_mbps);
+        let rtt = detect_gateway_rtt();
         
         let output = Command::new("tc")
             .args([
                 "qdisc", "replace", "dev", &ifc.name, "root", "cake",
                 "bandwidth", &bandwidth,
+                "rtt", &rtt,
                 "diffserv4", "dual-dsthost", "nat", "wash", "ack-filter"
             ])
             .output()
@@ -310,6 +318,9 @@ impl WifiManager {
 
     /// Remove CAKE qdisc
     pub fn remove_cake(&self, ifc: &WifiInterface) -> Result<()> {
+        if !is_tc_available() {
+            return Ok(());
+        }
         let _ = Command::new("tc")
             .args(["qdisc", "del", "dev", &ifc.name, "root"])
             .output();
