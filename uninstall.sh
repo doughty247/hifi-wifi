@@ -35,15 +35,24 @@ if systemctl is-enabled --quiet hifi-wifi 2>/dev/null; then
     echo "Service disabled."
 fi
 
-# 2. Remove systemd service file
-echo -e "${BLUE}[2/5] Removing systemd service...${NC}"
+# 2. Remove systemd service file and NetworkManager configurations
+echo -e "${BLUE}[2/5] Removing systemd service and NetworkManager configs...${NC}"
 if [[ -f /etc/systemd/system/hifi-wifi.service ]]; then
     rm -f /etc/systemd/system/hifi-wifi.service
     systemctl daemon-reload
     echo "Service file removed."
-else
-    echo "Service file not found."
 fi
+
+# Clean up NetworkManager customizations
+for nm_file in /etc/NetworkManager/dispatcher.d/99-hifi-wifi-connect \
+              /etc/NetworkManager/conf.d/99-hifi-wifi-powersave.conf \
+              /etc/NetworkManager/conf.d/99-hifi-wifi-mac.conf; do
+    if [[ -f "$nm_file" ]]; then
+        rm -f "$nm_file"
+        echo "Removed NetworkManager config: $nm_file"
+    fi
+done
+systemctl restart NetworkManager 2>/dev/null || true
 
 # 3. Remove user repair service (SteamOS auto-repair)
 echo -e "${BLUE}[3/5] Removing user repair service...${NC}"

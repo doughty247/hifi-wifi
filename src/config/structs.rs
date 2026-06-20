@@ -57,6 +57,9 @@ pub struct WifiConfig {
     pub band_bias_5ghz: i32,
     /// Band bias for 6GHz (gets +25 - less interference, 160MHz channels, ideal for gaming)
     pub band_bias_6ghz: i32,
+    /// Custom MAC address or "permanent" to disable randomization
+    #[serde(default)]
+    pub wifi_mac_address: Option<String>,
 }
 
 impl Default for WifiConfig {
@@ -69,6 +72,7 @@ impl Default for WifiConfig {
             min_signal_6g_dbm: -70,  // 6GHz: even stricter (higher path loss)
             band_bias_5ghz: 15,  // Per rewrite.md
             band_bias_6ghz: 25,  // Higher than 5GHz - 6GHz has less interference, better for gaming
+            wifi_mac_address: None,
         }
     }
 }

@@ -22,6 +22,11 @@ min_signal_6g_dbm = -70
 # Band bias (higher = more preference)
 band_bias_5ghz = 15
 band_bias_6ghz = 25
+# Custom MAC address override (optional):
+#   "permanent" - Uses the permanent hardware MAC address (disables randomization)
+#   "stable" - Random but stable MAC per network profile
+#   "00:11:22:33:44:55" - Enforces a specific custom MAC address
+# wifi_mac_address = "permanent"
 
 [system]
 sysctl_enabled = true
