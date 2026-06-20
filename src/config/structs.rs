@@ -44,6 +44,7 @@ impl Default for GlobalConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct WifiConfig {
     #[allow(dead_code)]
     pub enabled: bool,
@@ -100,10 +101,14 @@ impl Default for PowerConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct SystemConfig {
     pub sysctl_enabled: bool,
     pub irq_affinity_enabled: bool,
     pub driver_tweaks_enabled: bool,
+    /// Custom system hostname to set at startup
+    #[serde(default)]
+    pub hostname: Option<String>,
 }
 
 impl Default for SystemConfig {
@@ -112,6 +117,7 @@ impl Default for SystemConfig {
             sysctl_enabled: true,
             irq_affinity_enabled: true,
             driver_tweaks_enabled: true,
+            hostname: None,
         }
     }
 }

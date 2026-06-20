@@ -184,6 +184,11 @@ fn run_apply(config: &config::structs::Config) -> Result<()> {
         warn!("Failed to write NM MAC configuration: {}", e);
     }
 
+    // 3d. Apply system hostname override if configured
+    if let Err(e) = apply_system_hostname(&config.system.hostname) {
+        warn!("Failed to apply system hostname override: {}", e);
+    }
+
     // 4. Apply power-aware settings
     for ifc in interfaces {
         // Skip disconnected interfaces
@@ -1521,6 +1526,46 @@ fn write_nm_mac_config(mac: &Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// Apply the custom system hostname using hostnamectl if it differs from current.
+fn apply_system_hostname(hostname_opt: &Option<String>) -> Result<()> {
+    if let Some(target_hostname) = hostname_opt {
+        let target_hostname = target_hostname.trim();
+        if target_hostname.is_empty() {
+            return Ok(());
+        }
+
+        let current = match std::fs::read_to_string("/proc/sys/kernel/hostname") {
+            Ok(h) => h.trim().to_string(),
+            Err(e) => {
+                warn!("Could not read current hostname: {}", e);
+                String::new()
+            }
+        };
+
+        if current != target_hostname {
+            info!("System hostname differs (current: '{}', target: '{}'). Setting hostname...", current, target_hostname);
+            match std::process::Command::new("hostnamectl")
+                .arg("set-hostname")
+                .arg(target_hostname)
+                .output()
+            {
+                Ok(output) => {
+                    if output.status.success() {
+                        info!("Successfully set system hostname to '{}'", target_hostname);
+                    } else {
+                        let err_msg = String::from_utf8_lossy(&output.stderr);
+                        warn!("hostnamectl failed to set hostname: {}", err_msg.trim());
+                    }
+                }
+                Err(e) => {
+                    warn!("Could not execute hostnamectl: {}", e);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Remove the persistent NetworkManager power save config
 fn remove_nm_powersave_config() {
     if std::path::Path::new(NM_POWERSAVE_CONF).exists() {
@@ -1879,5 +1924,18 @@ mod main_tests {
         let existing = "[power]\nenabled = true\nwlan_power_save = \"off\"\n\n[governor]\nscan_suppress = false\n";
         let expected = "[power]\nenabled = true\nwlan_power_save = \"off\"\n\n[governor]\nscan_suppress = true\n";
         assert_eq!(generate_new_config_content(existing, "governor", "scan_suppress", "true"), expected);
+    }
+
+    #[test]
+    fn test_config_parsing_mac_and_hostname() {
+        let toml_str = r#"
+            [wifi]
+            wifi_mac_address = "00:11:22:33:44:55"
+            [system]
+            hostname = "steamdeck"
+        "#;
+        let parsed: crate::config::structs::Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.wifi.wifi_mac_address, Some("00:11:22:33:44:55".to_string()));
+        assert_eq!(parsed.system.hostname, Some("steamdeck".to_string()));
     }
 }

@@ -32,6 +32,8 @@ band_bias_6ghz = 25
 sysctl_enabled = true
 irq_affinity_enabled = true
 driver_tweaks_enabled = true
+# Force a custom system hostname (optional, sent to routers via DHCP for local DNS resolution)
+# hostname = "steamdeck"
 
 [backend]
 # Disable iwd's periodic scanning for reduced latency
