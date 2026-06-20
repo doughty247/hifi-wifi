@@ -97,18 +97,29 @@ sudo hifi-wifi power-save adaptive
 
 ### Background Scanning & Roaming
 
-WiFi drivers perform background channel scans every ~15 seconds, causing **170ms latency spikes** that affect gaming and streaming. By default, hifi-wifi now leaves background scanning ON to ensure smooth WiFi roaming between access points.
+WiFi drivers perform background channel scans every ~15 seconds, causing **170ms latency spikes** that affect gaming and streaming. 
 
-If you do not need roaming (e.g. single access point, stationary gaming/streaming), you can disable background scanning (suppress scans) to reduce latency to **~3.5ms average / 4ms max**:
+By default, `hifi-wifi` uses a smart, **Adaptive** scanning governor that gets the best of both worlds:
+1. **Gaming/Streaming Active:** Background scanning is completely suppressed to guarantee a pristine 3-4ms connection.
+2. **System Wake/Reboot:** Scanning is temporarily allowed for 30 seconds to ensure the device reconnects to the network instantly and seamlessly.
+3. **Signal Degraded:** If you walk away from your AP and the signal drops below the usable threshold, scanning is automatically allowed so the device can steer/roam to a stronger access point.
+4. **Strong Signal (Idle):** Scans are suppressed to avoid random spikes while browsing or watching media.
 
+You can customize this behavior at any time:
+
+To force background scanning always **OFF** (suppressed — lowest latency, disables roaming):
 ```bash
 sudo hifi-wifi scan off
 ```
 
-To re-enable background scanning (and restore roaming):
-
+To force background scanning always **ON** (allowed — roaming enabled):
 ```bash
 sudo hifi-wifi scan on
+```
+
+To restore the default smart **ADAPTIVE** governor:
+```bash
+sudo hifi-wifi scan adaptive
 ```
 
 **Config File:** `/etc/hifi-wifi/config.toml` (created on first run)

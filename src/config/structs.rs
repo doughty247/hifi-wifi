@@ -88,7 +88,6 @@ pub struct PowerConfig {
 }
 
 fn default_true() -> bool { true }
-fn default_false() -> bool { false }
 fn default_adaptive() -> String { "adaptive".to_string() }
 
 impl Default for PowerConfig {
@@ -176,12 +175,65 @@ pub struct GovernorConfig {
     /// Rolling average window size for CPU monitoring
     pub cpu_avg_window_size: usize,
 
-    /// Suppress iwd background scans to eliminate latency spikes
-    /// When true, the Governor aborts background scans every 500ms
-    /// while connected, reducing latency from ~20ms avg/170ms max to ~3.5ms avg/4ms max.
-    /// Disables roaming and band steering while active (scans resume if disconnected).
-    #[serde(default = "default_false")]
-    pub scan_suppress: bool,
+    /// Suppress background scans to eliminate latency spikes
+    /// - On: Always suppress scans when connected
+    /// - Off: Never suppress scans (roaming active)
+    /// - Adaptive: Suppress when gaming or signal is good; allow when signal is weak or during wake/boot grace periods.
+    #[serde(default = "default_scan_suppress")]
+    pub scan_suppress: ScanSuppressMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanSuppressMode {
+    On,
+    Off,
+    Adaptive,
+}
+
+impl<'de> Deserialize<'de> for ScanSuppressMode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ScanSuppressVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ScanSuppressVisitor {
+            type Value = ScanSuppressMode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a boolean or a string ('on', 'off', 'adaptive')")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v {
+                    Ok(ScanSuppressMode::On)
+                } else {
+                    Ok(ScanSuppressMode::Off)
+                }
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match v.to_lowercase().as_str() {
+                    "on" | "true" | "yes" => Ok(ScanSuppressMode::On),
+                    "off" | "false" | "no" => Ok(ScanSuppressMode::Off),
+                    "adaptive" => Ok(ScanSuppressMode::Adaptive),
+                    _ => Err(serde::de::Error::custom(format!("invalid scan suppress mode: {}", v))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(ScanSuppressVisitor)
+    }
+}
+
+fn default_scan_suppress() -> ScanSuppressMode {
+    ScanSuppressMode::Adaptive
 }
 
 impl Default for GovernorConfig {
@@ -207,9 +259,39 @@ impl Default for GovernorConfig {
             cpu_coalescing_threshold: 0.90,
             
             cpu_avg_window_size: 3,
-
-            scan_suppress: false,
+            
+            scan_suppress: ScanSuppressMode::Adaptive,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    struct TestConfig {
+        scan_suppress: ScanSuppressMode,
+    }
+
+    #[test]
+    fn test_scan_suppress_deserialization() {
+        // Test booleans (backward compatibility)
+        let c: TestConfig = toml::from_str("scan_suppress = true").unwrap();
+        assert_eq!(c.scan_suppress, ScanSuppressMode::On);
+
+        let c: TestConfig = toml::from_str("scan_suppress = false").unwrap();
+        assert_eq!(c.scan_suppress, ScanSuppressMode::Off);
+
+        // Test strings
+        let c: TestConfig = toml::from_str("scan_suppress = \"on\"").unwrap();
+        assert_eq!(c.scan_suppress, ScanSuppressMode::On);
+
+        let c: TestConfig = toml::from_str("scan_suppress = \"off\"").unwrap();
+        assert_eq!(c.scan_suppress, ScanSuppressMode::Off);
+
+        let c: TestConfig = toml::from_str("scan_suppress = \"adaptive\"").unwrap();
+        assert_eq!(c.scan_suppress, ScanSuppressMode::Adaptive);
     }
 }
 

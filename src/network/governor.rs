@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tokio::time;
 use notify::{Watcher, RecursiveMode, Config as NotifyConfig, RecommendedWatcher, Event, EventKind};
 
-use crate::config::structs::{GovernorConfig, PowerConfig, WifiConfig};
+use crate::config::structs::{GovernorConfig, PowerConfig, WifiConfig, ScanSuppressMode};
 use crate::network::nm::NmClient;
 use crate::network::tc::{TcManager, EthtoolManager};
 use crate::network::stats::PpsMonitor;
@@ -106,6 +106,8 @@ pub struct Governor {
     interface_states: std::collections::HashMap<String, InterfaceState>,
     /// Shared flag: when true, the scan abort task actively suppresses background scans
     scan_suppress_active: Arc<AtomicBool>,
+    last_tick_at: Instant,
+    last_resume_at: Option<Instant>,
 }
 
 impl Governor {
@@ -115,6 +117,7 @@ impl Governor {
         let cpu_monitor = CpuMonitor::new(config.cpu_avg_window_size);
         let power_manager = PowerManager::new();
         let wifi_manager = WifiManager::new()?;
+        let now = Instant::now();
 
         Ok(Self {
             config,
@@ -126,6 +129,8 @@ impl Governor {
             wifi_manager,
             interface_states: std::collections::HashMap::new(),
             scan_suppress_active: Arc::new(AtomicBool::new(false)),
+            last_tick_at: now,
+            last_resume_at: Some(now), // Treat startup as initial grace period
         })
     }
 
@@ -136,12 +141,12 @@ impl Governor {
         info!("Governor starting (tick rate: {}s)", tick_rate_secs);
 
         // Spawn scan suppression task if enabled
-        if self.config.scan_suppress {
+        if self.config.scan_suppress != ScanSuppressMode::Off {
             let flag = self.scan_suppress_active.clone();
             tokio::spawn(async move {
                 scan_abort_task(flag).await;
             });
-            info!("Scan suppression task started (500ms interval)");
+            info!("Scan suppression task started (500ms interval, mode: {:?})", self.config.scan_suppress);
         } else {
             info!("Scan suppression disabled by config");
         }
@@ -172,6 +177,15 @@ impl Governor {
             }
             
             interval.tick().await;
+
+            // Check if we resumed from suspend (large time gap between ticks)
+            let now = Instant::now();
+            let elapsed = now.duration_since(self.last_tick_at);
+            if elapsed.as_secs() > tick_rate_secs * 3 {
+                info!("System resume from suspend detected (elapsed: {}s)! Temporarily allowing background scans.", elapsed.as_secs());
+                self.last_resume_at = Some(now);
+            }
+            self.last_tick_at = now;
             
             if let Err(e) = self.tick().await {
                 warn!("Governor tick error: {}", e);
@@ -280,11 +294,78 @@ impl Governor {
             .map(|d| (d.interface.clone(), d.path.clone(), d.bitrate, d.active_ap.clone()))
             .collect();
 
-        // Update scan suppression flag: suppress when connected, allow when disconnected
-        if self.config.scan_suppress {
-            let has_wifi_connection = !device_infos.is_empty();
-            self.scan_suppress_active.store(has_wifi_connection, Ordering::Relaxed);
+        // Ensure interface states exist
+        for (interface, _, _, _) in &device_infos {
+            if !self.interface_states.contains_key(interface) {
+                self.interface_states.insert(
+                    interface.clone(), 
+                    InterfaceState::new(&self.config)
+                );
+            }
         }
+
+        // Update scan suppression flag based on mode
+        let suppress;
+        let has_wifi_connection = !device_infos.is_empty();
+
+        match self.config.scan_suppress {
+            ScanSuppressMode::Off => {
+                suppress = false;
+            }
+            ScanSuppressMode::On => {
+                suppress = has_wifi_connection;
+            }
+            ScanSuppressMode::Adaptive => {
+                if !has_wifi_connection {
+                    suppress = false;
+                } else {
+                    let now = Instant::now();
+                    let in_wake_grace_period = self.last_resume_at
+                        .map(|resume_time| now.duration_since(resume_time).as_secs() < 30)
+                        .unwrap_or(false);
+
+                    if in_wake_grace_period {
+                        debug!("Adaptive Scan: Wake/startup grace period active, allowing background scans");
+                        suppress = false;
+                    } else {
+                        let mut in_game_mode = false;
+                        let mut weak_signal = false;
+
+                        for (interface, _, _, active_ap) in &device_infos {
+                            if let Some(state) = self.interface_states.get(interface) {
+                                if state.game_mode_until.map(|until| now < until).unwrap_or(false) {
+                                    in_game_mode = true;
+                                }
+                            }
+                            if let Some(ap) = active_ap {
+                                let limit = match ap.band {
+                                    crate::network::nm::WifiBand::Band2_4GHz => self.wifi_config.min_signal_2g_dbm,
+                                    crate::network::nm::WifiBand::Band5GHz => self.wifi_config.min_signal_5g_dbm,
+                                    crate::network::nm::WifiBand::Band6GHz => self.wifi_config.min_signal_6g_dbm,
+                                    _ => -75,
+                                };
+                                if ap.signal_strength <= limit {
+                                    weak_signal = true;
+                                }
+                            }
+                        }
+
+                        if in_game_mode {
+                            debug!("Adaptive Scan: Game Mode active, suppressing scans");
+                            suppress = true;
+                        } else if weak_signal {
+                            debug!("Adaptive Scan: Weak signal detected, allowing scans for roaming");
+                            suppress = false;
+                        } else {
+                            debug!("Adaptive Scan: Strong signal and idle, suppressing scans");
+                            suppress = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.scan_suppress_active.store(suppress, Ordering::Relaxed);
 
         for (interface, path, bitrate, active_ap) in device_infos {
             info!("Processing interface: {}, active_ap: {:?}, band_steering_enabled: {}", 

@@ -10,6 +10,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::config::loader::load_config;
+use crate::config::structs::ScanSuppressMode;
 use crate::network::wifi::{WifiManager, WifiInterface};
 use crate::network::backend_tuner::BackendTuner;
 use crate::network::governor::Governor;
@@ -630,10 +631,10 @@ async fn run_status_async() -> Result<()> {
     println!("{}│{}    ├─ QoS Mode:   {}", BLUE, NC, if config.governor.breathing_cake_enabled { "Breathing CAKE (Dynamic)" } else { "Static CAKE" });
     println!("{}│{}    ├─ Game Mode:  {}", BLUE, NC, if config.governor.game_mode_enabled { "Available (PPS > 200)" } else { "Disabled" });
     println!("{}│{}    ├─ Band Steer: {}", BLUE, NC, if config.governor.band_steering_enabled { "Available" } else { "Disabled" });
-    let scan_desc = if !config.governor.scan_suppress {
-        format!("{}[ON]{} (Roaming Enabled)", GREEN, NC)
-    } else {
-        format!("{}[OFF]{} (Lowest Latency)", YELLOW, NC)
+    let scan_desc = match config.governor.scan_suppress {
+        ScanSuppressMode::Off => format!("{}[ON]{} (Roaming Enabled)", GREEN, NC),
+        ScanSuppressMode::On => format!("{}[OFF]{} (Lowest Latency)", YELLOW, NC),
+        ScanSuppressMode::Adaptive => format!("{}[ADAPTIVE]{} (Latency-Prioritized)", GREEN, NC),
     };
     println!("{}│{}    └─ Background Scan: {}", BLUE, NC, scan_desc);
 
@@ -1802,10 +1803,10 @@ fn run_scan(mode: &str, config: &config::structs::Config) -> Result<()> {
             println!("{}────────────────────────────{}", BLUE, NC);
 
             let scan_suppress = config.governor.scan_suppress;
-            let mode_display = if !scan_suppress {
-                format!("{}ON{} (Background scans allowed — roaming enabled)", GREEN, NC)
-            } else {
-                format!("{}OFF{} (Background scans suppressed — lowest latency)", YELLOW, NC)
+            let mode_display = match scan_suppress {
+                ScanSuppressMode::Off => format!("{}ON{} (Background scans allowed — roaming enabled)", GREEN, NC),
+                ScanSuppressMode::On => format!("{}OFF{} (Background scans suppressed — lowest latency)", YELLOW, NC),
+                ScanSuppressMode::Adaptive => format!("{}ADAPTIVE{} (Latency-prioritized scans)", GREEN, NC),
             };
             println!("  Config: {}", mode_display);
 
@@ -1817,9 +1818,13 @@ fn run_scan(mode: &str, config: &config::structs::Config) -> Result<()> {
                 .unwrap_or(false);
 
             if service_active {
+                let service_mode = match scan_suppress {
+                    ScanSuppressMode::Off => "active",
+                    ScanSuppressMode::On => "inactive",
+                    ScanSuppressMode::Adaptive => "adaptive",
+                };
                 println!("  Service: {}Running{} (scanning {})",
-                    GREEN, NC,
-                    if !scan_suppress { "active" } else { "inactive" });
+                    GREEN, NC, service_mode);
             } else {
                 println!("  Service: {}Not running{}", YELLOW, NC);
             }
@@ -1847,17 +1852,23 @@ fn run_scan(mode: &str, config: &config::structs::Config) -> Result<()> {
             }
             println!();
         }
-        "on" | "off" => {
-            let scan_on = mode == "on";
-            let desc = if scan_on {
-                "ON (allow background scans — roaming enabled)"
-            } else {
-                "OFF (suppress background scans — lowest latency, disables roaming)"
+        "on" | "off" | "adaptive" => {
+            let config_mode = match mode {
+                "on" => "off",
+                "off" => "on",
+                "adaptive" => "adaptive",
+                _ => unreachable!(),
+            };
+            let desc = match mode {
+                "on" => "ON (allow background scans — roaming enabled)",
+                "off" => "OFF (suppress background scans — lowest latency)",
+                "adaptive" => "ADAPTIVE (latency-prioritized background scans)",
+                _ => unreachable!(),
             };
             info!("Setting background scanning to: {}", desc);
 
-            // Update config file (scan_on = true means scan_suppress = false)
-            write_scan_suppress_config(!scan_on)?;
+            // Update config file
+            write_scan_suppress_config(config_mode)?;
 
             // Restart service if running so Governor picks up the new config
             let service_running = Command::new("systemctl")
@@ -1874,7 +1885,7 @@ fn run_scan(mode: &str, config: &config::structs::Config) -> Result<()> {
             info!("Background scanning set to '{}' successfully", mode);
         }
         _ => {
-            error!("Invalid mode: '{}'. Use: on, off, or status", mode);
+            error!("Invalid mode: '{}'. Use: on, off, adaptive, or status", mode);
             std::process::exit(1);
         }
     }
@@ -1883,8 +1894,8 @@ fn run_scan(mode: &str, config: &config::structs::Config) -> Result<()> {
 }
 
 /// Write the scan_suppress setting to the hifi-wifi config file
-fn write_scan_suppress_config(suppress: bool) -> Result<()> {
-    write_config_value("governor", "scan_suppress", &suppress.to_string())
+fn write_scan_suppress_config(mode: &str) -> Result<()> {
+    write_config_value("governor", "scan_suppress", &format!("\"{}\"", mode))
 }
 
 #[cfg(test)]
