@@ -543,72 +543,54 @@ async fn run_status_async() -> Result<()> {
         }
 
         // IRQ Affinity
-        let irq_out = std::fs::read_to_string("/proc/interrupts").unwrap_or_default();
-        
-        // USB devices don't have dedicated IRQs we can pin easily
         let is_usb = ifc.driver.contains("usb") || ifc.name.contains("usb") || ifc.driver.starts_with("rt2800usb");
 
         let irq_status = if is_usb {
              format!("{}[N/A]{} (USB Device)", DIM, NC)
         } else {
-            // Special mappings for drivers that report different names in /proc/interrupts
-            // - rtl8192ee reports as "rtl_pci"
-            // - rtw88_8822ce (Steam Deck LCD) may show as rtw88, rtw_pci, or interface name
-            // - ath11k uses MSI-X with multiple IRQ vectors (ath11k_pci:base, DP, CE0-CE11, MHI)
-            // - Steam Deck OLED (WCN6855) may show as wcn, ath11k, MHI, or other variants
-            let search_terms: Vec<&str> = match ifc.driver.as_str() {
-                "rtl8192ee" => vec!["rtl_pci"],
-                "rtw88_8822ce" | "rtw88_pci" | "rtw_pci" => vec!["rtw88", "rtw_pci", &ifc.name],
-                "ath11k_pci" | "ath11k" => vec!["ath11k", "wcn", "MHI", &ifc.name],
-                _ => vec![ifc.driver.as_str(), &ifc.name],
-            };
-
-            // Find ALL matching IRQs
-            let irq_lines: Vec<&str> = irq_out.lines()
-                .filter(|l| search_terms.iter().any(|t| l.contains(t)) || l.contains(&ifc.name))
-                .collect();
-            
-            if !irq_lines.is_empty() {
-                 // Check if ALL IRQs are pinned to CPU1
-                 let mut all_optimized = true;
-                 let mut all_found = true;
-                 let mut total = 0;
-                 let mut optimized = 0;
-                 
-                 for line in &irq_lines {
-                     let irq_num = line.trim().split(':').next().unwrap_or("?");
-                     if let Ok(affinity) = std::fs::read_to_string(format!("/proc/irq/{}/smp_affinity", irq_num)) {
-                         total += 1;
-                         let aff = affinity.trim();
-                         // Check if pinned to CPU1 (mask 0x2 in various formats)
-                         let is_cpu1 = aff == "2" || aff == "02" || aff == "00000002" || aff == "000002";
-                         if is_cpu1 {
-                             optimized += 1;
-                         } else {
-                             all_optimized = false;
-                         }
-                     } else {
-                         all_found = false;
-                     }
+             match crate::system::optimizer::find_wifi_irqs(ifc) {
+                 Ok(irqs) if !irqs.is_empty() => {
+                      // Check if IRQs are pinned to CPU1
+                      let mut all_optimized = true;
+                      let mut all_found = true;
+                      let mut total = 0;
+                      let mut optimized = 0;
+                      
+                      for irq_num in &irqs {
+                          if let Ok(affinity) = std::fs::read_to_string(format!("/proc/irq/{}/smp_affinity", irq_num)) {
+                              total += 1;
+                              let aff = affinity.trim();
+                              // Check if pinned to CPU1 (mask 0x2 in various formats)
+                              let is_cpu1 = aff == "2" || aff == "02" || aff == "00000002" || aff == "000002";
+                              if is_cpu1 {
+                                  optimized += 1;
+                              } else {
+                                  all_optimized = false;
+                              }
+                          } else {
+                              all_found = false;
+                          }
+                      }
+                      
+                      if total == 0 || !all_found {
+                          format!("{}[UNKNOWN]{}", DIM, NC)
+                      } else if all_optimized {
+                          if total > 1 {
+                              format!("{}[OPTIMIZED]{} (CPU 1, {} vectors)", GREEN, NC, total)
+                          } else {
+                              format!("{}[OPTIMIZED]{} (CPU 1)", GREEN, NC)
+                          }
+                      } else if optimized == 0 {
+                          // No IRQs pinned
+                          format!("{}[DEFAULT]{} (System Managed)", DIM, NC)
+                      } else {
+                          // Some IRQs pinned
+                          format!("{}[OPTIMIZED]{} (CPU 1, {}/{} vectors)", GREEN, NC, optimized, total)
+                      }
                  }
-                 
-                 if total == 0 || !all_found {
-                     format!("{}[UNKNOWN]{}", DIM, NC)
-                 } else if all_optimized {
-                     if total > 1 {
-                         format!("{}[OPTIMIZED]{} (CPU 1, {} vectors)", GREEN, NC, total)
-                     } else {
-                         format!("{}[OPTIMIZED]{} (CPU 1)", GREEN, NC)
-                     }
-                 } else if optimized == 0 {
-                     // No IRQs pinned = default system distribution
-                     format!("{}[DEFAULT]{} (System Managed)", DIM, NC)
-                 } else {
-                     format!("{}[PARTIAL]{} ({}/{} pinned)", YELLOW, NC, optimized, total)
-                 }
-            } else {
-                 format!("{}[NOT FOUND]{}", DIM, NC)
-            }
+                 Ok(_) => format!("{}[NOT FOUND]{}", DIM, NC),
+                 Err(_) => format!("{}[UNKNOWN]{}", DIM, NC),
+             }
         };
         println!("{}│{}    └─ IRQ Pin:    {}", BLUE, NC, irq_status);
         println!("{}│{}", BLUE, NC);

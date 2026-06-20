@@ -240,52 +240,37 @@ options mwifiex disable_auto_ds=1
             // We proceed anyway, but the warning is crucial for debugging
         }
 
-        // Read /proc/interrupts to find the Wi-Fi IRQ(s)
-        let interrupts = fs::read_to_string("/proc/interrupts")
-            .context("Failed to read /proc/interrupts")?;
-
-        // Special mappings for drivers that report different names in /proc/interrupts
-        // - rtl8192ee reports as "rtl_pci" 
-        // - rtw88_8822ce (Steam Deck LCD) may show as rtw88, rtw_pci, or interface name
-        // - ath11k uses MSI-X with multiple IRQ vectors (ath11k_pci:base, DP, CE0-CE11, MHI)
-        // - Steam Deck OLED (WCN6855) may show as wcn, ath11k, or other variants
-        let search_terms: Vec<&str> = match ifc.driver.as_str() {
-            "rtl8192ee" => vec!["rtl_pci"],
-            "rtw88_8822ce" | "rtw88_pci" | "rtw_pci" => vec!["rtw88", "rtw_pci", &ifc.name],
-            "ath11k_pci" | "ath11k" => vec!["ath11k", "wcn", "mhi", "bhi", &ifc.name],  // WCN6855 variants
-            _ => vec![ifc.driver.as_str(), &ifc.name],
-        };
-
-        // Find ALL matching IRQs (important for MSI-X drivers like ath11k)
-        let irqs: Vec<String> = interrupts.lines()
-            .filter(|line| {
-                let lower = line.to_lowercase();
-                search_terms.iter().any(|term| lower.contains(&term.to_lowercase())) || lower.contains(&ifc.name.to_lowercase())
-            })
-            .filter_map(|line| line.trim().split(':').next())
-            .map(|s| s.trim().to_string())
-            .collect();
+        let irqs = find_wifi_irqs(ifc)?;
 
         if irqs.is_empty() {
             debug!("Could not find IRQ for {} (driver: {})", ifc.name, ifc.driver);
         } else {
             // Pin ALL matching IRQs to CPU 1
             let mut pinned = 0;
+            let mut managed = 0;
             for irq_num in &irqs {
                 let affinity_path = format!("/proc/irq/{}/smp_affinity", irq_num);
                 
                 // Bind to CPU 1 (affinity mask 0x2)
                 if let Err(e) = fs::write(&affinity_path, "2") {
-                    warn!("Failed to set IRQ affinity for {}: {}", irq_num, e);
+                    if e.raw_os_error() == Some(5) {
+                        // OS Error 5 (EIO) means the interrupt is managed by the kernel
+                        debug!("IRQ {} is managed by the kernel (affinity cannot be modified)", irq_num);
+                        managed += 1;
+                    } else {
+                        warn!("Failed to set IRQ affinity for {}: {}", irq_num, e);
+                    }
                 } else {
                     pinned += 1;
                 }
             }
             
             if irqs.len() > 1 {
-                info!("Wi-Fi {} IRQs bound to CPU 1 ({} vectors)", pinned, irqs.len());
-            } else {
+                info!("Wi-Fi IRQs optimization completed: {} bound to CPU 1, {} managed by kernel ({} total vectors)", pinned, managed, irqs.len());
+            } else if pinned > 0 {
                 info!("Wi-Fi IRQ {} bound to CPU 1", irqs[0]);
+            } else {
+                info!("Wi-Fi IRQ {} is kernel-managed (affinity not modified)", irqs[0]);
             }
         }
 
@@ -431,4 +416,29 @@ impl Default for SystemOptimizer {
     fn default() -> Self {
         Self::new(true, true, true)
     }
+}
+
+/// Helper to find all IRQs associated with a Wi-Fi interface in /proc/interrupts.
+/// Returns a list of IRQ numbers.
+pub fn find_wifi_irqs(ifc: &WifiInterface) -> Result<Vec<String>> {
+    let interrupts = fs::read_to_string("/proc/interrupts")
+        .context("Failed to read /proc/interrupts")?;
+        
+    let search_terms: Vec<&str> = match ifc.driver.as_str() {
+        "rtl8192ee" => vec!["rtl_pci"],
+        "rtw88_8822ce" | "rtw88_pci" | "rtw_pci" => vec!["rtw88", "rtw_pci", &ifc.name],
+        "ath11k_pci" | "ath11k" => vec!["ath11k", "wcn", "mhi", "bhi", &ifc.name],  // WCN6855 variants
+        _ => vec![ifc.driver.as_str(), &ifc.name],
+    };
+
+    let irqs: Vec<String> = interrupts.lines()
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            search_terms.iter().any(|term| lower.contains(&term.to_lowercase())) || lower.contains(&ifc.name.to_lowercase())
+        })
+        .filter_map(|line| line.trim().split(':').next())
+        .map(|s| s.trim().to_string())
+        .collect();
+
+    Ok(irqs)
 }
