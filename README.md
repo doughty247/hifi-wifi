@@ -152,7 +152,7 @@ Then install normally.
 
 hifi-wifi uses the CAKE traffic shaper to manage network congestion, suppresses latency-causing background WiFi scans, monitors your connection quality, and adjusts settings in real-time. It detects WiFi reconnections, roaming events, and power state changes to keep optimizations current.
 
-**[Read the full architecture documentation →](ARCHITECTURE.md)**
+**[Read the full architecture documentation →](docs/ARCHITECTURE.md)**
 
 ---
 
