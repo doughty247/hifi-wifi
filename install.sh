@@ -153,17 +153,22 @@ setup_homebrew_build_deps() {
 
 # Setup SteamOS runtime dependencies (iproute2) via Homebrew
 setup_homebrew_runtime_deps() {
-    echo -e "${BLUE}Ensuring runtime dependencies via Homebrew...${NC}"
-    setup_homebrew || return 1
-    
-    local HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"
-    eval "$($HOMEBREW_PREFIX/bin/brew shellenv)"
-    
-    # Check if tc already exists
-    if command -v tc &>/dev/null || [[ -x "$HOMEBREW_PREFIX/sbin/tc" ]]; then
+    # Check if tc already exists in PATH first to avoid touching Homebrew entirely
+    if command -v tc &>/dev/null; then
         echo -e "${GREEN}Runtime dependencies ready! (tc)${NC}"
         return 0
     fi
+    
+    local HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"
+    if [[ -x "$HOMEBREW_PREFIX/sbin/tc" ]]; then
+        echo -e "${GREEN}Runtime dependencies ready! (tc)${NC}"
+        return 0
+    fi
+    
+    echo -e "${BLUE}Ensuring runtime dependencies via Homebrew...${NC}"
+    setup_homebrew || return 1
+    
+    eval "$($HOMEBREW_PREFIX/bin/brew shellenv)"
     
     echo -e "${BLUE}Installing iproute2 via Homebrew...${NC}"
     if [[ $EUID -eq 0 ]] && [[ -n "$SUDO_USER" ]]; then
