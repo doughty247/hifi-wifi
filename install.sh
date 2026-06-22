@@ -151,6 +151,37 @@ setup_homebrew_build_deps() {
     return 1
 }
 
+# Setup SteamOS runtime dependencies (iproute2) via Homebrew
+setup_homebrew_runtime_deps() {
+    echo -e "${BLUE}Ensuring runtime dependencies via Homebrew...${NC}"
+    setup_homebrew || return 1
+    
+    local HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"
+    eval "$($HOMEBREW_PREFIX/bin/brew shellenv)"
+    
+    # Check if tc already exists
+    if command -v tc &>/dev/null || [[ -x "$HOMEBREW_PREFIX/sbin/tc" ]]; then
+        echo -e "${GREEN}Runtime dependencies ready! (tc)${NC}"
+        return 0
+    fi
+    
+    echo -e "${BLUE}Installing iproute2 via Homebrew...${NC}"
+    if [[ $EUID -eq 0 ]] && [[ -n "$SUDO_USER" ]]; then
+        sudo -u "$SUDO_USER" "$HOMEBREW_PREFIX/bin/brew" install iproute2 || true
+    else
+        brew install iproute2 || true
+    fi
+    
+    if [[ -x "$HOMEBREW_PREFIX/sbin/tc" ]]; then
+        echo -e "${GREEN}Runtime dependencies ready! (tc)${NC}"
+        return 0
+    fi
+    
+    echo -e "${RED}Failed to install iproute2 via Homebrew${NC}"
+    return 1
+}
+
+
 # Setup SteamOS build environment using Homebrew (persists across updates!)
 setup_steamos_build_env() {
     echo -e "${BLUE}[SteamOS] Preparing build environment via Homebrew...${NC}"
@@ -461,6 +492,11 @@ main() {
     
     # Step 5: Install
     echo -e "${BLUE}[5/5] Installing service...${NC}"
+    if [[ "$distro_id" == "steamos" ]]; then
+        setup_homebrew_runtime_deps || {
+            echo -e "${YELLOW}Warning: Failed to setup Homebrew runtime dependencies.${NC}"
+        }
+    fi
     install_service
     setup_user_path
 
