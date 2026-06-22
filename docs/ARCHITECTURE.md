@@ -862,28 +862,27 @@ The ~2-5% throughput reduction is the cost of flow isolation and queue managemen
 
 ## Future Roadmap
 
-### v3.1 - Polish
+### v3.1.0 - Core Engine Rewrite (Implemented)
 
-- JSON output mode for API integration
-- Improved game detection
-- Configuration UI (TUI)
+- **Zero-Overhead Netlink Listener**: Subscribes directly to kernel netlink link multicast groups (`RTMGRP_LINK`) to trigger instant governor ticks on carrier changes.
+- **RTT-Driven CAKE Scaling**: Queries the kernel's `TCP_INFO` struct dynamically to scale CAKE queue capacity during wireless jitter spikes.
+- **cgroup v2 & DSCP Tagging**: Prioritizes gaming/streaming application traffic (e.g. `gamescope.slice`) and ports via `nftables` postrouting rules.
+- **Proactive Roaming Governor**: Triggers active NetworkManager association handovers to target BSSIDs when signal strength drops below `-80 dBm`.
 
-### v3.2 - Decky Plugin
+### v3.2.0 - Decky Plugin & QAM Integration
 
-- Decky Loader plugin for Steam Deck
-- Real-time status display in Game Mode
-- One-click enable/disable
+- Decky Loader UI plugin for Steam Deck
+- Real-time latency and jitter display in QAM (Quick Access Menu)
+- One-click toggling and configuration overrides
 
-### v3.3 - Advanced Features
+### v3.3.0 - Advanced Network Routing
 
-- Per-application traffic prioritization
-- Multi-interface bonding awareness
+- Multi-interface bonding and fallback awareness
 - VPN-aware optimization
-- Mesh network support
+- Mesh network channel optimization
 
-### v4.0 - Platform Expansion
+### v4.0.0 - Platform Expansion
 
-- Windows support (long-term)
 - Router-side agent (OpenWrt package)
 - Cloud configuration sync
 

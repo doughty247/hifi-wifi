@@ -165,6 +165,15 @@ impl Governor {
             }
         };
 
+        // Initialize generic Netlink event listener
+        let netlink_listener = match crate::network::netlink::NetlinkListener::new() {
+            Ok(nl) => Some(nl),
+            Err(e) => {
+                warn!("Failed to initialize Netlink listener (falling back to timer-only): {}", e);
+                None
+            }
+        };
+
         let mut interval = time::interval(Duration::from_secs(tick_rate_secs));
 
         loop {
@@ -176,7 +185,26 @@ impl Governor {
                 }
             }
             
-            interval.tick().await;
+            // Wait for either the tick timer OR a Netlink event
+            if let Some(ref nl) = netlink_listener {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        debug!("Periodic tick timer expired");
+                    }
+                    event_res = nl.next_event() => {
+                        match event_res {
+                            Ok(_) => {
+                                info!("Netlink event detected - running immediate tick");
+                            }
+                            Err(e) => {
+                                warn!("Netlink listener error: {}", e);
+                            }
+                        }
+                    }
+                }
+            } else {
+                interval.tick().await;
+            }
 
             // Check if we resumed from suspend (large time gap between ticks)
             let now = Instant::now();
@@ -399,6 +427,7 @@ impl Governor {
                         if freeze_cake && !was_in_game {
                             state.tc_manager.enter_game_mode();
                             info!("Game mode ACTIVATED: {} PPS on {} (CAKE frozen)", pps, interface);
+                            let _ = crate::network::cgroups::set_dscp_prioritization(true);
                         } else {
                             debug!("Game mode extended: {} PPS on {}", pps, interface);
                         }
@@ -411,6 +440,7 @@ impl Governor {
                         if !still_in_game && freeze_cake {
                             state.tc_manager.exit_game_mode();
                             info!("Game mode ENDED on {} (CAKE unfrozen)", interface);
+                            let _ = crate::network::cgroups::set_dscp_prioritization(false);
                         }
                     }
                 }
@@ -453,7 +483,19 @@ impl Governor {
                         
                         // Convert Kbit to Mbit and scale using overhead factor (default 0.85)
                         let bitrate_mbit = effective_bitrate / 1000;
-                        let scaled_mbit = (bitrate_mbit as f64 * self.config.cake_overhead_factor) as u32;
+                        let mut scale_factor = self.config.cake_overhead_factor;
+                        
+                        // RTT-driven scaling via TCP_INFO telemetry
+                        if let Ok(telemetry) = crate::network::tcp_info::get_gaming_telemetry() {
+                            if telemetry.rtt_var_us > 15_000 {
+                                let jitter_ms = telemetry.rtt_var_us / 1000;
+                                let penalty = (jitter_ms as f64 * 0.01).min(0.30); // max 30% reduction
+                                scale_factor *= 1.0 - penalty;
+                                info!("RTT Telemetry: Jitter detected ({}ms). Scaling CAKE: {:.2}", jitter_ms, scale_factor);
+                            }
+                        }
+
+                        let scaled_mbit = (bitrate_mbit as f64 * scale_factor) as u32;
                         
                         debug!("CAKE: NM={}Kbit, iw={}Kbit, effective={}Kbit, scaled={}Mbit",
                                nm_bitrate, iw_bitrate, effective_bitrate, scaled_mbit);
@@ -466,7 +508,19 @@ impl Governor {
                         // Both sources invalid BUT we have a last known good value - use it
                         // This handles MCS0 probe frames during idle periods
                         let bitrate_mbit = last_good / 1000;
-                        let scaled_mbit = (bitrate_mbit as f64 * self.config.cake_overhead_factor) as u32;
+                        let mut scale_factor = self.config.cake_overhead_factor;
+                        
+                        // RTT-driven scaling via TCP_INFO telemetry
+                        if let Ok(telemetry) = crate::network::tcp_info::get_gaming_telemetry() {
+                            if telemetry.rtt_var_us > 15_000 {
+                                let jitter_ms = telemetry.rtt_var_us / 1000;
+                                let penalty = (jitter_ms as f64 * 0.01).min(0.30);
+                                scale_factor *= 1.0 - penalty;
+                                info!("RTT Telemetry (historical): Jitter detected ({}ms). Scaling CAKE: {:.2}", jitter_ms, scale_factor);
+                            }
+                        }
+
+                        let scaled_mbit = (bitrate_mbit as f64 * scale_factor) as u32;
                         
                         debug!("CAKE: Invalid readings (NM={}, iw={}), using last known good {}Kbit -> {}Mbit",
                                nm_bitrate, iw_bitrate, last_good, scaled_mbit);
@@ -701,8 +755,14 @@ impl Governor {
             }
 
             // 6. Smart Band Steering
-            // Skip when scan suppress is active — scan results are stale/empty
-            if self.config.band_steering_enabled && !self.scan_suppress_active.load(Ordering::Relaxed) {
+            // Skip when scan suppress is active — EXCEPT when signal is critically weak (disconnect imminent)
+            let is_critical_signal = if let Some(current_ap) = &active_ap {
+                current_ap.signal_strength <= -80
+            } else {
+                false
+            };
+
+            if self.config.band_steering_enabled && (!self.scan_suppress_active.load(Ordering::Relaxed) || is_critical_signal) {
                 if let Some(current_ap) = &active_ap {
                     let hysteresis_ticks = self.config.roam_hysteresis_ticks;
                     
@@ -714,7 +774,6 @@ impl Governor {
                     match self.nm_client.get_access_points(&path).await {
                         Ok(access_points) => {
                             info!("Band steering: Found {} visible APs (current SSID: '{}')", access_points.len(), current_ap.ssid);
-                            info!("Band steering: access_points is_empty={}, len={}", access_points.is_empty(), access_points.len());
                             
                             if access_points.is_empty() {
                                 info!("Band steering: No APs returned from NetworkManager");
@@ -753,54 +812,58 @@ impl Governor {
                                 })
                                 .max_by_key(|ap| ap.score(bias_5, bias_6));
 
-                        if let Some(state) = self.interface_states.get_mut(&interface) {
-                            if let Some(best_candidate) = best {
-                                let candidate_score = best_candidate.score(bias_5, bias_6);
-                                
-                                if candidate_score > current_score {
-                                    // Update hysteresis
-                                    let should_trigger = if let Some(ref mut roam) = state.roam_candidate {
-                                        if roam.bssid == best_candidate.bssid {
-                                            roam.consecutive_ticks += 1;
-                                            roam.score = candidate_score;
+                            if let Some(state) = self.interface_states.get_mut(&interface) {
+                                if let Some(best_candidate) = best {
+                                    let candidate_score = best_candidate.score(bias_5, bias_6);
+                                    
+                                    if candidate_score > current_score {
+                                        // Update hysteresis
+                                        let should_trigger = if let Some(ref mut roam) = state.roam_candidate {
+                                            if roam.bssid == best_candidate.bssid {
+                                                roam.consecutive_ticks += 1;
+                                                roam.score = candidate_score;
+                                            } else {
+                                                *roam = RoamCandidate {
+                                                    bssid: best_candidate.bssid.clone(),
+                                                    score: candidate_score,
+                                                    consecutive_ticks: 1,
+                                                };
+                                            }
+                                            roam.consecutive_ticks >= hysteresis_ticks
                                         } else {
-                                            *roam = RoamCandidate {
+                                            state.roam_candidate = Some(RoamCandidate {
                                                 bssid: best_candidate.bssid.clone(),
                                                 score: candidate_score,
                                                 consecutive_ticks: 1,
-                                            };
-                                        }
-                                        roam.consecutive_ticks >= hysteresis_ticks
-                                    } else {
-                                        state.roam_candidate = Some(RoamCandidate {
-                                            bssid: best_candidate.bssid.clone(),
-                                            score: candidate_score,
-                                            consecutive_ticks: 1,
-                                        });
-                                        false
-                                    };
+                                            });
+                                            false
+                                        };
 
-                                    if should_trigger {
-                                        info!("Band steering: {} -> {} (score: {} -> {}, band: {:?} -> {:?})",
-                                              current_ap.bssid, best_candidate.bssid, 
-                                              current_score, candidate_score,
-                                              current_ap.band, best_candidate.band);
-                                        
-                                        // Clear cached bitrate - after roaming it will be stale
-                                        state.last_good_bitrate = None;
-                                        state.bandwidth_valid = false;
-                                        
-                                        // Request scan to hint firmware/driver about better AP
-                                        let _ = self.nm_client.request_scan(&path).await;
+                                        if should_trigger {
+                                            info!("Proactive Roaming Governor: {} -> {} (score: {} -> {}, band: {:?} -> {:?})",
+                                                  current_ap.bssid, best_candidate.bssid, 
+                                                  current_score, candidate_score,
+                                                  current_ap.band, best_candidate.band);
+                                            
+                                            // Clear cached bitrate - after roaming it will be stale
+                                            state.last_good_bitrate = None;
+                                            state.bandwidth_valid = false;
+                                            
+                                            // Active connection handover
+                                            if let Err(e) = self.nm_client.active_roam(&path, &best_candidate.path).await {
+                                                warn!("Proactive handover to AP {} failed: {}. Falling back to scan hinting.", best_candidate.bssid, e);
+                                                // Fallback: Request scan to hint firmware/driver about better AP
+                                                let _ = self.nm_client.request_scan(&path).await;
+                                            }
+                                            state.roam_candidate = None;
+                                        }
+                                    } else {
                                         state.roam_candidate = None;
                                     }
                                 } else {
                                     state.roam_candidate = None;
                                 }
-                            } else {
-                                state.roam_candidate = None;
                             }
-                        }
                         }
                         Err(e) => {
                             debug!("Band steering: Failed to get APs: {}", e);
@@ -820,6 +883,9 @@ impl Governor {
         for (interface, state) in &self.interface_states {
             let _ = state.tc_manager.remove_cake(interface);
         }
+        
+        // Clean up DSCP tagging
+        let _ = crate::network::cgroups::set_dscp_prioritization(false);
     }
 
     /// Fallback: Get bitrate from `iw` when NetworkManager reports 0

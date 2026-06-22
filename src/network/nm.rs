@@ -136,6 +136,13 @@ trait NetworkManager {
     
     #[zbus(property)]
     fn version(&self) -> zbus::Result<String>;
+
+    fn activate_connection(
+        &self,
+        connection: zbus::zvariant::ObjectPath<'_>,
+        device: zbus::zvariant::ObjectPath<'_>,
+        specific_object: zbus::zvariant::ObjectPath<'_>,
+    ) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
 }
 
 // Device proxy
@@ -152,6 +159,9 @@ trait NmDevice {
     
     #[zbus(property)]
     fn state(&self) -> zbus::Result<u32>;
+
+    #[zbus(property)]
+    fn active_connection(&self) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
 }
 
 // Wireless device proxy
@@ -328,6 +338,26 @@ impl NmClient {
         wireless.request_scan(options).await?;
         debug!("Scan requested for device: {}", device_path);
         
+        Ok(())
+    }
+
+    /// Actively trigger roaming/handover to a specific Access Point BSSID path
+    pub async fn active_roam(&self, device_path: &str, ap_path: &str) -> Result<()> {
+        let device = NmDeviceProxy::builder(&self.connection)
+            .path(device_path)?
+            .build()
+            .await?;
+        
+        let active_conn_path = device.active_connection().await?;
+        
+        let nm = NetworkManagerProxy::new(&self.connection).await?;
+        let _ = nm.activate_connection(
+            zbus::zvariant::ObjectPath::from(active_conn_path),
+            zbus::zvariant::ObjectPath::try_from(device_path)?,
+            zbus::zvariant::ObjectPath::try_from(ap_path)?,
+        ).await?;
+        
+        info!("Proactive handover triggered successfully to AP: {}", ap_path);
         Ok(())
     }
 
