@@ -4,6 +4,35 @@ mod config;
 mod utils;
 
 use anyhow::Result;
+
+const SYSTEMD_SERVICE_CONTENT: &str = r#"[Unit]
+Description=hifi-wifi Network Optimizer
+Documentation=https://github.com/doughty247/hifi-wifi
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/var/lib/hifi-wifi/hifi-wifi monitor
+Restart=on-failure
+RestartSec=5
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Security hardening
+# Note: ProtectSystem cannot be used - we need to write to /etc/modprobe.d, /etc/sysctl.d, /etc/iwd
+ProtectHome=true
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+
+# Resource limits
+MemoryMax=64M
+CPUQuota=10%
+
+[Install]
+WantedBy=multi-user.target
+"#;
+
 use clap::{Parser, Subcommand};
 use log::{info, error, warn};
 use std::path::Path;
@@ -374,13 +403,20 @@ async fn run_monitor(config: &config::structs::Config) -> Result<()> {
     run_apply(config)?;
 
     // Start the Governor
-    let mut governor = Governor::new(config.governor.clone(), config.wifi.clone(), config.power.clone()).await?;
+    let mut governor = Governor::new(
+        config.governor.clone(),
+        config.wifi.clone(),
+        config.power.clone(),
+        config.system.clone(),
+    ).await?;
     
     info!("Governor initialized, entering main loop (tick: {}s)", 
           config.global.tick_rate_secs);
     
-    // Handle graceful shutdown
-    let ctrl_c = tokio::signal::ctrl_c();
+    // Handle graceful shutdown (SIGINT or SIGTERM)
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
     
     tokio::select! {
         result = governor.run(config.global.tick_rate_secs) => {
@@ -388,8 +424,12 @@ async fn run_monitor(config: &config::structs::Config) -> Result<()> {
                 error!("Governor error: {}", e);
             }
         }
-        _ = ctrl_c => {
-            info!("\nReceived shutdown signal");
+        _ = sigint.recv() => {
+            info!("Received SIGINT, shutting down gracefully...");
+            governor.stop();
+        }
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM, shutting down gracefully...");
             governor.stop();
         }
     }
@@ -777,32 +817,7 @@ fn run_install() -> Result<()> {
 
     // Create systemd service
     // Per rewrite.md: Service config with capabilities
-    let service_content = r#"[Unit]
-Description=hifi-wifi Network Optimizer
-Documentation=https://github.com/your-repo/hifi-wifi
-After=network-online.target NetworkManager.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/var/lib/hifi-wifi/hifi-wifi monitor
-Restart=on-failure
-RestartSec=5
-
-# Security hardening
-# Note: ProtectSystem cannot be used - we need to write to /etc/modprobe.d, /etc/sysctl.d, /etc/iwd
-ProtectHome=true
-NoNewPrivileges=false
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
-
-# Resource limits
-MemoryMax=64M
-CPUQuota=10%
-
-[Install]
-WantedBy=multi-user.target
-"#;
+    let service_content = SYSTEMD_SERVICE_CONTENT;
 
     let service_path = std::path::Path::new("/etc/systemd/system/hifi-wifi.service");
     info!("Creating systemd service: {}", service_path.display());
@@ -1329,32 +1344,7 @@ fn run_bootstrap() -> Result<()> {
         info!("Bootstrap: Service file missing (likely after SteamOS update), recreating...");
         
         // Recreate service file
-        let service_content = r#"[Unit]
-Description=hifi-wifi Network Optimizer
-Documentation=https://github.com/doughty247/hifi-wifi
-After=network-online.target NetworkManager.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/var/lib/hifi-wifi/hifi-wifi monitor
-Restart=on-failure
-RestartSec=5
-
-# Security hardening
-# Note: ProtectSystem cannot be used - we need to write to /etc/modprobe.d, /etc/sysctl.d, /etc/iwd
-ProtectHome=true
-NoNewPrivileges=false
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
-
-# Resource limits
-MemoryMax=64M
-CPUQuota=10%
-
-[Install]
-WantedBy=multi-user.target
-"#;
+        let service_content = SYSTEMD_SERVICE_CONTENT;
         
         if let Ok(mut file) = File::create(service_path) {
             let _ = file.write_all(service_content.as_bytes());
@@ -1461,6 +1451,64 @@ fn write_nm_powersave_config(mode: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_valid_mac_override(mac: &str) -> bool {
+    let lower = mac.to_lowercase();
+    if matches!(lower.as_str(), "permanent" | "preserve" | "random" | "stable" | "stable-ssid") {
+        return true;
+    }
+    
+    let parts: Vec<&str> = if mac.contains(':') {
+        mac.split(':').collect()
+    } else if mac.contains('-') {
+        mac.split('-').collect()
+    } else {
+        return false;
+    };
+    
+    if parts.len() != 6 {
+        return false;
+    }
+    
+    for part in parts {
+        if part.len() != 2 {
+            return false;
+        }
+        if !part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    
+    true
+}
+
+fn is_valid_hostname(hostname: &str) -> bool {
+    if hostname.is_empty() || hostname.len() > 20 {
+        return false;
+    }
+    
+    for label in hostname.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        
+        let chars: Vec<char> = label.chars().collect();
+        if !chars[0].is_ascii_alphanumeric() {
+            return false;
+        }
+        if !chars[chars.len() - 1].is_ascii_alphanumeric() {
+            return false;
+        }
+        
+        for c in chars {
+            if !c.is_ascii_alphanumeric() && c != '-' {
+                return false;
+            }
+        }
+    }
+    
+    true
+}
+
 /// Write a NetworkManager config file that persistently controls the WiFi MAC address.
 fn write_nm_mac_config(mac: &Option<String>) -> Result<()> {
     use std::fs::{self, File};
@@ -1469,6 +1517,11 @@ fn write_nm_mac_config(mac: &Option<String>) -> Result<()> {
     let conf_path = std::path::Path::new(NM_MAC_CONF);
 
     if let Some(mac_val) = mac {
+        let mac_val = mac_val.trim();
+        if !is_valid_mac_override(mac_val) {
+            warn!("Invalid wifi_mac_address '{}' configured. Ignoring.", mac_val);
+            return Ok(());
+        }
         let content = format!(
             "# hifi-wifi MAC address configuration\n\
              # Auto-generated by hifi-wifi — do not edit manually\n\
@@ -1514,6 +1567,10 @@ fn apply_system_hostname(hostname_opt: &Option<String>) -> Result<()> {
     if let Some(target_hostname) = hostname_opt {
         let target_hostname = target_hostname.trim();
         if target_hostname.is_empty() {
+            return Ok(());
+        }
+        if !is_valid_hostname(target_hostname) {
+            warn!("Invalid hostname '{}' configured. Ignoring.", target_hostname);
             return Ok(());
         }
 
@@ -1930,5 +1987,32 @@ mod main_tests {
         let parsed: crate::config::structs::Config = toml::from_str(toml_str).unwrap();
         assert_eq!(parsed.wifi.wifi_mac_address, Some("00:11:22:33:44:55".to_string()));
         assert_eq!(parsed.system.hostname, Some("steamdeck".to_string()));
+    }
+
+    #[test]
+    fn test_is_valid_mac_override() {
+        assert!(super::is_valid_mac_override("00:11:22:33:44:55"));
+        assert!(super::is_valid_mac_override("AA-BB-CC-DD-EE-FF"));
+        assert!(super::is_valid_mac_override("stable"));
+        assert!(super::is_valid_mac_override("random"));
+        assert!(!super::is_valid_mac_override("00:11:22:33:44:5"));
+        assert!(!super::is_valid_mac_override("00:11:22:33:44:GG"));
+        assert!(!super::is_valid_mac_override("something_else"));
+    }
+
+    #[test]
+    fn test_is_valid_hostname() {
+        assert!(super::is_valid_hostname("steamdeck"));
+        assert!(super::is_valid_hostname("my-host.local"));
+        assert!(super::is_valid_hostname("fedora-laptop"));
+        assert!(super::is_valid_hostname("fedora-gaming-12345")); // 19 characters - valid
+        assert!(super::is_valid_hostname("fedora-gaming-123456")); // 20 characters - valid
+        assert!(!super::is_valid_hostname("fedora-gaming-1234567")); // 21 characters - invalid
+        assert!(!super::is_valid_hostname("-host"));
+        assert!(!super::is_valid_hostname("host-"));
+        assert!(!super::is_valid_hostname("host;inject"));
+        assert!(!super::is_valid_hostname("host&inject"));
+        assert!(!super::is_valid_hostname("host|inject"));
+        assert!(!super::is_valid_hostname("host$(inject)"));
     }
 }

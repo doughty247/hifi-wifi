@@ -53,6 +53,9 @@ struct InterfaceState {
     eee_enabled: Option<bool>,
     eee_stable_ticks: u32,
     pending_eee: Option<bool>,
+    aspm_performance: Option<bool>,
+    aspm_stable_ticks: u32,
+    pending_aspm: Option<bool>,
     /// Last known bytes for throughput calculation
     last_rx_bytes: u64,
     last_tx_bytes: u64,
@@ -73,6 +76,9 @@ impl InterfaceState {
                 config.cake_change_threshold_pct,
                 config.cake_hysteresis_up,
                 config.cake_hysteresis_down,
+                config.qos_use_ifb,
+                config.internet_download_mbit,
+                config.internet_upload_mbit,
             ),
             roam_candidate: None,
             game_mode_until: None,
@@ -85,6 +91,9 @@ impl InterfaceState {
             eee_enabled: None,
             eee_stable_ticks: 0,
             pending_eee: None,
+            aspm_performance: None,
+            aspm_stable_ticks: 0,
+            pending_aspm: None,
             last_rx_bytes: 0,
             last_tx_bytes: 0,
             last_stats_time: None,
@@ -99,6 +108,7 @@ pub struct Governor {
     config: GovernorConfig,
     wifi_config: WifiConfig,
     power_config: PowerConfig,
+    system_config: crate::config::structs::SystemConfig,
     nm_client: NmClient,
     cpu_monitor: CpuMonitor,
     power_manager: PowerManager,
@@ -112,7 +122,12 @@ pub struct Governor {
 
 impl Governor {
     /// Create a new Governor with the given configuration
-    pub async fn new(config: GovernorConfig, wifi_config: WifiConfig, power_config: PowerConfig) -> Result<Self> {
+    pub async fn new(
+        config: GovernorConfig,
+        wifi_config: WifiConfig,
+        power_config: PowerConfig,
+        system_config: crate::config::structs::SystemConfig,
+    ) -> Result<Self> {
         let nm_client = NmClient::new().await?;
         let cpu_monitor = CpuMonitor::new(config.cpu_avg_window_size);
         let power_manager = PowerManager::new();
@@ -123,6 +138,7 @@ impl Governor {
             config,
             wifi_config,
             power_config,
+            system_config,
             nm_client,
             cpu_monitor,
             power_manager,
@@ -195,6 +211,7 @@ impl Governor {
                         match event_res {
                             Ok(_) => {
                                 info!("Netlink event detected - running immediate tick");
+                                self.reapply_irq_affinity();
                             }
                             Err(e) => {
                                 warn!("Netlink listener error: {}", e);
@@ -269,6 +286,8 @@ impl Governor {
         info!("Waiting 1s for link to stabilize...");
         tokio::time::sleep(Duration::from_secs(1)).await;
         
+        self.reapply_irq_affinity();
+        
         // FIX for Issue #15: Force immediate CAKE application after reconnection
         // Don't wait for warmup samples - apply with conservative 100Mbit default
         info!("Forcing immediate CAKE application on all interfaces (warmup bypass)");
@@ -292,6 +311,31 @@ impl Governor {
         }
         
         info!("Post-reconnect optimization complete");
+    }
+
+    /// Re-evaluate and re-apply sysfs IRQ affinity paths after link events
+    fn reapply_irq_affinity(&self) {
+        if self.system_config.irq_affinity_enabled {
+            info!("Re-evaluating and applying sysfs IRQ paths after link/connection event...");
+            let interfaces = self.wifi_manager.interfaces();
+            let sys_opt = crate::system::optimizer::SystemOptimizer::new(
+                self.system_config.sysctl_enabled,
+                self.system_config.irq_affinity_enabled,
+                self.system_config.driver_tweaks_enabled,
+            );
+            let active_interfaces: Vec<crate::network::wifi::WifiInterface> = interfaces
+                .iter()
+                .filter(|ifc| self.wifi_manager.is_interface_connected(ifc))
+                .cloned()
+                .collect();
+            if !active_interfaces.is_empty() {
+                if let Err(e) = sys_opt.apply(&active_interfaces) {
+                    warn!("Failed to re-apply system optimizations after link event: {}", e);
+                } else {
+                    info!("Successfully re-applied system optimizations.");
+                }
+            }
+        }
     }
 
     /// Single tick of the governor loop
@@ -325,10 +369,9 @@ impl Governor {
         // Ensure interface states exist
         for (interface, _, _, _) in &device_infos {
             if !self.interface_states.contains_key(interface) {
-                self.interface_states.insert(
-                    interface.clone(), 
-                    InterfaceState::new(&self.config)
-                );
+                let state = InterfaceState::new(&self.config);
+                let _ = state.tc_manager.remove_cake(interface);
+                self.interface_states.insert(interface.clone(), state);
             }
         }
 
@@ -428,6 +471,9 @@ impl Governor {
                             state.tc_manager.enter_game_mode();
                             info!("Game mode ACTIVATED: {} PPS on {} (CAKE frozen)", pps, interface);
                             let _ = crate::network::cgroups::set_dscp_prioritization(true);
+                            if self.config.breathing_cake_enabled {
+                                let _ = state.tc_manager.apply_cake(&interface);
+                            }
                         } else {
                             debug!("Game mode extended: {} PPS on {}", pps, interface);
                         }
@@ -441,6 +487,9 @@ impl Governor {
                             state.tc_manager.exit_game_mode();
                             info!("Game mode ENDED on {} (CAKE unfrozen)", interface);
                             let _ = crate::network::cgroups::set_dscp_prioritization(false);
+                            if self.config.breathing_cake_enabled {
+                                let _ = state.tc_manager.remove_cake(&interface);
+                            }
                         }
                     }
                 }
@@ -474,6 +523,11 @@ impl Governor {
                 };
                 
                 if let Some(state) = self.interface_states.get_mut(&interface) {
+                    let is_in_game = state.game_mode_until
+                        .map(|until| Instant::now() < until)
+                        .unwrap_or(false);
+                    let should_apply_cake = !self.config.game_mode_enabled || is_in_game;
+
                     // Update throughput estimate from actual traffic
                     Self::update_throughput_estimate(state, &interface);
                     
@@ -501,7 +555,9 @@ impl Governor {
                                nm_bitrate, iw_bitrate, effective_bitrate, scaled_mbit);
                         
                         if state.tc_manager.update_bandwidth(scaled_mbit) {
-                            let _ = state.tc_manager.apply_cake(&interface);
+                            if should_apply_cake {
+                                let _ = state.tc_manager.apply_cake(&interface);
+                            }
                         }
                         state.bandwidth_valid = true;
                     } else if let Some(last_good) = state.last_good_bitrate {
@@ -526,7 +582,9 @@ impl Governor {
                                nm_bitrate, iw_bitrate, last_good, scaled_mbit);
                         
                         if state.tc_manager.update_bandwidth(scaled_mbit) {
-                            let _ = state.tc_manager.apply_cake(&interface);
+                            if should_apply_cake {
+                                let _ = state.tc_manager.apply_cake(&interface);
+                            }
                         }
                         state.bandwidth_valid = true;
                     } else {
@@ -542,7 +600,9 @@ impl Governor {
                         }
                         
                         if state.tc_manager.update_bandwidth(scaled_mbit) {
-                            let _ = state.tc_manager.apply_cake(&interface);
+                            if should_apply_cake {
+                                let _ = state.tc_manager.apply_cake(&interface);
+                            }
                         }
                         state.bandwidth_valid = true;
                     }
@@ -603,6 +663,10 @@ impl Governor {
             // 5b. Power Save Management - respects config mode
             // "off"/"on" = user override (skip adaptive logic entirely)
             // "adaptive" = original hysteresis logic based on AC/battery/activity
+            let battery_pct = self.power_manager.battery_percentage();
+            let is_critical_battery = self.power_config.critical_battery_pct > 0
+                && battery_pct.map(|pct| pct <= self.power_config.critical_battery_pct).unwrap_or(false);
+
             {
                 let power_mode = self.power_config.wlan_power_save.as_str();
 
@@ -636,7 +700,7 @@ impl Governor {
                         }
                     }
                     _ => {
-                        // "adaptive" — original hysteresis logic, unchanged
+                        // "adaptive" — original hysteresis logic, with critical battery override
                         let base_should_enable = self.power_manager.should_enable_power_save();
 
                         if let Some(state) = self.interface_states.get_mut(&interface) {
@@ -651,10 +715,16 @@ impl Governor {
                             // 1. On AC power, OR
                             // 2. Game mode active, OR
                             // 3. Any significant network activity (>50 PPS)
-                            let should_enable = base_should_enable && !in_game && !has_network_activity;
+                            // EXCEPT if we are in a critical battery state (where we force it ON)
+                            let should_enable = if is_critical_battery {
+                                true
+                            } else {
+                                base_should_enable && !in_game && !has_network_activity
+                            };
 
-                            // Hysteresis: require 3 stable ticks before changing power save
-                            // This prevents AC/battery flapping from causing jitter
+                            // Hysteresis: require stable ticks before changing power save
+                            // Entering performance mode (power-save OFF) is instant (1 tick) to eliminate latency immediately.
+                            // Entering power-save mode (power-save ON) requires 5 stable ticks (10s) to survive game loading screens.
                             if state.power_save_enabled != Some(should_enable) {
                                 if state.pending_power_save == Some(should_enable) {
                                     state.power_save_stable_ticks += 1;
@@ -663,13 +733,18 @@ impl Governor {
                                     state.power_save_stable_ticks = 1;
                                 }
 
-                                // Apply after 3 stable ticks (6 seconds) to avoid brief AC disconnects
-                                if state.power_save_stable_ticks >= 3 {
+                                let target_ticks = if should_enable { 5 } else { 1 };
+                                if state.power_save_stable_ticks >= target_ticks {
                                     let wifi_interfaces = self.wifi_manager.interfaces();
                                     if let Some(wifi_ifc) = wifi_interfaces.iter().find(|i| i.name == interface) {
                                         if should_enable {
                                             if let Ok(_) = self.wifi_manager.enable_power_save(wifi_ifc) {
-                                                info!("Power save ENABLED on {} (battery, idle)", interface);
+                                                let reason = if is_critical_battery {
+                                                    format!("critical battery {}%", battery_pct.unwrap_or(0))
+                                                } else {
+                                                    "battery, idle".to_string()
+                                                };
+                                                info!("Power save ENABLED on {} ({})", interface, reason);
                                                 state.power_save_enabled = Some(true);
                                             }
                                         } else {
@@ -713,10 +788,16 @@ impl Governor {
                                 .unwrap_or(false);
                             
                             // Enable EEE only on battery AND idle (no game, no network activity)
-                            // Otherwise disable for minimum latency
-                            let should_enable = base_should_enable && !in_game && !has_network_activity;
+                            // EXCEPT if we are in a critical battery state (where we force it ON)
+                            let should_enable = if is_critical_battery {
+                                true
+                            } else {
+                                base_should_enable && !in_game && !has_network_activity
+                            };
                             
-                            // Hysteresis: require 3 stable ticks before changing EEE
+                            // Hysteresis: require stable ticks before changing EEE
+                            // Entering performance mode (EEE OFF) is instant (1 tick) to prevent wakeup latency.
+                            // Entering power-saving mode (EEE ON) requires 5 stable ticks (10s) to survive load screens.
                             if state.eee_enabled != Some(should_enable) {
                                 if state.pending_eee == Some(should_enable) {
                                     state.eee_stable_ticks += 1;
@@ -725,11 +806,16 @@ impl Governor {
                                     state.eee_stable_ticks = 1;
                                 }
                                 
-                                // Apply after 3 stable ticks (6 seconds)
-                                if state.eee_stable_ticks >= 3 {
+                                let target_ticks = if should_enable { 5 } else { 1 };
+                                if state.eee_stable_ticks >= target_ticks {
                                     if should_enable {
                                         if let Ok(_) = EthtoolManager::enable_eee(&interface) {
-                                            info!("EEE ENABLED on {} (battery, idle)", interface);
+                                            let reason = if is_critical_battery {
+                                                format!("critical battery {}%", battery_pct.unwrap_or(0))
+                                            } else {
+                                                "battery, idle".to_string()
+                                            };
+                                            info!("EEE ENABLED on {} ({})", interface, reason);
                                             state.eee_enabled = Some(true);
                                         }
                                     } else {
@@ -750,6 +836,53 @@ impl Governor {
                                 state.eee_stable_ticks = 0;
                             }
                         }
+                    }
+                }
+            }
+
+            // 5d. PCIe ASPM & Runtime PM Management - Dynamic based on activity/power source
+            if self.power_config.dynamic_aspm {
+                let base_should_enable = self.power_manager.should_enable_power_save();
+                
+                if let Some(state) = self.interface_states.get_mut(&interface) {
+                    let in_game = state.game_mode_until
+                        .map(|until| Instant::now() < until)
+                        .unwrap_or(false);
+
+                    // ASPM Performance mode is enabled if:
+                    // 1. On AC power (base_should_enable is false), OR
+                    // 2. In game mode.
+                    // EXCEPT if we are in a critical battery state.
+                    let should_aspm_performance = !is_critical_battery && (!base_should_enable || in_game);
+
+                    if state.aspm_performance != Some(should_aspm_performance) {
+                        if state.pending_aspm == Some(should_aspm_performance) {
+                            state.aspm_stable_ticks += 1;
+                        } else {
+                            state.pending_aspm = Some(should_aspm_performance);
+                            state.aspm_stable_ticks = 1;
+                        }
+
+                        // Entering performance mode (ASPM OFF) is instant (1 tick) to restore performance.
+                        // Restoring ASPM power-save (ASPM ON) requires 5 stable ticks (10s) to survive load screens.
+                        let target_ticks = if should_aspm_performance { 1 } else { 5 };
+                        if state.aspm_stable_ticks >= target_ticks {
+                            let _ = crate::system::optimizer::SystemOptimizer::apply_pcie_aspm_sysfs(&interface, should_aspm_performance);
+                            let reason = if is_critical_battery {
+                                format!("critical battery {}%", battery_pct.unwrap_or(0))
+                            } else if should_aspm_performance {
+                                if in_game { "game mode".to_string() } else { "AC power".to_string() }
+                            } else {
+                                "battery, idle".to_string()
+                            };
+                            info!("PCIe ASPM state changed on {} to performance={} (reason: {})", interface, should_aspm_performance, reason);
+                            state.aspm_performance = Some(should_aspm_performance);
+                            state.pending_aspm = None;
+                            state.aspm_stable_ticks = 0;
+                        }
+                    } else {
+                        state.pending_aspm = None;
+                        state.aspm_stable_ticks = 0;
                     }
                 }
             }

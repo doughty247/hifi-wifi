@@ -85,21 +85,29 @@ pub struct PowerConfig {
     pub enabled: bool,
     #[serde(default = "default_adaptive")]
     pub wlan_power_save: String, // "on", "off", "adaptive"
+    #[serde(default = "default_critical_battery")]
+    pub critical_battery_pct: u32,
+    #[serde(default = "default_dynamic_aspm")]
+    pub dynamic_aspm: bool,
 }
 
 fn default_true() -> bool { true }
 fn default_adaptive() -> String { "adaptive".to_string() }
+fn default_critical_battery() -> u32 { 15 }
+fn default_dynamic_aspm() -> bool { true }
 
 impl Default for PowerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             wlan_power_save: "adaptive".to_string(),
+            critical_battery_pct: 15,
+            dynamic_aspm: true,
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SystemConfig {
     pub sysctl_enabled: bool,
@@ -181,6 +189,13 @@ pub struct GovernorConfig {
     /// - Adaptive: Suppress when gaming or signal is good; allow when signal is weak or during wake/boot grace periods.
     #[serde(default = "default_scan_suppress")]
     pub scan_suppress: ScanSuppressMode,
+    
+    /// Enable virtual IFB redirection for ingress (download) shaping
+    pub qos_use_ifb: bool,
+    /// Configured internet download limit in Mbit/s (optional)
+    pub internet_download_mbit: Option<u32>,
+    /// Configured internet upload limit in Mbit/s (optional)
+    pub internet_upload_mbit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,7 +254,7 @@ fn default_scan_suppress() -> ScanSuppressMode {
 impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
-            breathing_cake_enabled: true,
+            breathing_cake_enabled: false,
             cake_median_window: 3,             // 3 samples = 6 seconds (reduced from 5)
             cake_change_threshold_mbit: 15,    // Reduced from 25 for better responsiveness
             cake_change_threshold_pct: 0.15,   // Reduced from 20% to 15%
@@ -261,6 +276,9 @@ impl Default for GovernorConfig {
             cpu_avg_window_size: 3,
             
             scan_suppress: ScanSuppressMode::Adaptive,
+            qos_use_ifb: true,
+            internet_download_mbit: None,
+            internet_upload_mbit: None,
         }
     }
 }

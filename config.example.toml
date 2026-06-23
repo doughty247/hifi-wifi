@@ -13,6 +13,16 @@ enabled = true
 #   "on" - ALWAYS enabled (battery saving, may cause lag)
 wlan_power_save = "adaptive"
 
+# Force power save and EEE ON if battery drops below this threshold (0-100)
+# Helps prevent the device from dying in the middle of gameplay.
+# Set to 0 to disable critical battery override.
+critical_battery_pct = 15
+
+# Automatically toggles PCIe Active State Power Management (ASPM) at runtime:
+#   true (default) - Disable ASPM for 0ms wakeup latency during Game Mode, restore to auto when idle
+#   false - Keep initial static system ASPM configuration
+dynamic_aspm = true
+
 [wifi]
 enabled = true
 # Signal thresholds for band steering (dBm)
@@ -41,13 +51,24 @@ iwd_periodic_scan_disable = true
 
 [governor]
 # Breathing CAKE (dynamic bandwidth adjustment)
-breathing_cake_enabled = true
+# Note: Defaults to false. Modern Linux Wi-Fi drivers have native FQ-CoDel + EDCA priority.
+# Enable if you want local software-based shaping at the cost of 15% throughput overhead.
+breathing_cake_enabled = false
 cake_median_window = 3
 cake_change_threshold_mbit = 15
 cake_change_threshold_pct = 0.15
 cake_overhead_factor = 0.85
 cake_hysteresis_up = 3    # Slow increases (prevent oscillation)
 cake_hysteresis_down = 1  # Fast decreases (prevent bufferbloat)
+
+# Intermediate Functional Block (IFB) redirection for ingress (download) shaping.
+# Keeps the root physical interface qdisc as mq (preserving EDCA) while shaping in software.
+qos_use_ifb = true
+
+# Internet limits (Mbit/s). Optional - if omitted, it defaults to the dynamic wireless link rate.
+# Specifying your actual internet speeds is highly recommended for proper bufferbloat prevention.
+# internet_download_mbit = 100
+# internet_upload_mbit = 20
 
 # Game Mode Detection
 game_mode_enabled = true

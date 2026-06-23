@@ -37,7 +37,7 @@ impl SystemOptimizer {
             for ifc in interfaces {
                 self.apply_driver_config(&ifc.category)?;
                 if ifc.interface_type == InterfaceType::Wifi {
-                    if let Err(e) = self.apply_pcie_aspm_sysfs(&ifc.name, true) {
+                    if let Err(e) = Self::apply_pcie_aspm_sysfs(&ifc.name, true) {
                         warn!("Failed to disable PCIe ASPM sysfs for {}: {}", ifc.name, e);
                     }
                 }
@@ -334,7 +334,7 @@ options mwifiex disable_auto_ds=1
     }
 
     /// Enable (disable ASPM / enforce power on) or disable (restore ASPM / auto power) PCIe ASPM for the interface
-    fn apply_pcie_aspm_sysfs(&self, iface_name: &str, enable: bool) -> Result<()> {
+    pub fn apply_pcie_aspm_sysfs(iface_name: &str, enable: bool) -> Result<()> {
         let device_path = format!("/sys/class/net/{}/device", iface_name);
         let device_path = match fs::canonicalize(&device_path) {
             Ok(p) => p,
@@ -401,7 +401,7 @@ options mwifiex disable_auto_ds=1
                 if Path::new(&device_path).exists() {
                     let phy_path = format!("/sys/class/net/{}/phy80211", iface_name);
                     if Path::new(&phy_path).exists() || iface_name.starts_with('w') {
-                        let _ = self.apply_pcie_aspm_sysfs(&iface_name, false);
+                        let _ = Self::apply_pcie_aspm_sysfs(&iface_name, false);
                     }
                 }
             }

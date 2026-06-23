@@ -146,6 +146,12 @@ pub struct TcManager {
     frozen_bandwidth: Option<u32>,
     /// Throughput-based bandwidth estimate (bytes/sec monitoring)
     throughput_bandwidth: Option<u32>,
+    /// Whether to use IFB for ingress shaping
+    qos_use_ifb: bool,
+    /// Configured internet download limit (Mbit)
+    internet_download_mbit: Option<u32>,
+    /// Configured internet upload limit (Mbit)
+    internet_upload_mbit: Option<u32>,
 }
 
 impl TcManager {
@@ -155,7 +161,41 @@ impl TcManager {
         threshold_pct: f64,
         hysteresis_up: u32,
         hysteresis_down: u32,
+        qos_use_ifb: bool,
+        internet_download_mbit: Option<u32>,
+        internet_upload_mbit: Option<u32>,
     ) -> Self {
+        let mut resolved_qos_use_ifb = qos_use_ifb;
+        if resolved_qos_use_ifb {
+            let status = Command::new("modprobe")
+                .args(["--dry-run", "ifb"])
+                .status();
+            let is_available = match status {
+                Ok(s) => s.success(),
+                Err(_) => false,
+            };
+            if !is_available {
+                warn!("The 'ifb' kernel module is not available on this system. Ingress (download) shaping fallback disabled.");
+                resolved_qos_use_ifb = false;
+            } else {
+                let load_status = Command::new("modprobe")
+                    .args(["ifb", "numifbs=1"])
+                    .status();
+                match load_status {
+                    Ok(s) => {
+                        if !s.success() {
+                            warn!("Failed to load 'ifb' kernel module (exit code: {}). Ingress (download) shaping fallback disabled.", s);
+                            resolved_qos_use_ifb = false;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to execute modprobe to load 'ifb': {}. Ingress (download) shaping fallback disabled.", e);
+                        resolved_qos_use_ifb = false;
+                    }
+                }
+            }
+        }
+
         Self {
             last_bandwidth: None,
             sample_window: VecDeque::with_capacity(window_size + 2),
@@ -170,6 +210,9 @@ impl TcManager {
             game_mode_frozen: false,
             frozen_bandwidth: None,
             throughput_bandwidth: None,
+            qos_use_ifb: resolved_qos_use_ifb,
+            internet_download_mbit,
+            internet_upload_mbit,
         }
     }
 
@@ -329,52 +372,182 @@ impl TcManager {
         self.median().unwrap_or(200).max(10)
     }
 
-    /// Apply CAKE qdisc to interface
+    /// Apply CAKE qdisc to interface (with IFB ingress redirection if enabled)
     pub fn apply_cake(&mut self, interface: &str) -> Result<()> {
         if !is_tc_available() {
             debug!("Skipping CAKE application on {} (tc not available)", interface);
             return Ok(());
         }
-        let bandwidth_mbit = self.get_target_bandwidth();
-        
-        info!("Applying CAKE on {} with {}mbit bandwidth", interface, bandwidth_mbit);
-        
+
+        // Determine upload and download bandwidths.
+        // If internet upload/download limits are set, use them. Otherwise fall back to PHY rate.
+        let dynamic_bandwidth = self.get_target_bandwidth();
+        let upload_limit = self.internet_upload_mbit.unwrap_or(dynamic_bandwidth);
+        let download_limit = self.internet_download_mbit.unwrap_or(dynamic_bandwidth);
+
+        // 1. Ingress Shaping via IFB (Download)
+        if self.qos_use_ifb {
+            info!("Applying IFB ingress redirection and CAKE on {} (download limit: {}mbit)", interface, download_limit);
+            
+            // Load ifb module (ignore failure if already loaded)
+            let _ = Command::new("modprobe")
+                .args(["ifb", "numifbs=1"])
+                .output();
+
+            // Set ifb0 device UP
+            let _ = Command::new("ip")
+                .args(["link", "set", "dev", "ifb0", "up"])
+                .output();
+
+            // Clear any existing ingress qdisc on physical interface to start fresh
+            let _ = Command::new("tc")
+                .args(["qdisc", "del", "dev", interface, "ingress"])
+                .output();
+
+            // Add ingress qdisc to physical interface
+            let output = Command::new("tc")
+                .args(["qdisc", "add", "dev", interface, "handle", "ffff:", "ingress"])
+                .output();
+
+            if let Ok(out) = output {
+                if out.status.success() {
+                    // Redirect ingress traffic of physical interface to ifb0
+                    let output = Command::new("tc")
+                        .args([
+                            "filter", "add", "dev", interface, "parent", "ffff:",
+                            "matchall", "action", "mirred", "egress", "redirect", "dev", "ifb0"
+                        ])
+                        .output();
+                    
+                    if let Ok(out_filter) = output {
+                        if out_filter.status.success() {
+                            // Apply CAKE on ifb0 (for download shaping)
+                            let rtt = detect_gateway_rtt();
+                            let output = Command::new("tc")
+                                .args([
+                                    "qdisc", "replace", "dev", "ifb0", "root", "cake",
+                                    "bandwidth", &format!("{}mbit", download_limit),
+                                    "rtt", &rtt,
+                                    "diffserv4",
+                                    "dual-dsthost",
+                                    "nat",
+                                    "wash",
+                                    "ack-filter",
+                                ])
+                                .output();
+                            
+                            if let Ok(out_cake) = output {
+                                if out_cake.status.success() {
+                                    info!("Ingress CAKE applied successfully on ifb0");
+                                } else {
+                                    let stderr = String::from_utf8_lossy(&out_cake.stderr);
+                                    warn!("Failed to apply CAKE on ifb0: {}", stderr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Egress Shaping (Upload)
+        // Check number of TX queues on the interface: /sys/class/net/<interface>/queues/tx-*
+        let mut tx_queues = 1;
+        if let Ok(entries) = std::fs::read_dir(format!("/sys/class/net/{}/queues", interface)) {
+            let count = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("tx-"))
+                .count();
+            if count > 0 {
+                tx_queues = count;
+            }
+        }
+
+        info!("Applying egress CAKE on {} (upload limit: {}mbit, TX queues: {})", interface, upload_limit, tx_queues);
+
+        if tx_queues > 1 {
+            // Apply mq as root qdisc (preserving EDCA)
+            let output = Command::new("tc")
+                .args(["qdisc", "replace", "dev", interface, "root", "handle", "1:", "mq"])
+                .output()
+                .context("Failed to apply mq root qdisc")?;
+
+            if output.status.success() {
+                // Apply CAKE on each queue parent under mq
+                let rtt = detect_gateway_rtt();
+                for q in 1..=tx_queues {
+                    let parent_id = format!("1:{}", q);
+                    let output = Command::new("tc")
+                        .args([
+                            "qdisc", "replace", "dev", interface, "parent", &parent_id, "cake",
+                            "bandwidth", &format!("{}mbit", upload_limit),
+                            "rtt", &rtt,
+                            "diffserv4",
+                            "dual-dsthost",
+                            "nat",
+                            "wash",
+                            "ack-filter",
+                        ])
+                        .output();
+
+                    if let Ok(out_cake) = output {
+                        if !out_cake.status.success() {
+                            let stderr = String::from_utf8_lossy(&out_cake.stderr);
+                            warn!("Failed to apply CAKE to parent {} on {}: {}", parent_id, interface, stderr);
+                        }
+                    }
+                }
+                info!("Egress MQ+CAKE applied successfully on {}", interface);
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!("Failed to apply mq root on {}: {}", interface, stderr);
+                // Fallback to direct root CAKE if mq fails
+                self.apply_root_cake_fallback(interface, upload_limit)?;
+            }
+        } else {
+            // Single TX queue: apply CAKE directly as root
+            self.apply_root_cake_fallback(interface, upload_limit)?;
+        }
+
+        self.last_bandwidth = Some(dynamic_bandwidth);
+        Ok(())
+    }
+
+    fn apply_root_cake_fallback(&self, interface: &str, bandwidth_mbit: u32) -> Result<()> {
+        let rtt = detect_gateway_rtt();
         let output = Command::new("tc")
             .args([
                 "qdisc", "replace", "dev", interface, "root", "cake",
                 "bandwidth", &format!("{}mbit", bandwidth_mbit),
-                "rtt", &detect_gateway_rtt(),
-                "diffserv4",      // Differentiated services
-                "dual-dsthost",   // Fair queuing per destination
-                "nat",            // NAT awareness
-                "wash",           // Clear DSCP on ingress
-                "ack-filter",     // ACK filtering
+                "rtt", &rtt,
+                "diffserv4",
+                "dual-dsthost",
+                "nat",
+                "wash",
+                "ack-filter",
             ])
             .output()
-            .context("Failed to execute tc command")?;
+            .context("Failed to execute fallback tc command")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("tc failed: {}", stderr);
+            warn!("Fallback tc failed: {}", stderr);
             
-            // Fallback to simpler CAKE config
+            // Simpler CAKE config
             let output = Command::new("tc")
                 .args([
                     "qdisc", "replace", "dev", interface, "root", "cake",
                     "bandwidth", &format!("{}mbit", bandwidth_mbit),
-                    "rtt", &detect_gateway_rtt(),
+                    "rtt", &rtt,
                     "besteffort", "nat",
                 ])
                 .output()?;
             
             if !output.status.success() {
-                anyhow::bail!("Failed to apply CAKE qdisc");
+                anyhow::bail!("Failed to apply fallback CAKE qdisc");
             }
         }
-
-        self.last_bandwidth = Some(bandwidth_mbit);
-        info!("CAKE applied successfully: {}mbit on {}", bandwidth_mbit, interface);
-        
+        info!("Fallback root CAKE applied successfully: {}mbit on {}", bandwidth_mbit, interface);
         Ok(())
     }
 
@@ -383,17 +556,51 @@ impl TcManager {
         if !is_tc_available() {
             return Ok(());
         }
+
+        // 1. Clean up egress (root) qdisc on physical interface
         let output = Command::new("tc")
             .args(["qdisc", "del", "dev", interface, "root"])
             .output();
         
-        // Ignore errors (may not have qdisc)
         if let Ok(o) = output {
             if o.status.success() {
-                info!("Removed CAKE from {}", interface);
+                info!("Removed root qdisc from {}", interface);
             }
         }
+
+        // Check if this was a multi-queue interface and restore mq
+        let mut tx_queues = 1;
+        if let Ok(entries) = std::fs::read_dir(format!("/sys/class/net/{}/queues", interface)) {
+            let count = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("tx-"))
+                .count();
+            if count > 0 {
+                tx_queues = count;
+            }
+        }
+
+        if tx_queues > 1 {
+            info!("Restoring default mq root qdisc on {}", interface);
+            let _ = Command::new("tc")
+                .args(["qdisc", "replace", "dev", interface, "root", "handle", "1:", "mq"])
+                .output();
+        }
+
+        // 2. Clean up ingress redirection (if used)
+        let _ = Command::new("tc")
+            .args(["qdisc", "del", "dev", interface, "ingress"])
+            .output();
+
+        let _ = Command::new("ip")
+            .args(["link", "set", "dev", "ifb0", "down"])
+            .output();
+
+        let _ = Command::new("tc")
+            .args(["qdisc", "del", "dev", "ifb0", "root"])
+            .output();
         
+        info!("Cleaned up ingress redirect for {}", interface);
         Ok(())
     }
 
@@ -476,7 +683,7 @@ impl EthtoolManager {
 impl Default for TcManager {
     fn default() -> Self {
         // Defaults: 3 sample window, 15Mbit/15% threshold, 3 ticks up, 1 tick down
-        Self::new(3, 15, 0.15, 3, 1)
+        Self::new(3, 15, 0.15, 3, 1, false, None, None)
     }
 }
 
@@ -487,7 +694,7 @@ mod tests {
     #[test]
     fn test_median_filtering() {
         // 3 window, 15mbit/15% threshold, 3 up / 1 down hysteresis
-        let mut tc = TcManager::new(3, 15, 0.15, 3, 1);
+        let mut tc = TcManager::new(3, 15, 0.15, 3, 1, false, None, None);
         
         // First sample - warming up (need 2 min)
         assert!(!tc.update_bandwidth(100)); // Sample 1 - warming
@@ -511,7 +718,7 @@ mod tests {
 
     #[test]
     fn test_asymmetric_hysteresis() {
-        let mut tc = TcManager::new(3, 15, 0.15, 3, 1); // 3 up, 1 down
+        let mut tc = TcManager::new(3, 15, 0.15, 3, 1, false, None, None); // 3 up, 1 down
         
         // Warm up and apply initial
         tc.update_bandwidth(100);

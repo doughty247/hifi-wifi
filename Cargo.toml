@@ -1,6 +1,6 @@
 [package]
 name = "hifi-wifi"
-version = "3.1.0-dev"
+version = "3.1.0"
 edition = "2021"
 
 [dependencies]

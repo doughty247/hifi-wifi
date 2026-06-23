@@ -4,7 +4,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION=$(grep '^version' "$SCRIPT_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')
 GIT_HASH=$(git rev-parse --short HEAD)
-PACKAGE_NAME="hifi-wifi-${VERSION%%-*}-${GIT_HASH}"
+PACKAGE_NAME="hifi-wifi-${VERSION%%-*}-${GIT_HASH}-final"
 BUILD_DIR="$SCRIPT_DIR/release-build"
 PACKAGE_DIR="$BUILD_DIR/$PACKAGE_NAME"
 
