@@ -69,10 +69,10 @@ impl Default for WifiConfig {
             enabled: true,
             // Per-band thresholds: 5GHz/6GHz need stronger signals due to path loss
             min_signal_2g_dbm: -75,
-            min_signal_5g_dbm: -72,  // 5GHz: slightly stricter
-            min_signal_6g_dbm: -70,  // 6GHz: even stricter (higher path loss)
-            band_bias_5ghz: 15,  // Per rewrite.md
-            band_bias_6ghz: 25,  // Higher than 5GHz - 6GHz has less interference, better for gaming
+            min_signal_5g_dbm: -72, // 5GHz: slightly stricter
+            min_signal_6g_dbm: -70, // 6GHz: even stricter (higher path loss)
+            band_bias_5ghz: 15,     // Per rewrite.md
+            band_bias_6ghz: 25, // Higher than 5GHz - 6GHz has less interference, better for gaming
             wifi_mac_address: None,
         }
     }
@@ -91,10 +91,18 @@ pub struct PowerConfig {
     pub dynamic_aspm: bool,
 }
 
-fn default_true() -> bool { true }
-fn default_adaptive() -> String { "adaptive".to_string() }
-fn default_critical_battery() -> u32 { 15 }
-fn default_dynamic_aspm() -> bool { true }
+fn default_true() -> bool {
+    true
+}
+fn default_adaptive() -> String {
+    "adaptive".to_string()
+}
+fn default_critical_battery() -> u32 {
+    15
+}
+fn default_dynamic_aspm() -> bool {
+    true
+}
 
 impl Default for PowerConfig {
     fn default() -> Self {
@@ -160,7 +168,7 @@ pub struct GovernorConfig {
     pub cake_hysteresis_up: u32,
     /// Hysteresis ticks for bandwidth DECREASES (fast, prevents bufferbloat)
     pub cake_hysteresis_down: u32,
-    
+
     /// Enable game mode detection via PPS
     pub game_mode_enabled: bool,
     /// PPS threshold to trigger game mode
@@ -169,17 +177,17 @@ pub struct GovernorConfig {
     pub game_mode_cooldown_secs: u64,
     /// Freeze CAKE during game mode (prevents mid-game jitter)
     pub game_mode_freeze_cake: bool,
-    
+
     /// Enable smart band steering
     pub band_steering_enabled: bool,
     /// Hysteresis ticks before roaming (consecutive ticks required)
     pub roam_hysteresis_ticks: u32,
-    
+
     /// Enable CPU-based interrupt coalescing
     pub cpu_coalescing_enabled: bool,
     /// CPU load threshold for coalescing (0.0-1.0)
     pub cpu_coalescing_threshold: f64,
-    
+
     /// Rolling average window size for CPU monitoring
     pub cpu_avg_window_size: usize,
 
@@ -189,13 +197,22 @@ pub struct GovernorConfig {
     /// - Adaptive: Suppress when gaming or signal is good; allow when signal is weak or during wake/boot grace periods.
     #[serde(default = "default_scan_suppress")]
     pub scan_suppress: ScanSuppressMode,
-    
+
     /// Enable virtual IFB redirection for ingress (download) shaping
     pub qos_use_ifb: bool,
     /// Configured internet download limit in Mbit/s (optional)
     pub internet_download_mbit: Option<u32>,
     /// Configured internet upload limit in Mbit/s (optional)
     pub internet_upload_mbit: Option<u32>,
+
+    /// Enable eBPF-based bypass for game UDP streams
+    pub ebpf_bypass_enabled: bool,
+    /// Enable predictive multipath bonding / duplication
+    pub multipath_bonding_enabled: bool,
+    /// Packet loss threshold for multipath activation (0.0 - 1.0)
+    pub multipath_packet_loss_threshold: f64,
+    /// Jitter threshold for multipath activation (ms)
+    pub multipath_jitter_threshold_ms: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,7 +255,10 @@ impl<'de> Deserialize<'de> for ScanSuppressMode {
                     "on" | "true" | "yes" => Ok(ScanSuppressMode::On),
                     "off" | "false" | "no" => Ok(ScanSuppressMode::Off),
                     "adaptive" => Ok(ScanSuppressMode::Adaptive),
-                    _ => Err(serde::de::Error::custom(format!("invalid scan suppress mode: {}", v))),
+                    _ => Err(serde::de::Error::custom(format!(
+                        "invalid scan suppress mode: {}",
+                        v
+                    ))),
                 }
             }
         }
@@ -255,30 +275,35 @@ impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
             breathing_cake_enabled: false,
-            cake_median_window: 3,             // 3 samples = 6 seconds (reduced from 5)
-            cake_change_threshold_mbit: 15,    // Reduced from 25 for better responsiveness
-            cake_change_threshold_pct: 0.15,   // Reduced from 20% to 15%
-            cake_overhead_factor: 0.85,        // 85% of link bandwidth
-            cake_hysteresis_up: 3,             // 3 ticks (6 sec) for increases
-            cake_hysteresis_down: 1,           // 1 tick (2 sec) for decreases - FAST
-            
+            cake_median_window: 3, // 3 samples = 6 seconds (reduced from 5)
+            cake_change_threshold_mbit: 15, // Reduced from 25 for better responsiveness
+            cake_change_threshold_pct: 0.15, // Reduced from 20% to 15%
+            cake_overhead_factor: 0.85, // 85% of link bandwidth
+            cake_hysteresis_up: 3, // 3 ticks (6 sec) for increases
+            cake_hysteresis_down: 1, // 1 tick (2 sec) for decreases - FAST
+
             game_mode_enabled: true,
             game_mode_pps_threshold: 200,
             game_mode_cooldown_secs: 30,
-            game_mode_freeze_cake: true,       // NEW: Freeze CAKE during gaming
-            
+            game_mode_freeze_cake: true, // NEW: Freeze CAKE during gaming
+
             band_steering_enabled: true,
             roam_hysteresis_ticks: 3,
-            
+
             cpu_coalescing_enabled: true,
             cpu_coalescing_threshold: 0.90,
-            
+
             cpu_avg_window_size: 3,
-            
+
             scan_suppress: ScanSuppressMode::Adaptive,
             qos_use_ifb: true,
             internet_download_mbit: None,
             internet_upload_mbit: None,
+
+            ebpf_bypass_enabled: true,
+            multipath_bonding_enabled: true,
+            multipath_packet_loss_threshold: 0.02,
+            multipath_jitter_threshold_ms: 15.0,
         }
     }
 }
@@ -312,4 +337,3 @@ mod tests {
         assert_eq!(c.scan_suppress, ScanSuppressMode::Adaptive);
     }
 }
-

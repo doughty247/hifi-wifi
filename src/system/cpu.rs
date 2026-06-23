@@ -4,8 +4,8 @@
 //! Per rewrite.md: Rolling average window size ~3 samples.
 
 use log::debug;
-use std::fs;
 use std::collections::VecDeque;
+use std::fs;
 
 /// CPU statistics from /proc/stat
 #[derive(Debug, Clone, Default)]
@@ -25,7 +25,7 @@ impl CpuTimes {
     fn from_proc_stat() -> Option<Self> {
         let content = fs::read_to_string("/proc/stat").ok()?;
         let first_line = content.lines().next()?;
-        
+
         if !first_line.starts_with("cpu ") {
             return None;
         }
@@ -54,8 +54,14 @@ impl CpuTimes {
 
     /// Total CPU time (all states)
     fn total(&self) -> u64 {
-        self.user + self.nice + self.system + self.idle + 
-        self.iowait + self.irq + self.softirq + self.steal
+        self.user
+            + self.nice
+            + self.system
+            + self.idle
+            + self.iowait
+            + self.irq
+            + self.softirq
+            + self.steal
     }
 
     /// Idle time (idle + iowait)
@@ -94,7 +100,7 @@ impl CpuMonitor {
         let load = if let Some(ref last) = self.last_times {
             let total_delta = current.total().saturating_sub(last.total());
             let idle_delta = current.idle_time().saturating_sub(last.idle_time());
-            
+
             if total_delta > 0 {
                 1.0 - (idle_delta as f64 / total_delta as f64)
             } else {
@@ -113,8 +119,12 @@ impl CpuMonitor {
         self.samples.push_back(load);
 
         let smoothed = self.smoothed_load();
-        debug!("CPU load: {:.1}% (raw: {:.1}%)", smoothed * 100.0, load * 100.0);
-        
+        debug!(
+            "CPU load: {:.1}% (raw: {:.1}%)",
+            smoothed * 100.0,
+            load * 100.0
+        );
+
         smoothed
     }
 
@@ -125,7 +135,6 @@ impl CpuMonitor {
         }
         self.samples.iter().sum::<f64>() / self.samples.len() as f64
     }
-
 }
 
 impl Default for CpuMonitor {
@@ -141,12 +150,12 @@ mod tests {
     #[test]
     fn test_cpu_monitor_smoothing() {
         let mut monitor = CpuMonitor::new(3);
-        
+
         // Simulate some samples
         monitor.samples.push_back(0.5);
         monitor.samples.push_back(0.6);
         monitor.samples.push_back(0.7);
-        
+
         let avg = monitor.smoothed_load();
         assert!((avg - 0.6).abs() < 0.01);
     }

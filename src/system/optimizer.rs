@@ -3,13 +3,13 @@
 //! Handles sysctl tuning, driver module parameters, IRQ affinity, and ethtool settings.
 
 use anyhow::{Context, Result};
-use log::{info, warn, debug};
+use log::{debug, info, warn};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-use crate::network::wifi::{DriverCategory, WifiInterface, InterfaceType};
+use crate::network::wifi::{DriverCategory, InterfaceType, WifiInterface};
 
 /// System optimizer for kernel and driver tuning
 pub struct SystemOptimizer {
@@ -87,21 +87,24 @@ impl SystemOptimizer {
         for (key, val) in settings.iter() {
             config_content.push_str(&format!("{} = {}\n", key, val));
         }
-        
+
         // Try to persist to file (best effort)
         let persistence_success = if let Some(parent) = sysctl_path.parent() {
             fs::create_dir_all(parent).ok();
             match File::create(sysctl_path) {
                 Ok(mut file) => {
                     if let Err(e) = file.write_all(config_content.as_bytes()) {
-                         warn!("Failed to write sysctl config: {}", e);
-                         false
+                        warn!("Failed to write sysctl config: {}", e);
+                        false
                     } else {
-                         true
+                        true
                     }
-                },
+                }
                 Err(e) => {
-                    warn!("Could not create sysctl config file (Read-only filesystem?): {}", e);
+                    warn!(
+                        "Could not create sysctl config file (Read-only filesystem?): {}",
+                        e
+                    );
                     false
                 }
             }
@@ -111,23 +114,23 @@ impl SystemOptimizer {
 
         // If persistence worked, use 'sysctl -p'. Otherwise, apply manually.
         if persistence_success {
-             let output = Command::new("sysctl")
+            let output = Command::new("sysctl")
                 .args(["-p", sysctl_path.to_str().unwrap()])
                 .output();
-             if let Ok(o) = output {
-                 if !o.status.success() {
-                     warn!("sysctl -p failed: {}", String::from_utf8_lossy(&o.stderr));
-                 } else {
-                     info!("Sysctl optimizations applied via config file");
-                     return Ok(());
-                 }
-             }
+            if let Ok(o) = output {
+                if !o.status.success() {
+                    warn!("sysctl -p failed: {}", String::from_utf8_lossy(&o.stderr));
+                } else {
+                    info!("Sysctl optimizations applied via config file");
+                    return Ok(());
+                }
+            }
         }
 
         // Fallback: Apply manually
         info!("Applying sysctl settings transiently (runtime only)...");
         for (key, val) in settings.iter() {
-             let _ = Command::new("sysctl")
+            let _ = Command::new("sysctl")
                 .arg("-w")
                 .arg(format!("{}={}", key, val))
                 .status();
@@ -137,7 +140,7 @@ impl SystemOptimizer {
     }
 
     /// Apply driver-specific module parameters
-    /// 
+    ///
     /// References:
     /// - RTW89: https://github.com/lwfinger/rtw89 (disable_aspm_l1, disable_aspm_l1ss for HP/Lenovo)
     /// - MT7921: https://wiki.archlinux.org/title/Network_configuration/Wireless#mt7921_/_mt7922
@@ -145,34 +148,48 @@ impl SystemOptimizer {
     /// - ath11k: Steam Deck OLED WCN6855 - limited params, kernel handles most
     fn apply_driver_config(&self, category: &DriverCategory) -> Result<()> {
         let (filename, config) = match category {
-            DriverCategory::Rtw89 => ("rtw89.conf", r#"# Realtek RTW89 optimizations (RTL8851BE/RTL8852AE/RTL8852BE/RTL8852CE)
+            DriverCategory::Rtw89 => (
+                "rtw89.conf",
+                r#"# Realtek RTW89 optimizations (RTL8851BE/RTL8852AE/RTL8852BE/RTL8852CE)
 # Disables PCIe Active State Power Management for stability
 # Required for HP/Lenovo laptops with buggy BIOS PCIe implementations
 options rtw89_pci disable_aspm_l1=y disable_aspm_l1ss=y
 # Disable firmware-level power save for consistent low latency
 options rtw89_core disable_ps_mode=y
-"#),
-            DriverCategory::Rtw88 => ("rtw88.conf", r#"# Realtek RTW88 optimizations (RTL8822CE - Steam Deck LCD)
+"#,
+            ),
+            DriverCategory::Rtw88 => (
+                "rtw88.conf",
+                r#"# Realtek RTW88 optimizations (RTL8822CE - Steam Deck LCD)
 # Disables PCIe ASPM for stability and lower latency
 options rtw88_pci disable_aspm=1
 # Disables deep low-power states that cause reconnection issues
 options rtw88_core disable_lps_deep=Y
-"#),
-            DriverCategory::RtlLegacy => ("rtl_legacy.conf", r#"# Legacy Realtek optimizations (RTL8192EE/RTL8188EE)
+"#,
+            ),
+            DriverCategory::RtlLegacy => (
+                "rtl_legacy.conf",
+                r#"# Legacy Realtek optimizations (RTL8192EE/RTL8188EE)
 # swenc=1: Software encryption (more stable on some chips)
 # ips=0: Disable inactive power save
 # fwlps=0: Disable firmware low-power state
 options rtl8192ee swenc=1 ips=0 fwlps=0
 options rtl8188ee swenc=1 ips=0 fwlps=0
 options rtl_pci disable_aspm=1
-"#),
-            DriverCategory::MediaTek => ("mediatek.conf", r#"# MediaTek optimizations (MT7921/MT7922/MT76)
+"#,
+            ),
+            DriverCategory::MediaTek => (
+                "mediatek.conf",
+                r#"# MediaTek optimizations (MT7921/MT7922/MT76)
 # Fixes high latency issues documented in Arch Wiki
 options mt7921e disable_aspm=1
 # Disable USB scatter-gather for better stability on USB adapters
 options mt76_usb disable_usb_sg=1
-"#),
-            DriverCategory::Intel => ("iwlwifi.conf", r#"# Intel Wi-Fi optimizations (AX200/AX201/AX210/AX211/BE200)
+"#,
+            ),
+            DriverCategory::Intel => (
+                "iwlwifi.conf",
+                r#"# Intel Wi-Fi optimizations (AX200/AX201/AX210/AX211/BE200)
 # power_save=0: Disable driver-level power saving
 # uapsd_disable=1: Disable U-APSD (unscheduled automatic power save delivery)
 #   - U-APSD can cause latency spikes during gaming
@@ -180,35 +197,51 @@ options iwlwifi power_save=0 uapsd_disable=1
 # power_scheme=1: "Always Active" mode (vs 2=Balanced, 3=Low-power)
 # Prevents WiFi card disappearing on battery or after suspend
 options iwlmvm power_scheme=1
-"#),
-            DriverCategory::Atheros => ("ath_wifi.conf", r#"# Qualcomm Atheros optimizations
+"#,
+            ),
+            DriverCategory::Atheros => (
+                "ath_wifi.conf",
+                r#"# Qualcomm Atheros optimizations
 # ath11k: Steam Deck OLED (WCN6855) and other WiFi 6E chips
 # disable_aspm=1: Prevents latency spikes from PCIe power transitions
 options ath11k_pci disable_aspm=1
 # ath9k: Legacy 802.11n chips (AR9285/AR9287/etc)
 # ps_enable=0: Disable hardware power save
 options ath9k ps_enable=0
-"#),
-            DriverCategory::Broadcom => ("broadcom.conf", r#"# Broadcom optimizations
+"#,
+            ),
+            DriverCategory::Broadcom => (
+                "broadcom.conf",
+                r#"# Broadcom optimizations
 options brcmfmac roamoff=1
 options wl interference=0
-"#),
-            DriverCategory::Ralink => ("ralink.conf", r#"# Ralink/MediaTek Legacy optimizations
+"#,
+            ),
+            DriverCategory::Ralink => (
+                "ralink.conf",
+                r#"# Ralink/MediaTek Legacy optimizations
 options rt2800usb nohwcrypt=0
 options rt2800pci nohwcrypt=0
-"#),
-            DriverCategory::Marvell => ("marvell.conf", r#"# Marvell optimizations
+"#,
+            ),
+            DriverCategory::Marvell => (
+                "marvell.conf",
+                r#"# Marvell optimizations
 options mwifiex disable_auto_ds=1
-"#),
-            DriverCategory::Generic => ("wifi_generic.conf", r#"# Universal Wi-Fi optimizations
+"#,
+            ),
+            DriverCategory::Generic => (
+                "wifi_generic.conf",
+                r#"# Universal Wi-Fi optimizations
 # Applied for unknown drivers
-"#),
+"#,
+            ),
         };
 
         info!("Applying {:?} driver configuration...", category);
 
         let modprobe_path = Path::new("/etc/modprobe.d").join(filename);
-        
+
         if let Some(parent) = modprobe_path.parent() {
             fs::create_dir_all(parent).ok();
         }
@@ -216,17 +249,25 @@ options mwifiex disable_auto_ds=1
         match File::create(&modprobe_path) {
             Ok(mut file) => {
                 if let Err(e) = file.write_all(config.as_bytes()) {
-                    warn!("Failed to write driver config to {}: {}", modprobe_path.display(), e);
+                    warn!(
+                        "Failed to write driver config to {}: {}",
+                        modprobe_path.display(),
+                        e
+                    );
                 } else {
                     info!("Created driver config: {}", modprobe_path.display());
                 }
-            },
+            }
             Err(e) => {
-                warn!("Could not create driver config at {} (Read-only filesystem?): {}", modprobe_path.display(), e);
+                warn!(
+                    "Could not create driver config at {} (Read-only filesystem?): {}",
+                    modprobe_path.display(),
+                    e
+                );
                 warn!("Driver optimizations requiring persistence will NOT be applied.");
             }
         }
-        
+
         Ok(())
     }
 
@@ -235,7 +276,12 @@ options mwifiex disable_auto_ds=1
         info!("Optimizing IRQ affinity for {}", ifc.name);
 
         // Check for irqbalance
-        if Command::new("pgrep").arg("irqbalance").output().map(|o| o.status.success()).unwrap_or(false) {
+        if Command::new("pgrep")
+            .arg("irqbalance")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
             warn!("'irqbalance' daemon detected! It may undo Wi-Fi IRQ pinning.");
             // We proceed anyway, but the warning is crucial for debugging
         }
@@ -243,19 +289,25 @@ options mwifiex disable_auto_ds=1
         let irqs = find_wifi_irqs(ifc)?;
 
         if irqs.is_empty() {
-            debug!("Could not find IRQ for {} (driver: {})", ifc.name, ifc.driver);
+            debug!(
+                "Could not find IRQ for {} (driver: {})",
+                ifc.name, ifc.driver
+            );
         } else {
             // Pin ALL matching IRQs to CPU 1
             let mut pinned = 0;
             let mut managed = 0;
             for irq_num in &irqs {
                 let affinity_path = format!("/proc/irq/{}/smp_affinity", irq_num);
-                
+
                 // Bind to CPU 1 (affinity mask 0x2)
                 if let Err(e) = fs::write(&affinity_path, "2") {
                     if e.raw_os_error() == Some(5) {
                         // OS Error 5 (EIO) means the interrupt is managed by the kernel
-                        debug!("IRQ {} is managed by the kernel (affinity cannot be modified)", irq_num);
+                        debug!(
+                            "IRQ {} is managed by the kernel (affinity cannot be modified)",
+                            irq_num
+                        );
                         managed += 1;
                     } else {
                         warn!("Failed to set IRQ affinity for {}: {}", irq_num, e);
@@ -264,13 +316,16 @@ options mwifiex disable_auto_ds=1
                     pinned += 1;
                 }
             }
-            
+
             if irqs.len() > 1 {
                 info!("Wi-Fi IRQs optimization completed: {} bound to CPU 1, {} managed by kernel ({} total vectors)", pinned, managed, irqs.len());
             } else if pinned > 0 {
                 info!("Wi-Fi IRQ {} bound to CPU 1", irqs[0]);
             } else {
-                info!("Wi-Fi IRQ {} is kernel-managed (affinity not modified)", irqs[0]);
+                info!(
+                    "Wi-Fi IRQ {} is kernel-managed (affinity not modified)",
+                    irqs[0]
+                );
             }
         }
 
@@ -289,16 +344,19 @@ options mwifiex disable_auto_ds=1
         // Ethernet-specific optimizations for streaming/gaming
         if ifc.interface_type == InterfaceType::Ethernet {
             info!("Applying ethernet streaming optimizations for {}", ifc.name);
-            
+
             // Disable Energy Efficient Ethernet (EEE) - causes micro-stutters in streaming
             // EEE puts the link into low-power state between packets, causing 50-200us wakeup latency
             let eee_result = Command::new("ethtool")
                 .args(["--set-eee", &ifc.name, "eee", "off"])
                 .output();
-            
+
             match eee_result {
                 Ok(output) if output.status.success() => {
-                    info!("Disabled EEE (Energy Efficient Ethernet) on {} for low latency", ifc.name);
+                    info!(
+                        "Disabled EEE (Energy Efficient Ethernet) on {} for low latency",
+                        ifc.name
+                    );
                 }
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -313,14 +371,28 @@ options mwifiex disable_auto_ds=1
             // The governor will dynamically adjust this based on CPU load
             // rx-usecs=0, rx-frames=1 means "interrupt immediately on every packet"
             let coal_result = Command::new("ethtool")
-                .args(["-C", &ifc.name, "rx-usecs", "0", "rx-frames", "1", "tx-usecs", "0", "tx-frames", "1"])
+                .args([
+                    "-C",
+                    &ifc.name,
+                    "rx-usecs",
+                    "0",
+                    "rx-frames",
+                    "1",
+                    "tx-usecs",
+                    "0",
+                    "tx-frames",
+                    "1",
+                ])
                 .output();
-            
+
             match coal_result {
                 Ok(output) if output.status.success() => {
                     info!("Set low-latency interrupt coalescing on {}", ifc.name);
                 }
-                Ok(_) => debug!("Coalescing settings may not be fully supported on {}", ifc.name),
+                Ok(_) => debug!(
+                    "Coalescing settings may not be fully supported on {}",
+                    ifc.name
+                ),
                 Err(e) => debug!("Coalescing command failed: {}", e),
             }
 
@@ -339,7 +411,10 @@ options mwifiex disable_auto_ds=1
         let device_path = match fs::canonicalize(&device_path) {
             Ok(p) => p,
             Err(_) => {
-                debug!("Interface {} does not have a physical sysfs device path", iface_name);
+                debug!(
+                    "Interface {} does not have a physical sysfs device path",
+                    iface_name
+                );
                 return Ok(());
             }
         };
@@ -348,15 +423,23 @@ options mwifiex disable_auto_ds=1
         if link_dir.is_dir() {
             let val = if enable { "0" } else { "1" };
             let aspm_files = [
-                "l0s_aspm", "l1_aspm", "l1_1_aspm", "l1_2_aspm",
-                "l1_1_pcipm", "l1_2_pcipm"
+                "l0s_aspm",
+                "l1_aspm",
+                "l1_1_aspm",
+                "l1_2_aspm",
+                "l1_1_pcipm",
+                "l1_2_pcipm",
             ];
             for filename in &aspm_files {
                 let filepath = link_dir.join(filename);
                 if filepath.exists() {
                     match fs::write(&filepath, val) {
                         Ok(_) => debug!("Set ASPM state in {} to {}", filepath.display(), val),
-                        Err(e) => debug!("Failed to write to {} (unsupported or permission denied): {}", filepath.display(), e),
+                        Err(e) => debug!(
+                            "Failed to write to {} (unsupported or permission denied): {}",
+                            filepath.display(),
+                            e
+                        ),
                     }
                 }
             }
@@ -366,8 +449,15 @@ options mwifiex disable_auto_ds=1
         if power_control.exists() {
             let val = if enable { "on" } else { "auto" };
             match fs::write(&power_control, val) {
-                Ok(_) => info!("Set runtime PCI power control to '{}' for {}", val, iface_name),
-                Err(e) => warn!("Failed to write to {} (runtime power control): {}", power_control.display(), e),
+                Ok(_) => info!(
+                    "Set runtime PCI power control to '{}' for {}",
+                    val, iface_name
+                ),
+                Err(e) => warn!(
+                    "Failed to write to {} (runtime power control): {}",
+                    power_control.display(),
+                    e
+                ),
             }
         }
 
@@ -383,9 +473,16 @@ options mwifiex disable_auto_ds=1
 
         // Remove modprobe configs (list all possible files)
         let modprobe_files = [
-            "rtw89.conf", "rtw88.conf", "rtl_legacy.conf", "mediatek.conf",
-            "iwlwifi.conf", "ath_wifi.conf", "broadcom.conf", "ralink.conf",
-            "marvell.conf", "wifi_generic.conf",
+            "rtw89.conf",
+            "rtw88.conf",
+            "rtl_legacy.conf",
+            "mediatek.conf",
+            "iwlwifi.conf",
+            "ath_wifi.conf",
+            "broadcom.conf",
+            "ralink.conf",
+            "marvell.conf",
+            "wifi_generic.conf",
         ];
 
         for file in modprobe_files {
@@ -421,20 +518,24 @@ impl Default for SystemOptimizer {
 /// Helper to find all IRQs associated with a Wi-Fi interface in /proc/interrupts.
 /// Returns a list of IRQ numbers.
 pub fn find_wifi_irqs(ifc: &WifiInterface) -> Result<Vec<String>> {
-    let interrupts = fs::read_to_string("/proc/interrupts")
-        .context("Failed to read /proc/interrupts")?;
-        
+    let interrupts =
+        fs::read_to_string("/proc/interrupts").context("Failed to read /proc/interrupts")?;
+
     let search_terms: Vec<&str> = match ifc.driver.as_str() {
         "rtl8192ee" => vec!["rtl_pci"],
         "rtw88_8822ce" | "rtw88_pci" | "rtw_pci" => vec!["rtw88", "rtw_pci", &ifc.name],
-        "ath11k_pci" | "ath11k" => vec!["ath11k", "wcn", "mhi", "bhi", &ifc.name],  // WCN6855 variants
+        "ath11k_pci" | "ath11k" => vec!["ath11k", "wcn", "mhi", "bhi", &ifc.name], // WCN6855 variants
         _ => vec![ifc.driver.as_str(), &ifc.name],
     };
 
-    let irqs: Vec<String> = interrupts.lines()
+    let irqs: Vec<String> = interrupts
+        .lines()
         .filter(|line| {
             let lower = line.to_lowercase();
-            search_terms.iter().any(|term| lower.contains(&term.to_lowercase())) || lower.contains(&ifc.name.to_lowercase())
+            search_terms
+                .iter()
+                .any(|term| lower.contains(&term.to_lowercase()))
+                || lower.contains(&ifc.name.to_lowercase())
         })
         .filter_map(|line| line.trim().split(':').next())
         .map(|s| s.trim().to_string())

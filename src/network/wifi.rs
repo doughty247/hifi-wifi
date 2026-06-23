@@ -3,7 +3,7 @@
 //! Handles detection, monitoring, and configuration of Wi-Fi interfaces.
 
 use anyhow::{Context, Result};
-use log::{info, warn, debug};
+use log::{debug, info, warn};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -20,16 +20,16 @@ pub enum InterfaceType {
 /// Detected driver category for applying specific optimizations
 #[derive(Debug, Clone, PartialEq)]
 pub enum DriverCategory {
-    Rtw89,      // Realtek RTW89 (modern)
-    Rtw88,      // Realtek RTW88
-    RtlLegacy,  // Legacy Realtek
-    MediaTek,   // MediaTek MT7921/MT76
-    Intel,      // Intel iwlwifi
-    Atheros,    // Qualcomm Atheros
-    Broadcom,   // Broadcom
-    Ralink,     // Ralink/MediaTek Legacy
-    Marvell,    // Marvell
-    Generic,    // Unknown - apply universal optimizations
+    Rtw89,     // Realtek RTW89 (modern)
+    Rtw88,     // Realtek RTW88
+    RtlLegacy, // Legacy Realtek
+    MediaTek,  // MediaTek MT7921/MT76
+    Intel,     // Intel iwlwifi
+    Atheros,   // Qualcomm Atheros
+    Broadcom,  // Broadcom
+    Ralink,    // Ralink/MediaTek Legacy
+    Marvell,   // Marvell
+    Generic,   // Unknown - apply universal optimizations
 }
 
 /// Represents a detected network interface (WiFi or Ethernet)
@@ -63,7 +63,7 @@ impl WifiManager {
     /// Detect all Wi-Fi interfaces on the system
     fn detect_interfaces(log_output: bool) -> Result<Vec<WifiInterface>> {
         let mut interfaces = Vec::new();
-        
+
         // Read from /sys/class/net
         let net_path = Path::new("/sys/class/net");
         if !net_path.exists() {
@@ -73,7 +73,7 @@ impl WifiManager {
         for entry in fs::read_dir(net_path)? {
             let entry = entry?;
             let ifc_name = entry.file_name().to_string_lossy().to_string();
-            
+
             // Check if it's a wireless or ethernet interface
             let interface_type = if ifc_name.starts_with("wl") {
                 InterfaceType::Wifi
@@ -92,8 +92,10 @@ impl WifiManager {
                     InterfaceType::Wifi => "WiFi",
                     InterfaceType::Ethernet => "Ethernet",
                 };
-                info!("Detected interface: {} (type: {}, driver: {}, category: {:?})", 
-                      ifc_name, type_str, driver, category);
+                info!(
+                    "Detected interface: {} (type: {}, driver: {}, category: {:?})",
+                    ifc_name, type_str, driver, category
+                );
             }
 
             interfaces.push(WifiInterface {
@@ -111,13 +113,13 @@ impl WifiManager {
     /// Detect the driver for a given interface
     fn detect_driver(ifc_name: &str) -> String {
         let driver_path = format!("/sys/class/net/{}/device/driver", ifc_name);
-        
+
         if let Ok(link) = fs::read_link(&driver_path) {
             if let Some(driver_name) = link.file_name() {
                 return driver_name.to_string_lossy().to_string();
             }
         }
-        
+
         "unknown".to_string()
     }
 
@@ -158,7 +160,7 @@ impl WifiManager {
         }
 
         info!("Disabling power save on {}", ifc.name);
-        
+
         let output = Command::new("iw")
             .args(["dev", &ifc.name, "set", "power_save", "off"])
             .output()
@@ -182,7 +184,7 @@ impl WifiManager {
         }
 
         info!("Enabling power save on {}", ifc.name);
-        
+
         let output = Command::new("iw")
             .args(["dev", &ifc.name, "set", "power_save", "on"])
             .output()
@@ -208,7 +210,7 @@ impl WifiManager {
                     .context("Failed to get WiFi link stats")?;
 
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                
+
                 for line in stdout.lines() {
                     let line = line.trim();
                     if line.starts_with("signal:") {
@@ -225,7 +227,7 @@ impl WifiManager {
                         }
                     }
                 }
-            },
+            }
             InterfaceType::Ethernet => {
                 // Use ethtool to get ethernet speed
                 let output = Command::new("ethtool")
@@ -234,7 +236,7 @@ impl WifiManager {
                     .context("Failed to get ethernet link stats")?;
 
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                
+
                 for line in stdout.lines() {
                     let line = line.trim();
                     if line.contains("Speed:") {
@@ -250,7 +252,7 @@ impl WifiManager {
                         break;
                     }
                 }
-            },
+            }
         }
 
         debug!("Link stats for {}: {:?}", ifc.name, stats);
@@ -262,19 +264,17 @@ impl WifiManager {
         match ifc.interface_type {
             InterfaceType::Wifi => {
                 // For WiFi, check if we're connected via iw
-                let output = Command::new("iw")
-                    .args(["dev", &ifc.name, "link"])
-                    .output();
-                
+                let output = Command::new("iw").args(["dev", &ifc.name, "link"]).output();
+
                 if let Ok(output) = output {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     // If connected, output will contain "Connected to" and not "Not connected"
-                    stdout.contains("Connected to") || 
-                    (stdout.contains("SSID:") && !stdout.contains("Not connected"))
+                    stdout.contains("Connected to")
+                        || (stdout.contains("SSID:") && !stdout.contains("Not connected"))
                 } else {
                     false
                 }
-            },
+            }
             InterfaceType::Ethernet => {
                 // For Ethernet, check carrier status
                 let carrier_path = format!("/sys/class/net/{}/carrier", ifc.name);
@@ -288,20 +288,37 @@ impl WifiManager {
     /// Apply CAKE qdisc for bufferbloat mitigation
     pub fn apply_cake(&self, ifc: &WifiInterface, bandwidth_mbps: u32) -> Result<()> {
         if !is_tc_available() {
-            debug!("Skipping CAKE application on {} (tc not available)", ifc.name);
+            debug!(
+                "Skipping CAKE application on {} (tc not available)",
+                ifc.name
+            );
             return Ok(());
         }
-        info!("Applying CAKE qdisc on {} with {}mbit bandwidth", ifc.name, bandwidth_mbps);
-        
+        info!(
+            "Applying CAKE qdisc on {} with {}mbit bandwidth",
+            ifc.name, bandwidth_mbps
+        );
+
         let bandwidth = format!("{}mbit", bandwidth_mbps);
         let rtt = detect_gateway_rtt();
-        
+
         let output = Command::new("tc")
             .args([
-                "qdisc", "replace", "dev", &ifc.name, "root", "cake",
-                "bandwidth", &bandwidth,
-                "rtt", &rtt,
-                "diffserv4", "dual-dsthost", "nat", "wash", "ack-filter"
+                "qdisc",
+                "replace",
+                "dev",
+                &ifc.name,
+                "root",
+                "cake",
+                "bandwidth",
+                &bandwidth,
+                "rtt",
+                &rtt,
+                "diffserv4",
+                "dual-dsthost",
+                "nat",
+                "wash",
+                "ack-filter",
             ])
             .output()
             .context("Failed to apply CAKE qdisc")?;
@@ -338,6 +355,8 @@ pub struct LinkStats {
 
 impl Default for WifiManager {
     fn default() -> Self {
-        Self::new().unwrap_or(Self { interfaces: Vec::new() })
+        Self::new().unwrap_or(Self {
+            interfaces: Vec::new(),
+        })
     }
 }

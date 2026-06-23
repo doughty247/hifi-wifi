@@ -4,10 +4,10 @@
 //! Implements "Breathing CAKE" with asymmetric response (fast down, slow up).
 
 use anyhow::{Context, Result};
-use log::{info, debug, warn};
-use std::process::Command;
+use log::{debug, info, warn};
 use std::collections::VecDeque;
-use std::sync::{RwLock, OnceLock};
+use std::process::Command;
+use std::sync::{OnceLock, RwLock};
 
 static GATEWAY_RTT: RwLock<Option<String>> = RwLock::new(None);
 static TC_AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -15,10 +15,7 @@ static TC_AVAILABLE: OnceLock<bool> = OnceLock::new();
 /// Check if the `tc` command is available on the system
 pub fn is_tc_available() -> bool {
     *TC_AVAILABLE.get_or_init(|| {
-        let available = Command::new("tc")
-            .arg("-Version")
-            .output()
-            .is_ok();
+        let available = Command::new("tc").arg("-Version").output().is_ok();
         if !available {
             warn!("Traffic Control (tc) binary not found. CAKE QoS features will be disabled.");
         }
@@ -43,15 +40,15 @@ pub fn detect_gateway_rtt() -> String {
             return cached.clone();
         }
     }
-    
+
     // Measure and cache
     let rtt = measure_gateway_rtt();
     info!("CAKE: Auto-detected gateway RTT -> using {}", rtt);
-    
+
     if let Ok(mut cache) = GATEWAY_RTT.write() {
         *cache = Some(rtt.clone());
     }
-    
+
     rtt
 }
 
@@ -63,7 +60,8 @@ fn measure_gateway_rtt() -> String {
         .ok()
         .and_then(|output| {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            stdout.split_whitespace()
+            stdout
+                .split_whitespace()
                 .skip_while(|w| *w != "via")
                 .nth(1)
                 .map(|s| s.to_string())
@@ -85,7 +83,8 @@ fn measure_gateway_rtt() -> String {
         .and_then(|output| {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             // Parse "rtt min/avg/max/mdev = 1.234/2.345/3.456/0.567 ms"
-            stdout.lines()
+            stdout
+                .lines()
                 .find(|l| l.contains("rtt") || l.contains("round-trip"))
                 .and_then(|l| l.split('=').nth(1))
                 .and_then(|s| s.split('/').nth(1))
@@ -113,11 +112,11 @@ fn measure_gateway_rtt() -> String {
 }
 
 /// Traffic Control manager with asymmetric response
-/// 
+///
 /// Design philosophy: Bandwidth DROPS are dangerous (bufferbloat), INCREASES are safe.
 /// - Drops: Apply immediately after 1 tick confirmation
 /// - Increases: Require full hysteresis (3 ticks) to prevent oscillation
-/// 
+///
 /// Uses single-stage median filter (no EMA) for faster response.
 pub struct TcManager {
     /// Last applied bandwidth (Mbit)
@@ -157,7 +156,7 @@ pub struct TcManager {
 impl TcManager {
     pub fn new(
         window_size: usize,
-        threshold_mbit: u32, 
+        threshold_mbit: u32,
         threshold_pct: f64,
         hysteresis_up: u32,
         hysteresis_down: u32,
@@ -167,9 +166,7 @@ impl TcManager {
     ) -> Self {
         let mut resolved_qos_use_ifb = qos_use_ifb;
         if resolved_qos_use_ifb {
-            let status = Command::new("modprobe")
-                .args(["--dry-run", "ifb"])
-                .status();
+            let status = Command::new("modprobe").args(["--dry-run", "ifb"]).status();
             let is_available = match status {
                 Ok(s) => s.success(),
                 Err(_) => false,
@@ -178,9 +175,7 @@ impl TcManager {
                 warn!("The 'ifb' kernel module is not available on this system. Ingress (download) shaping fallback disabled.");
                 resolved_qos_use_ifb = false;
             } else {
-                let load_status = Command::new("modprobe")
-                    .args(["ifb", "numifbs=1"])
-                    .status();
+                let load_status = Command::new("modprobe").args(["ifb", "numifbs=1"]).status();
                 match load_status {
                     Ok(s) => {
                         if !s.success() {
@@ -293,7 +288,11 @@ impl TcManager {
         // Need minimum samples before making decisions
         let min_samples = (self.window_size / 2).max(2);
         if self.sample_window.len() < min_samples {
-            debug!("CAKE: Warming up ({}/{} samples)", self.sample_window.len(), min_samples);
+            debug!(
+                "CAKE: Warming up ({}/{} samples)",
+                self.sample_window.len(),
+                min_samples
+            );
             return false;
         }
 
@@ -302,15 +301,15 @@ impl TcManager {
             Some(m) => m,
             None => return false,
         };
-        
+
         // Stage 3: Check if significant change
         let (should_consider, is_decrease) = if let Some(last) = self.last_bandwidth {
             let diff = target_mbit as i32 - last as i32;
             let abs_diff = diff.unsigned_abs();
             let pct_diff = abs_diff as f64 / last as f64;
-            
-            let significant = abs_diff >= self.change_threshold_mbit || 
-                              pct_diff >= self.change_threshold_pct;
+
+            let significant =
+                abs_diff >= self.change_threshold_mbit || pct_diff >= self.change_threshold_pct;
             (significant, diff < 0)
         } else {
             (true, false) // First application
@@ -320,22 +319,25 @@ impl TcManager {
             // Reset hysteresis if not considering a change
             self.stable_ticks = 0;
             self.pending_bandwidth = None;
-            debug!("CAKE: No significant change ({}Mbit, last={:?})", target_mbit, self.last_bandwidth);
+            debug!(
+                "CAKE: No significant change ({}Mbit, last={:?})",
+                target_mbit, self.last_bandwidth
+            );
             return false;
         }
 
         // Stage 4: Asymmetric hysteresis
         // - Decreases: Fast response (1 tick) to prevent bufferbloat
         // - Increases: Slow response (3 ticks) to prevent oscillation
-        let required_ticks = if is_decrease { 
-            self.hysteresis_ticks_down 
-        } else { 
-            self.hysteresis_ticks_up 
+        let required_ticks = if is_decrease {
+            self.hysteresis_ticks_down
+        } else {
+            self.hysteresis_ticks_up
         };
 
         // Check direction consistency
-        let direction_changed = self.pending_bandwidth.is_some() && 
-                                self.pending_direction_up != !is_decrease;
+        let direction_changed =
+            self.pending_bandwidth.is_some() && self.pending_direction_up != !is_decrease;
 
         if direction_changed {
             // Direction reversed, reset
@@ -354,15 +356,19 @@ impl TcManager {
 
         if self.stable_ticks >= required_ticks {
             let direction = if is_decrease { "DOWN" } else { "UP" };
-            info!("CAKE: Bandwidth {} approved ({} ticks): {:?} -> {}Mbit",
-                  direction, self.stable_ticks, self.last_bandwidth, target_mbit);
+            info!(
+                "CAKE: Bandwidth {} approved ({} ticks): {:?} -> {}Mbit",
+                direction, self.stable_ticks, self.last_bandwidth, target_mbit
+            );
             self.stable_ticks = 0;
             self.pending_bandwidth = None;
             true
         } else {
             let direction = if is_decrease { "down" } else { "up" };
-            debug!("CAKE: Waiting for {} stability ({}/{} ticks at {}Mbit)",
-                   direction, self.stable_ticks, required_ticks, target_mbit);
+            debug!(
+                "CAKE: Waiting for {} stability ({}/{} ticks at {}Mbit)",
+                direction, self.stable_ticks, required_ticks, target_mbit
+            );
             false
         }
     }
@@ -375,7 +381,10 @@ impl TcManager {
     /// Apply CAKE qdisc to interface (with IFB ingress redirection if enabled)
     pub fn apply_cake(&mut self, interface: &str) -> Result<()> {
         if !is_tc_available() {
-            debug!("Skipping CAKE application on {} (tc not available)", interface);
+            debug!(
+                "Skipping CAKE application on {} (tc not available)",
+                interface
+            );
             return Ok(());
         }
 
@@ -387,12 +396,13 @@ impl TcManager {
 
         // 1. Ingress Shaping via IFB (Download)
         if self.qos_use_ifb {
-            info!("Applying IFB ingress redirection and CAKE on {} (download limit: {}mbit)", interface, download_limit);
-            
+            info!(
+                "Applying IFB ingress redirection and CAKE on {} (download limit: {}mbit)",
+                interface, download_limit
+            );
+
             // Load ifb module (ignore failure if already loaded)
-            let _ = Command::new("modprobe")
-                .args(["ifb", "numifbs=1"])
-                .output();
+            let _ = Command::new("modprobe").args(["ifb", "numifbs=1"]).output();
 
             // Set ifb0 device UP
             let _ = Command::new("ip")
@@ -406,7 +416,9 @@ impl TcManager {
 
             // Add ingress qdisc to physical interface
             let output = Command::new("tc")
-                .args(["qdisc", "add", "dev", interface, "handle", "ffff:", "ingress"])
+                .args([
+                    "qdisc", "add", "dev", interface, "handle", "ffff:", "ingress",
+                ])
                 .output();
 
             if let Ok(out) = output {
@@ -414,20 +426,27 @@ impl TcManager {
                     // Redirect ingress traffic of physical interface to ifb0
                     let output = Command::new("tc")
                         .args([
-                            "filter", "add", "dev", interface, "parent", "ffff:",
-                            "matchall", "action", "mirred", "egress", "redirect", "dev", "ifb0"
+                            "filter", "add", "dev", interface, "parent", "ffff:", "matchall",
+                            "action", "mirred", "egress", "redirect", "dev", "ifb0",
                         ])
                         .output();
-                    
+
                     if let Ok(out_filter) = output {
                         if out_filter.status.success() {
                             // Apply CAKE on ifb0 (for download shaping)
                             let rtt = detect_gateway_rtt();
                             let output = Command::new("tc")
                                 .args([
-                                    "qdisc", "replace", "dev", "ifb0", "root", "cake",
-                                    "bandwidth", &format!("{}mbit", download_limit),
-                                    "rtt", &rtt,
+                                    "qdisc",
+                                    "replace",
+                                    "dev",
+                                    "ifb0",
+                                    "root",
+                                    "cake",
+                                    "bandwidth",
+                                    &format!("{}mbit", download_limit),
+                                    "rtt",
+                                    &rtt,
                                     "diffserv4",
                                     "dual-dsthost",
                                     "nat",
@@ -435,7 +454,7 @@ impl TcManager {
                                     "ack-filter",
                                 ])
                                 .output();
-                            
+
                             if let Ok(out_cake) = output {
                                 if out_cake.status.success() {
                                     info!("Ingress CAKE applied successfully on ifb0");
@@ -463,12 +482,17 @@ impl TcManager {
             }
         }
 
-        info!("Applying egress CAKE on {} (upload limit: {}mbit, TX queues: {})", interface, upload_limit, tx_queues);
+        info!(
+            "Applying egress CAKE on {} (upload limit: {}mbit, TX queues: {})",
+            interface, upload_limit, tx_queues
+        );
 
         if tx_queues > 1 {
             // Apply mq as root qdisc (preserving EDCA)
             let output = Command::new("tc")
-                .args(["qdisc", "replace", "dev", interface, "root", "handle", "1:", "mq"])
+                .args([
+                    "qdisc", "replace", "dev", interface, "root", "handle", "1:", "mq",
+                ])
                 .output()
                 .context("Failed to apply mq root qdisc")?;
 
@@ -479,9 +503,17 @@ impl TcManager {
                     let parent_id = format!("1:{}", q);
                     let output = Command::new("tc")
                         .args([
-                            "qdisc", "replace", "dev", interface, "parent", &parent_id, "cake",
-                            "bandwidth", &format!("{}mbit", upload_limit),
-                            "rtt", &rtt,
+                            "qdisc",
+                            "replace",
+                            "dev",
+                            interface,
+                            "parent",
+                            &parent_id,
+                            "cake",
+                            "bandwidth",
+                            &format!("{}mbit", upload_limit),
+                            "rtt",
+                            &rtt,
                             "diffserv4",
                             "dual-dsthost",
                             "nat",
@@ -493,7 +525,10 @@ impl TcManager {
                     if let Ok(out_cake) = output {
                         if !out_cake.status.success() {
                             let stderr = String::from_utf8_lossy(&out_cake.stderr);
-                            warn!("Failed to apply CAKE to parent {} on {}: {}", parent_id, interface, stderr);
+                            warn!(
+                                "Failed to apply CAKE to parent {} on {}: {}",
+                                parent_id, interface, stderr
+                            );
                         }
                     }
                 }
@@ -517,9 +552,16 @@ impl TcManager {
         let rtt = detect_gateway_rtt();
         let output = Command::new("tc")
             .args([
-                "qdisc", "replace", "dev", interface, "root", "cake",
-                "bandwidth", &format!("{}mbit", bandwidth_mbit),
-                "rtt", &rtt,
+                "qdisc",
+                "replace",
+                "dev",
+                interface,
+                "root",
+                "cake",
+                "bandwidth",
+                &format!("{}mbit", bandwidth_mbit),
+                "rtt",
+                &rtt,
                 "diffserv4",
                 "dual-dsthost",
                 "nat",
@@ -532,22 +574,33 @@ impl TcManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             warn!("Fallback tc failed: {}", stderr);
-            
+
             // Simpler CAKE config
             let output = Command::new("tc")
                 .args([
-                    "qdisc", "replace", "dev", interface, "root", "cake",
-                    "bandwidth", &format!("{}mbit", bandwidth_mbit),
-                    "rtt", &rtt,
-                    "besteffort", "nat",
+                    "qdisc",
+                    "replace",
+                    "dev",
+                    interface,
+                    "root",
+                    "cake",
+                    "bandwidth",
+                    &format!("{}mbit", bandwidth_mbit),
+                    "rtt",
+                    &rtt,
+                    "besteffort",
+                    "nat",
                 ])
                 .output()?;
-            
+
             if !output.status.success() {
                 anyhow::bail!("Failed to apply fallback CAKE qdisc");
             }
         }
-        info!("Fallback root CAKE applied successfully: {}mbit on {}", bandwidth_mbit, interface);
+        info!(
+            "Fallback root CAKE applied successfully: {}mbit on {}",
+            bandwidth_mbit, interface
+        );
         Ok(())
     }
 
@@ -561,7 +614,7 @@ impl TcManager {
         let output = Command::new("tc")
             .args(["qdisc", "del", "dev", interface, "root"])
             .output();
-        
+
         if let Ok(o) = output {
             if o.status.success() {
                 info!("Removed root qdisc from {}", interface);
@@ -583,7 +636,9 @@ impl TcManager {
         if tx_queues > 1 {
             info!("Restoring default mq root qdisc on {}", interface);
             let _ = Command::new("tc")
-                .args(["qdisc", "replace", "dev", interface, "root", "handle", "1:", "mq"])
+                .args([
+                    "qdisc", "replace", "dev", interface, "root", "handle", "1:", "mq",
+                ])
                 .output();
         }
 
@@ -599,7 +654,7 @@ impl TcManager {
         let _ = Command::new("tc")
             .args(["qdisc", "del", "dev", "ifb0", "root"])
             .output();
-        
+
         info!("Cleaned up ingress redirect for {}", interface);
         Ok(())
     }
@@ -628,11 +683,22 @@ impl EthtoolManager {
     /// Uses moderate coalescing to reduce CPU load while maintaining acceptable latency
     pub fn enable_coalescing(interface: &str) -> Result<()> {
         debug!("Enabling interrupt coalescing on {}", interface);
-        
+
         // Set moderate coalescing: wait up to 50us or 8 frames before interrupt
         // This reduces CPU load significantly while keeping latency under 1ms
         let _ = Command::new("ethtool")
-            .args(["-C", interface, "rx-usecs", "50", "rx-frames", "8", "tx-usecs", "50", "tx-frames", "8"])
+            .args([
+                "-C",
+                interface,
+                "rx-usecs",
+                "50",
+                "rx-frames",
+                "8",
+                "tx-usecs",
+                "50",
+                "tx-frames",
+                "8",
+            ])
             .output();
 
         // Also enable adaptive on supported cards as a fallback
@@ -647,10 +713,21 @@ impl EthtoolManager {
     /// Interrupts fire immediately on every packet for minimum latency
     pub fn disable_coalescing(interface: &str) -> Result<()> {
         debug!("Disabling interrupt coalescing on {}", interface);
-        
+
         // Zero coalescing: interrupt on every packet (lowest latency)
         let _ = Command::new("ethtool")
-            .args(["-C", interface, "rx-usecs", "0", "rx-frames", "1", "tx-usecs", "0", "tx-frames", "1"])
+            .args([
+                "-C",
+                interface,
+                "rx-usecs",
+                "0",
+                "rx-frames",
+                "1",
+                "tx-usecs",
+                "0",
+                "tx-frames",
+                "1",
+            ])
             .output();
 
         // Disable adaptive coalescing
@@ -695,23 +772,23 @@ mod tests {
     fn test_median_filtering() {
         // 3 window, 15mbit/15% threshold, 3 up / 1 down hysteresis
         let mut tc = TcManager::new(3, 15, 0.15, 3, 1, false, None, None);
-        
+
         // First sample - warming up (need 2 min)
         assert!(!tc.update_bandwidth(100)); // Sample 1 - warming
-        
+
         // Second sample - still warming but now have enough for first check
         // First real check after warmup should trigger (no previous bandwidth)
         // But we still need to pass hysteresis for first application (3 ticks up)
         assert!(!tc.update_bandwidth(100)); // Sample 2 - tick 1
         assert!(!tc.update_bandwidth(100)); // Sample 3 - tick 2
-        assert!(tc.update_bandwidth(100));  // Sample 4 - tick 3 - triggers first application
-        
+        assert!(tc.update_bandwidth(100)); // Sample 4 - tick 3 - triggers first application
+
         tc.set_last_applied(100);
-        
+
         // One outlier spike should be filtered by median
         // Median of [100, 100, 500] = 100, so no change
         assert!(!tc.update_bandwidth(500)); // Outlier - median still ~100
-        
+
         // Target should still be close to 100
         assert!(tc.get_target_mbit() <= 200);
     }
@@ -719,27 +796,27 @@ mod tests {
     #[test]
     fn test_asymmetric_hysteresis() {
         let mut tc = TcManager::new(3, 15, 0.15, 3, 1, false, None, None); // 3 up, 1 down
-        
+
         // Warm up and apply initial
         tc.update_bandwidth(100);
         tc.update_bandwidth(100);
         tc.update_bandwidth(100);
         tc.update_bandwidth(100); // This triggers first application
         tc.set_last_applied(100);
-        
+
         // Big DROP should trigger fast (1 tick) after meeting threshold
         // Need to fill window with 50s first
         tc.update_bandwidth(50);
         tc.update_bandwidth(50);
         assert!(tc.update_bandwidth(50)); // Now median is 50, triggers drop!
         tc.set_last_applied(50);
-        
+
         // Big INCREASE should require 3 ticks
         // Fill window with 100s - need several to shift median and pass hysteresis
         tc.update_bandwidth(100); // Tick 1 - shifts window
         tc.update_bandwidth(100); // Tick 2 - median now ~100
         tc.update_bandwidth(100); // Tick 3
-        // May need one more tick since the window needs to stabilize
+                                  // May need one more tick since the window needs to stabilize
         let triggered = tc.update_bandwidth(100);
         assert!(triggered, "Increase should trigger after 3+ ticks");
     }
@@ -747,30 +824,29 @@ mod tests {
     #[test]
     fn test_game_mode_freezes_cake() {
         let mut tc = TcManager::default();
-        
+
         // Set up initial state
         tc.update_bandwidth(100);
         tc.update_bandwidth(100);
         tc.update_bandwidth(100);
         tc.update_bandwidth(100);
         tc.set_last_applied(100);
-        
+
         // Enter game mode
         tc.enter_game_mode();
         assert!(tc.is_game_mode());
-        
+
         // Updates should be ignored during game mode
-        assert!(!tc.update_bandwidth(50));  // Would normally trigger
+        assert!(!tc.update_bandwidth(50)); // Would normally trigger
         assert!(!tc.update_bandwidth(200)); // Would normally trigger
-        
+
         // Exit game mode
         tc.exit_game_mode();
         assert!(!tc.is_game_mode());
-        
+
         // Now updates work again (after warmup)
         tc.update_bandwidth(50);
         tc.update_bandwidth(50);
         // Would need full hysteresis cycle to trigger
     }
-
 }

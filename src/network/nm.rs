@@ -4,9 +4,9 @@
 //! Per rewrite.md: No text parsing - use structured DBus APIs.
 
 use anyhow::{Context, Result};
-use log::{info, debug};
+use log::{debug, info};
 use std::collections::HashMap;
-use zbus::{Connection, proxy};
+use zbus::{proxy, Connection};
 
 /// WiFi frequency band
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -40,17 +40,17 @@ pub struct AccessPoint {
     pub band: WifiBand,
     pub signal_strength: i32, // dBm (typically -30 to -90)
     #[allow(dead_code)]
-    pub max_bitrate: u32,     // Kbit/s
+    pub max_bitrate: u32, // Kbit/s
 }
 
 impl AccessPoint {
     /// Calculate roaming score for band steering
-    /// 
+    ///
     /// The score considers:
     /// 1. Signal strength (RSSI in dBm)
     /// 2. Band bias (5GHz/6GHz preferred over 2.4GHz for gaming)
     /// 3. Max bitrate (higher potential throughput = better)
-    /// 
+    ///
     /// For gaming, we prefer 5GHz/6GHz even with slightly weaker signal
     /// because of lower latency and less interference.
     pub fn score(&self, bias_5ghz: i32, bias_6ghz: i32) -> i32 {
@@ -60,15 +60,15 @@ impl AccessPoint {
             WifiBand::Band6GHz => bias_6ghz,
             WifiBand::Unknown => 0,
         };
-        
+
         // Throughput bonus: Add points for high-bitrate APs
         // This accounts for wider channels (80MHz, 160MHz)
         // Scale: 0-600Mbps = 0-10 points, capped at 10
         let throughput_bonus = std::cmp::min(self.max_bitrate / 60000, 10) as i32;
-        
+
         self.signal_strength + band_bias + throughput_bonus
     }
-    
+
     /// Check if signal is usable for the given band
     /// 5GHz/6GHz need stronger signals due to higher path loss
     pub fn signal_usable(&self, min_2g: i32, min_5g: i32, min_6g: i32) -> bool {
@@ -120,7 +120,7 @@ pub struct WirelessDevice {
     pub path: String,
     pub interface: String,
     pub state: DeviceState,
-    pub bitrate: u32,         // Current bitrate in Kbit/s
+    pub bitrate: u32, // Current bitrate in Kbit/s
     pub active_ap: Option<AccessPoint>,
 }
 
@@ -133,7 +133,7 @@ pub struct WirelessDevice {
 trait NetworkManager {
     #[zbus(property)]
     fn devices(&self) -> zbus::Result<Vec<zbus::zvariant::OwnedObjectPath>>;
-    
+
     #[zbus(property)]
     fn version(&self) -> zbus::Result<String>;
 
@@ -153,10 +153,10 @@ trait NetworkManager {
 trait NmDevice {
     #[zbus(property)]
     fn device_type(&self) -> zbus::Result<u32>;
-    
+
     #[zbus(property)]
     fn interface(&self) -> zbus::Result<String>;
-    
+
     #[zbus(property)]
     fn state(&self) -> zbus::Result<u32>;
 
@@ -172,14 +172,15 @@ trait NmDevice {
 trait NmWireless {
     #[zbus(property)]
     fn bitrate(&self) -> zbus::Result<u32>;
-    
+
     #[zbus(property)]
     fn active_access_point(&self) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
-    
+
     #[zbus(property)]
     fn access_points(&self) -> zbus::Result<Vec<zbus::zvariant::OwnedObjectPath>>;
-    
-    fn request_scan(&self, options: HashMap<String, zbus::zvariant::Value<'_>>) -> zbus::Result<()>;
+
+    fn request_scan(&self, options: HashMap<String, zbus::zvariant::Value<'_>>)
+        -> zbus::Result<()>;
 }
 
 // Access Point proxy
@@ -190,16 +191,16 @@ trait NmWireless {
 trait NmAccessPoint {
     #[zbus(property)]
     fn ssid(&self) -> zbus::Result<Vec<u8>>;
-    
+
     #[zbus(property)]
     fn hw_address(&self) -> zbus::Result<String>;
-    
+
     #[zbus(property)]
     fn frequency(&self) -> zbus::Result<u32>;
-    
+
     #[zbus(property)]
     fn strength(&self) -> zbus::Result<u8>;
-    
+
     #[zbus(property)]
     fn max_bitrate(&self) -> zbus::Result<u32>;
 }
@@ -215,12 +216,12 @@ impl NmClient {
         let connection = Connection::system()
             .await
             .context("Failed to connect to system D-Bus")?;
-        
+
         // Verify NetworkManager is available
         let nm = NetworkManagerProxy::new(&connection).await?;
         let version = nm.version().await.unwrap_or_else(|_| "unknown".to_string());
         info!("Connected to NetworkManager v{}", version);
-        
+
         Ok(Self { connection })
     }
 
@@ -228,38 +229,38 @@ impl NmClient {
     pub async fn get_wireless_devices(&self) -> Result<Vec<WirelessDevice>> {
         let nm = NetworkManagerProxy::new(&self.connection).await?;
         let device_paths = nm.devices().await?;
-        
+
         let mut wireless_devices = Vec::new();
-        
+
         for path in device_paths {
             let device = NmDeviceProxy::builder(&self.connection)
                 .path(path.as_ref())?
                 .build()
                 .await?;
-            
+
             // Check if it's a WiFi device (type 2)
             let device_type = device.device_type().await.unwrap_or(0);
             if device_type != 2 {
                 continue;
             }
-            
+
             let interface = device.interface().await.unwrap_or_default();
             let state = DeviceState::from(device.state().await.unwrap_or(0));
-            
+
             // Skip virtual interfaces per rewrite.md
             if Self::is_virtual_interface(&interface) {
                 debug!("Skipping virtual interface: {}", interface);
                 continue;
             }
-            
+
             // Get wireless-specific properties
             let wireless = NmWirelessProxy::builder(&self.connection)
                 .path(path.as_ref())?
                 .build()
                 .await?;
-            
+
             let bitrate = wireless.bitrate().await.unwrap_or(0);
-            
+
             // Get active AP info
             let active_ap = match wireless.active_access_point().await {
                 Ok(ap_path) if !ap_path.as_str().is_empty() && ap_path.as_str() != "/" => {
@@ -267,7 +268,7 @@ impl NmClient {
                 }
                 _ => None,
             };
-            
+
             wireless_devices.push(WirelessDevice {
                 path: path.to_string(),
                 interface,
@@ -276,7 +277,7 @@ impl NmClient {
                 active_ap,
             });
         }
-        
+
         Ok(wireless_devices)
     }
 
@@ -286,17 +287,17 @@ impl NmClient {
             .path(path)?
             .build()
             .await?;
-        
+
         let ssid_bytes = ap.ssid().await.unwrap_or_default();
         let ssid = String::from_utf8_lossy(&ssid_bytes).to_string();
         let bssid = ap.hw_address().await.unwrap_or_default();
         let frequency = ap.frequency().await.unwrap_or(0);
         let strength = ap.strength().await.unwrap_or(0);
         let max_bitrate = ap.max_bitrate().await.unwrap_or(0);
-        
+
         // Convert strength (0-100) to approximate dBm
         let signal_dbm = Self::strength_to_dbm(strength);
-        
+
         Ok(AccessPoint {
             path: path.to_string(),
             ssid,
@@ -314,16 +315,16 @@ impl NmClient {
             .path(device_path)?
             .build()
             .await?;
-        
+
         let ap_paths = wireless.access_points().await?;
         let mut access_points = Vec::new();
-        
+
         for ap_path in ap_paths {
             if let Ok(ap) = self.get_access_point_info(ap_path.as_str()).await {
                 access_points.push(ap);
             }
         }
-        
+
         Ok(access_points)
     }
 
@@ -333,11 +334,11 @@ impl NmClient {
             .path(device_path)?
             .build()
             .await?;
-        
+
         let options: HashMap<String, zbus::zvariant::Value> = HashMap::new();
         wireless.request_scan(options).await?;
         debug!("Scan requested for device: {}", device_path);
-        
+
         Ok(())
     }
 
@@ -347,29 +348,34 @@ impl NmClient {
             .path(device_path)?
             .build()
             .await?;
-        
+
         let active_conn_path = device.active_connection().await?;
-        
+
         let nm = NetworkManagerProxy::new(&self.connection).await?;
-        let _ = nm.activate_connection(
-            zbus::zvariant::ObjectPath::from(active_conn_path),
-            zbus::zvariant::ObjectPath::try_from(device_path)?,
-            zbus::zvariant::ObjectPath::try_from(ap_path)?,
-        ).await?;
-        
-        info!("Proactive handover triggered successfully to AP: {}", ap_path);
+        let _ = nm
+            .activate_connection(
+                zbus::zvariant::ObjectPath::from(active_conn_path),
+                zbus::zvariant::ObjectPath::try_from(device_path)?,
+                zbus::zvariant::ObjectPath::try_from(ap_path)?,
+            )
+            .await?;
+
+        info!(
+            "Proactive handover triggered successfully to AP: {}",
+            ap_path
+        );
         Ok(())
     }
 
     /// Check if interface is virtual (per rewrite.md: ignore docker, veth, virbr, tun, tap)
     fn is_virtual_interface(name: &str) -> bool {
-        name.starts_with("docker") ||
-        name.starts_with("veth") ||
-        name.starts_with("virbr") ||
-        name.starts_with("tun") ||
-        name.starts_with("tap") ||
-        name.starts_with("br-") ||
-        name.starts_with("lo")
+        name.starts_with("docker")
+            || name.starts_with("veth")
+            || name.starts_with("virbr")
+            || name.starts_with("tun")
+            || name.starts_with("tap")
+            || name.starts_with("br-")
+            || name.starts_with("lo")
     }
 
     /// Convert NM strength (0-100) to approximate dBm
@@ -391,7 +397,7 @@ mod tests {
         assert_eq!(WifiBand::from_frequency(6000), WifiBand::Band6GHz);
         assert_eq!(WifiBand::from_frequency(900), WifiBand::Unknown);
     }
-    
+
     #[test]
     fn test_access_point_scoring() {
         let ap = AccessPoint {
@@ -403,16 +409,16 @@ mod tests {
             signal_strength: -60,
             max_bitrate: 300000, // 300 Mbps - gives 5 points throughput bonus
         };
-        
+
         // Score = RSSI (-60) + band_bias (15) + throughput_bonus (5) = -40
         assert_eq!(ap.score(15, 20), -40);
-        
+
         // With higher bias
         assert_eq!(ap.score(30, 20), -25);
-        
+
         // Test signal_usable per band
         assert!(ap.signal_usable(-75, -72, -70)); // -60 is good for 5GHz
-        
+
         let weak_ap = AccessPoint {
             path: "/".to_string(),
             ssid: "Test".to_string(),
@@ -424,7 +430,7 @@ mod tests {
         };
         assert!(!weak_ap.signal_usable(-75, -72, -70)); // -71 fails 6GHz threshold of -70
     }
-    
+
     #[test]
     fn test_throughput_bonus() {
         // Low bitrate AP
@@ -438,7 +444,7 @@ mod tests {
             max_bitrate: 54000, // 54 Mbps - gives 0 points
         };
         assert_eq!(slow_ap.score(15, 25), -50); // No band bias, no throughput bonus
-        
+
         // High bitrate 6GHz AP
         let fast_ap = AccessPoint {
             path: "/".to_string(),

@@ -3,7 +3,7 @@
 //! Applies optimizations specific to the active Wi-Fi backend.
 
 use anyhow::Result;
-use log::{info, debug, warn};
+use log::{debug, info, warn};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -27,7 +27,7 @@ impl BackendTuner {
     pub fn new(disable_periodic_scan: bool) -> Self {
         let backend = Self::detect_backend();
         info!("Detected Wi-Fi backend: {:?}", backend);
-        
+
         Self {
             backend,
             disable_periodic_scan,
@@ -109,12 +109,16 @@ impl BackendTuner {
 
         // Create directory (may fail on read-only filesystem)
         if let Err(e) = fs::create_dir_all(iwd_conf_dir) {
-            warn!("Could not create /etc/iwd directory (Read-only filesystem?): {}", e);
+            warn!(
+                "Could not create /etc/iwd directory (Read-only filesystem?): {}",
+                e
+            );
             warn!("iwd optimizations will NOT be applied.");
             return Ok(());
         }
 
-        let config = format!(r#"[General]
+        let config = format!(
+            r#"[General]
 # Use control port over nl80211 for better performance
 ControlPortOverNL80211=true
 
@@ -137,7 +141,9 @@ DisablePeriodicScan={}
 BandModifier2_4GHz=1.0
 BandModifier5GHz=2.0
 BandModifier6GHz=3.0
-"#, self.disable_periodic_scan);
+"#,
+            self.disable_periodic_scan
+        );
 
         match File::create(&iwd_conf_path) {
             Ok(mut file) => {
@@ -167,7 +173,7 @@ BandModifier6GHz=3.0
                 return Ok(());
             }
         };
-        
+
         // Check if DisablePeriodicScan is already set
         if content.contains("DisablePeriodicScan") {
             debug!("DisablePeriodicScan already configured in iwd");

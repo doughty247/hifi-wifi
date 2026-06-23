@@ -1,7 +1,7 @@
 use super::structs::Config;
+use log::{info, warn};
 use std::fs;
 use std::path::Path;
-use log::{info, warn};
 
 const CONFIG_PATH: &str = "/etc/hifi-wifi/config.toml";
 
@@ -24,6 +24,6 @@ pub fn load_config() -> Config {
     } else {
         info!("No config file found at {}. Using defaults.", CONFIG_PATH);
     }
-    
+
     Config::default()
 }

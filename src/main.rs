@@ -1,6 +1,6 @@
+mod config;
 mod network;
 mod system;
-mod config;
 mod utils;
 
 use anyhow::Result;
@@ -34,17 +34,17 @@ WantedBy=multi-user.target
 "#;
 
 use clap::{Parser, Subcommand};
-use log::{info, error, warn};
+use log::{error, info, warn};
 use std::path::Path;
 use std::process::Command;
 
 use crate::config::loader::load_config;
 use crate::config::structs::ScanSuppressMode;
-use crate::network::wifi::{WifiManager, WifiInterface};
 use crate::network::backend_tuner::BackendTuner;
 use crate::network::governor::Governor;
-use crate::system::power::PowerManager;
+use crate::network::wifi::{WifiInterface, WifiManager};
 use crate::system::optimizer::SystemOptimizer;
+use crate::system::power::PowerManager;
 
 #[derive(Parser)]
 #[command(name = "hifi-wifi")]
@@ -53,7 +53,7 @@ use crate::system::optimizer::SystemOptimizer;
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
-    
+
     /// Run without making changes (show what would be done)
     #[arg(long, global = true)]
     dry_run: bool,
@@ -96,7 +96,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     utils::logger::init();
-    
+
     let cli = Cli::parse();
 
     // Suppress INFO logs for status-like commands (clean output)
@@ -153,7 +153,7 @@ async fn main() -> Result<()> {
         Commands::Scan { mode } => {
             run_scan(&mode, &config)?;
         }
-}
+    }
 
     Ok(())
 }
@@ -165,15 +165,17 @@ fn run_apply(config: &config::structs::Config) -> Result<()> {
     // 1. Detect Wi-Fi interfaces
     let wifi_mgr = WifiManager::new()?;
     let interfaces = wifi_mgr.interfaces();
-    
+
     if interfaces.is_empty() {
         error!("No Wi-Fi interfaces detected!");
         return Ok(());
     }
 
     for ifc in interfaces {
-        info!("Found: {} (driver: {}, category: {:?})", 
-              ifc.name, ifc.driver, ifc.category);
+        info!(
+            "Found: {} (driver: {}, category: {:?})",
+            ifc.name, ifc.driver, ifc.category
+        );
     }
 
     // 2. Detect power state
@@ -182,20 +184,23 @@ fn run_apply(config: &config::structs::Config) -> Result<()> {
     info!("Power source: {:?}", power_mgr.power_source());
 
     // 3. Apply system optimizations
-    if config.system.sysctl_enabled || config.system.driver_tweaks_enabled || config.system.irq_affinity_enabled {
+    if config.system.sysctl_enabled
+        || config.system.driver_tweaks_enabled
+        || config.system.irq_affinity_enabled
+    {
         let sys_opt = SystemOptimizer::new(
             config.system.sysctl_enabled,
             config.system.irq_affinity_enabled,
             config.system.driver_tweaks_enabled,
         );
-        
+
         // Only optimize connected/active interfaces
         let active_interfaces: Vec<WifiInterface> = interfaces
             .iter()
             .filter(|ifc| wifi_mgr.is_interface_connected(ifc))
             .cloned()
             .collect();
-        
+
         if active_interfaces.is_empty() {
             warn!("No active network connections - skipping IRQ optimizations");
         } else {
@@ -226,18 +231,19 @@ fn run_apply(config: &config::structs::Config) -> Result<()> {
             info!("Skipping {} (not connected)", ifc.name);
             continue;
         }
-        
+
         info!("Optimizing connected interface: {}", ifc.name);
         let should_save = match config.power.wlan_power_save.as_str() {
             "on" => {
                 info!("Power save forced ON by config on {}", ifc.name);
                 true
-            },
+            }
             "off" => {
                 info!("Power save forced OFF by config on {}", ifc.name);
                 false
-            },
-            _ => { // adaptive
+            }
+            _ => {
+                // adaptive
                 let adaptive = power_mgr.should_enable_power_save();
                 if adaptive {
                     info!("On battery - enabling power save on {}", ifc.name);
@@ -258,12 +264,18 @@ fn run_apply(config: &config::structs::Config) -> Result<()> {
         // Always apply CAKE, even if we can't get link stats
         let bandwidth = match wifi_mgr.get_link_stats(ifc) {
             Ok(stats) if stats.tx_bitrate_mbps > 0.0 => {
-                info!("Link: {}Mbps TX, {}dBm signal", stats.tx_bitrate_mbps, stats.signal_dbm);
+                info!(
+                    "Link: {}Mbps TX, {}dBm signal",
+                    stats.tx_bitrate_mbps, stats.signal_dbm
+                );
                 // Use 60% of link rate for realistic Wi-Fi throughput
                 (stats.tx_bitrate_mbps * 0.60) as u32
             }
             Ok(stats) => {
-                warn!("Link stats returned 0 bitrate (signal: {}dBm), using 200Mbit default", stats.signal_dbm);
+                warn!(
+                    "Link stats returned 0 bitrate (signal: {}dBm), using 200Mbit default",
+                    stats.signal_dbm
+                );
                 200
             }
             Err(e) => {
@@ -271,7 +283,7 @@ fn run_apply(config: &config::structs::Config) -> Result<()> {
                 200
             }
         };
-        
+
         if let Err(e) = wifi_mgr.apply_cake(ifc, bandwidth.max(1)) {
             error!("Failed to apply CAKE on {}: {}", ifc.name, e);
         }
@@ -284,17 +296,20 @@ fn run_apply(config: &config::structs::Config) -> Result<()> {
     }
 
     info!("\n=== Optimization Complete ===");
-    
+
     // Smart UX: Auto-install and start service for persistence
     let service_path = Path::new("/etc/systemd/system/hifi-wifi.service");
     if !service_path.exists() {
         info!("\nInstalling systemd service for persistent optimization...");
         if let Err(e) = run_install() {
-            warn!("Failed to install service: {}. Optimizations won't persist.", e);
+            warn!(
+                "Failed to install service: {}. Optimizations won't persist.",
+                e
+            );
             return Ok(());
         }
     }
-    
+
     // Enable and start service for persistence across reboots
     info!("Enabling and starting hifi-wifi daemon...");
     let status = Command::new("systemctl")
@@ -309,33 +324,36 @@ fn run_apply(config: &config::structs::Config) -> Result<()> {
             warn!("Failed to enable/start daemon. Run: sudo systemctl enable --now hifi-wifi");
         }
     }
-    
+
     Ok(())
 }
 
 fn run_dry_run() -> Result<()> {
     let wifi_mgr = WifiManager::new()?;
     let power_mgr = PowerManager::new();
-    
-    info!("  - Detected {} Wi-Fi interface(s)", wifi_mgr.interfaces().len());
+
+    info!(
+        "  - Detected {} Wi-Fi interface(s)",
+        wifi_mgr.interfaces().len()
+    );
     for ifc in wifi_mgr.interfaces() {
         info!("    * {} ({:?})", ifc.name, ifc.category);
     }
-    
+
     info!("  - Device type: {:?}", power_mgr.device_type());
     info!("  - Power source: {:?}", power_mgr.power_source());
-    
+
     if power_mgr.should_enable_power_save() {
         info!("  - Would ENABLE power save (on battery)");
     } else {
         info!("  - Would DISABLE power save (performance mode)");
     }
-    
+
     info!("  - Would create /etc/sysctl.d/99-hifi-wifi.conf");
     info!("  - Would create driver-specific modprobe config");
     info!("  - Would apply CAKE qdisc for bufferbloat mitigation");
     info!("  - Would optimize IRQ affinity");
-    
+
     Ok(())
 }
 
@@ -343,7 +361,7 @@ fn run_revert() -> Result<()> {
     info!("=== Reverting hifi-wifi Optimizations ===\n");
 
     let wifi_mgr = WifiManager::new()?;
-    
+
     // Remove CAKE qdiscs and restore defaults
     for ifc in wifi_mgr.interfaces() {
         // Only operate on connected interfaces
@@ -351,16 +369,16 @@ fn run_revert() -> Result<()> {
             info!("Skipping {} (not connected)", ifc.name);
             continue;
         }
-        
+
         info!("Reverting optimizations on {}", ifc.name);
         wifi_mgr.remove_cake(ifc)?;
-        
+
         // Restore power-related defaults based on interface type
         match ifc.interface_type {
             crate::network::wifi::InterfaceType::Wifi => {
                 // Re-enable WiFi power save (safe default)
                 let _ = wifi_mgr.enable_power_save(ifc);
-            },
+            }
             crate::network::wifi::InterfaceType::Ethernet => {
                 // Re-enable EEE on ethernet (power saving default)
                 let _ = crate::network::tc::EthtoolManager::enable_eee(&ifc.name);
@@ -408,16 +426,19 @@ async fn run_monitor(config: &config::structs::Config) -> Result<()> {
         config.wifi.clone(),
         config.power.clone(),
         config.system.clone(),
-    ).await?;
-    
-    info!("Governor initialized, entering main loop (tick: {}s)", 
-          config.global.tick_rate_secs);
-    
+    )
+    .await?;
+
+    info!(
+        "Governor initialized, entering main loop (tick: {}s)",
+        config.global.tick_rate_secs
+    );
+
     // Handle graceful shutdown (SIGINT or SIGTERM)
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
-    
+
     tokio::select! {
         result = governor.run(config.global.tick_rate_secs) => {
             if let Err(e) = result {
@@ -442,22 +463,67 @@ async fn run_monitor(config: &config::structs::Config) -> Result<()> {
 fn freq_to_channel(freq: u32) -> u32 {
     match freq {
         // 2.4 GHz band
-        2412 => 1, 2417 => 2, 2422 => 3, 2427 => 4, 2432 => 5,
-        2437 => 6, 2442 => 7, 2447 => 8, 2452 => 9, 2457 => 10,
-        2462 => 11, 2467 => 12, 2472 => 13, 2484 => 14,
+        2412 => 1,
+        2417 => 2,
+        2422 => 3,
+        2427 => 4,
+        2432 => 5,
+        2437 => 6,
+        2442 => 7,
+        2447 => 8,
+        2452 => 9,
+        2457 => 10,
+        2462 => 11,
+        2467 => 12,
+        2472 => 13,
+        2484 => 14,
         // 5 GHz band (common channels)
-        5180 => 36, 5200 => 40, 5220 => 44, 5240 => 48,
-        5260 => 52, 5280 => 56, 5300 => 60, 5320 => 64,
-        5500 => 100, 5520 => 104, 5540 => 108, 5560 => 112,
-        5580 => 116, 5600 => 120, 5620 => 124, 5640 => 128,
-        5660 => 132, 5680 => 136, 5700 => 140, 5720 => 144,
-        5745 => 149, 5765 => 153, 5785 => 157, 5805 => 161, 5825 => 165,
+        5180 => 36,
+        5200 => 40,
+        5220 => 44,
+        5240 => 48,
+        5260 => 52,
+        5280 => 56,
+        5300 => 60,
+        5320 => 64,
+        5500 => 100,
+        5520 => 104,
+        5540 => 108,
+        5560 => 112,
+        5580 => 116,
+        5600 => 120,
+        5620 => 124,
+        5640 => 128,
+        5660 => 132,
+        5680 => 136,
+        5700 => 140,
+        5720 => 144,
+        5745 => 149,
+        5765 => 153,
+        5785 => 157,
+        5805 => 161,
+        5825 => 165,
         // 6 GHz band (common channels)
-        5955 => 1, 5975 => 5, 5995 => 9, 6015 => 13,
-        6035 => 17, 6055 => 21, 6075 => 25, 6095 => 29,
-        6115 => 33, 6135 => 37, 6155 => 41, 6175 => 45,
-        6195 => 49, 6215 => 53, 6235 => 57, 6255 => 61,
-        6275 => 65, 6295 => 69, 6315 => 73, 6335 => 77,
+        5955 => 1,
+        5975 => 5,
+        5995 => 9,
+        6015 => 13,
+        6035 => 17,
+        6055 => 21,
+        6075 => 25,
+        6095 => 29,
+        6115 => 33,
+        6135 => 37,
+        6155 => 41,
+        6175 => 45,
+        6195 => 49,
+        6215 => 53,
+        6235 => 57,
+        6255 => 61,
+        6275 => 65,
+        6295 => 69,
+        6315 => 73,
+        6335 => 77,
         // Fallback: calculate from frequency
         f if f >= 2400 && f <= 2500 => (f - 2407) / 5,
         f if f >= 5150 && f <= 5900 => (f - 5000) / 5,
@@ -482,9 +548,15 @@ async fn run_status_async() -> Result<()> {
     const NC: &str = "\x1b[0m";
 
     println!();
-    println!("{}{}{}", BOLD, CYAN, "══════════════════════════════════════");
+    println!(
+        "{}{}{}",
+        BOLD, CYAN, "══════════════════════════════════════"
+    );
     println!("       hifi-wifi Status");
-    println!("{}{}{}", BOLD, CYAN, "══════════════════════════════════════");
+    println!(
+        "{}{}{}",
+        BOLD, CYAN, "══════════════════════════════════════"
+    );
     println!();
 
     // 1. Service Status
@@ -505,17 +577,29 @@ async fn run_status_async() -> Result<()> {
     let power_mgr = PowerManager::new();
     println!("{}{}{}┌─ System Info{}", BOLD, BLUE, NC, NC);
     println!("{}│{}  Device: {:?}", BLUE, NC, power_mgr.device_type());
-    let bat_pct = power_mgr.battery_percentage().map(|p| format!("{}%", p)).unwrap_or("N/A".to_string());
-    println!("{}│{}  Power:  {:?} (Battery: {})", BLUE, NC, power_mgr.power_source(), bat_pct);
+    let bat_pct = power_mgr
+        .battery_percentage()
+        .map(|p| format!("{}%", p))
+        .unwrap_or("N/A".to_string());
+    println!(
+        "{}│{}  Power:  {:?} (Battery: {})",
+        BLUE,
+        NC,
+        power_mgr.power_source(),
+        bat_pct
+    );
     println!("{}└{}", BLUE, NC);
     println!();
 
     // 3. Interfaces & Tweaks (CAKE, Power Save)
     let wifi_mgr = WifiManager::new_quiet()?;
     println!("{}{}{}┌─ Interfaces & Tweaks{}", BOLD, BLUE, NC, NC);
-    
+
     if wifi_mgr.interfaces().is_empty() {
-         println!("{}│{}  {}No network interfaces detected{}", BLUE, NC, DIM, NC);
+        println!(
+            "{}│{}  {}No network interfaces detected{}",
+            BLUE, NC, DIM, NC
+        );
     }
 
     for ifc in wifi_mgr.interfaces() {
@@ -523,7 +607,10 @@ async fn run_status_async() -> Result<()> {
             crate::network::wifi::InterfaceType::Wifi => "WiFi",
             crate::network::wifi::InterfaceType::Ethernet => "Ethernet",
         };
-        println!("{}│{}  {}{}{} (Type: {}, Driver: {}, {:?})", BLUE, NC, BOLD, ifc.name, NC, ifc_type, ifc.driver, ifc.category);
+        println!(
+            "{}│{}  {}{}{} (Type: {}, Driver: {}, {:?})",
+            BLUE, NC, BOLD, ifc.name, NC, ifc_type, ifc.driver, ifc.category
+        );
 
         // CAKE Status (tc)
         let qdisc_out = Command::new("tc")
@@ -532,18 +619,25 @@ async fn run_status_async() -> Result<()> {
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default();
-        
+
         if qdisc_out.contains("cake") {
-             // Extract bandwidth and RTT if possible
-             let bw = qdisc_out.split("bandwidth ").nth(1)
+            // Extract bandwidth and RTT if possible
+            let bw = qdisc_out
+                .split("bandwidth ")
+                .nth(1)
                 .and_then(|s| s.split_whitespace().next())
                 .unwrap_or("unknown");
-             let rtt = qdisc_out.split("rtt ").nth(1)
+            let rtt = qdisc_out
+                .split("rtt ")
+                .nth(1)
                 .and_then(|s| s.split_whitespace().next())
                 .unwrap_or("default");
-             println!("{}│{}    ├─ CAKE:       {}[ACTIVE]{} Bandwidth: {} RTT: {}", BLUE, NC, GREEN, NC, bw, rtt);
+            println!(
+                "{}│{}    ├─ CAKE:       {}[ACTIVE]{} Bandwidth: {} RTT: {}",
+                BLUE, NC, GREEN, NC, bw, rtt
+            );
         } else {
-             println!("{}│{}    ├─ CAKE:       {}[INACTIVE]{}", BLUE, NC, RED, NC);
+            println!("{}│{}    ├─ CAKE:       {}[INACTIVE]{}", BLUE, NC, RED, NC);
         }
 
         // Power Save (iw) - WiFi only
@@ -554,11 +648,11 @@ async fn run_status_async() -> Result<()> {
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                 .unwrap_or_default();
-            
+
             let ps_status = if ps_out.contains("on") {
-                 format!("{}[ON]{} (Power Saving)", YELLOW, NC)
+                format!("{}[ON]{} (Power Saving)", YELLOW, NC)
             } else {
-                 format!("{}[OFF]{} (Performance)", GREEN, NC)
+                format!("{}[OFF]{} (Performance)", GREEN, NC)
             };
             println!("{}│{}    ├─ Power Save: {}", BLUE, NC, ps_status);
         } else {
@@ -569,12 +663,14 @@ async fn run_status_async() -> Result<()> {
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
                 .unwrap_or_default();
-            
+
             let eee_status = if eee_out.contains("EEE status: disabled") {
                 format!("{}[DISABLED]{} (Low Latency)", GREEN, NC)
             } else if eee_out.contains("EEE status: enabled") {
                 format!("{}[ENABLED]{} (Power Saving)", YELLOW, NC)
-            } else if eee_out.contains("not supported") || eee_out.contains("Operation not supported") {
+            } else if eee_out.contains("not supported")
+                || eee_out.contains("Operation not supported")
+            {
                 format!("{}[N/A]{} (Not Supported)", DIM, NC)
             } else {
                 format!("{}[UNKNOWN]{}", DIM, NC)
@@ -583,54 +679,62 @@ async fn run_status_async() -> Result<()> {
         }
 
         // IRQ Affinity
-        let is_usb = ifc.driver.contains("usb") || ifc.name.contains("usb") || ifc.driver.starts_with("rt2800usb");
+        let is_usb = ifc.driver.contains("usb")
+            || ifc.name.contains("usb")
+            || ifc.driver.starts_with("rt2800usb");
 
         let irq_status = if is_usb {
-             format!("{}[N/A]{} (USB Device)", DIM, NC)
+            format!("{}[N/A]{} (USB Device)", DIM, NC)
         } else {
-             match crate::system::optimizer::find_wifi_irqs(ifc) {
-                 Ok(irqs) if !irqs.is_empty() => {
-                      // Check if IRQs are pinned to CPU1
-                      let mut all_optimized = true;
-                      let mut all_found = true;
-                      let mut total = 0;
-                      let mut optimized = 0;
-                      
-                      for irq_num in &irqs {
-                          if let Ok(affinity) = std::fs::read_to_string(format!("/proc/irq/{}/smp_affinity", irq_num)) {
-                              total += 1;
-                              let aff = affinity.trim();
-                              // Check if pinned to CPU1 (mask 0x2 in various formats)
-                              let is_cpu1 = aff == "2" || aff == "02" || aff == "00000002" || aff == "000002";
-                              if is_cpu1 {
-                                  optimized += 1;
-                              } else {
-                                  all_optimized = false;
-                              }
-                          } else {
-                              all_found = false;
-                          }
-                      }
-                      
-                      if total == 0 || !all_found {
-                          format!("{}[UNKNOWN]{}", DIM, NC)
-                      } else if all_optimized {
-                          if total > 1 {
-                              format!("{}[OPTIMIZED]{} (CPU 1, {} vectors)", GREEN, NC, total)
-                          } else {
-                              format!("{}[OPTIMIZED]{} (CPU 1)", GREEN, NC)
-                          }
-                      } else if optimized == 0 {
-                          // No IRQs pinned
-                          format!("{}[DEFAULT]{} (System Managed)", DIM, NC)
-                      } else {
-                          // Some IRQs pinned
-                          format!("{}[OPTIMIZED]{} (CPU 1, {}/{} vectors)", GREEN, NC, optimized, total)
-                      }
-                 }
-                 Ok(_) => format!("{}[NOT FOUND]{}", DIM, NC),
-                 Err(_) => format!("{}[UNKNOWN]{}", DIM, NC),
-             }
+            match crate::system::optimizer::find_wifi_irqs(ifc) {
+                Ok(irqs) if !irqs.is_empty() => {
+                    // Check if IRQs are pinned to CPU1
+                    let mut all_optimized = true;
+                    let mut all_found = true;
+                    let mut total = 0;
+                    let mut optimized = 0;
+
+                    for irq_num in &irqs {
+                        if let Ok(affinity) =
+                            std::fs::read_to_string(format!("/proc/irq/{}/smp_affinity", irq_num))
+                        {
+                            total += 1;
+                            let aff = affinity.trim();
+                            // Check if pinned to CPU1 (mask 0x2 in various formats)
+                            let is_cpu1 =
+                                aff == "2" || aff == "02" || aff == "00000002" || aff == "000002";
+                            if is_cpu1 {
+                                optimized += 1;
+                            } else {
+                                all_optimized = false;
+                            }
+                        } else {
+                            all_found = false;
+                        }
+                    }
+
+                    if total == 0 || !all_found {
+                        format!("{}[UNKNOWN]{}", DIM, NC)
+                    } else if all_optimized {
+                        if total > 1 {
+                            format!("{}[OPTIMIZED]{} (CPU 1, {} vectors)", GREEN, NC, total)
+                        } else {
+                            format!("{}[OPTIMIZED]{} (CPU 1)", GREEN, NC)
+                        }
+                    } else if optimized == 0 {
+                        // No IRQs pinned
+                        format!("{}[DEFAULT]{} (System Managed)", DIM, NC)
+                    } else {
+                        // Some IRQs pinned
+                        format!(
+                            "{}[OPTIMIZED]{} (CPU 1, {}/{} vectors)",
+                            GREEN, NC, optimized, total
+                        )
+                    }
+                }
+                Ok(_) => format!("{}[NOT FOUND]{}", DIM, NC),
+                Err(_) => format!("{}[UNKNOWN]{}", DIM, NC),
+            }
         };
         println!("{}│{}    └─ IRQ Pin:    {}", BLUE, NC, irq_status);
         println!("{}│{}", BLUE, NC);
@@ -642,7 +746,7 @@ async fn run_status_async() -> Result<()> {
     let backend = BackendTuner::default();
     println!("{}{}{}┌─ Network Governor & Backend{}", BOLD, BLUE, NC, NC);
     println!("{}│{}  Backend: {:?}", BLUE, NC, backend.backend());
-    
+
     let config = load_config();
     let gov_status = if service_active {
         format!("{}Active{}", GREEN, NC)
@@ -650,9 +754,36 @@ async fn run_status_async() -> Result<()> {
         format!("{}Inactive{}", RED, NC)
     };
     println!("{}│{}  Governor: {}", BLUE, NC, gov_status);
-    println!("{}│{}    ├─ QoS Mode:   {}", BLUE, NC, if config.governor.breathing_cake_enabled { "Breathing CAKE (Dynamic)" } else { "Static CAKE" });
-    println!("{}│{}    ├─ Game Mode:  {}", BLUE, NC, if config.governor.game_mode_enabled { "Available (PPS > 200)" } else { "Disabled" });
-    println!("{}│{}    ├─ Band Steer: {}", BLUE, NC, if config.governor.band_steering_enabled { "Available" } else { "Disabled" });
+    println!(
+        "{}│{}    ├─ QoS Mode:   {}",
+        BLUE,
+        NC,
+        if config.governor.breathing_cake_enabled {
+            "Breathing CAKE (Dynamic)"
+        } else {
+            "Static CAKE"
+        }
+    );
+    println!(
+        "{}│{}    ├─ Game Mode:  {}",
+        BLUE,
+        NC,
+        if config.governor.game_mode_enabled {
+            "Available (PPS > 200)"
+        } else {
+            "Disabled"
+        }
+    );
+    println!(
+        "{}│{}    ├─ Band Steer: {}",
+        BLUE,
+        NC,
+        if config.governor.band_steering_enabled {
+            "Available"
+        } else {
+            "Disabled"
+        }
+    );
     let scan_desc = match config.governor.scan_suppress {
         ScanSuppressMode::Off => format!("{}[ON]{} (Roaming Enabled)", GREEN, NC),
         ScanSuppressMode::On => format!("{}[OFF]{} (Lowest Latency)", YELLOW, NC),
@@ -661,7 +792,7 @@ async fn run_status_async() -> Result<()> {
     println!("{}│{}    └─ Background Scan: {}", BLUE, NC, scan_desc);
 
     println!("{}└{}", BLUE, NC);
-    
+
     // Add fix suggestion if governor not running
     if !service_active {
         println!();
@@ -673,83 +804,119 @@ async fn run_status_async() -> Result<()> {
 
     // 5. Connection Details (NM)
     if let Ok(nm) = NmClient::new().await {
-        println!("{}{}{}┌─ Active Connection (NetworkManager){}", BOLD, BLUE, NC, NC);
+        println!(
+            "{}{}{}┌─ Active Connection (NetworkManager){}",
+            BOLD, BLUE, NC, NC
+        );
         match nm.get_wireless_devices().await {
             Ok(devices) => {
-                 let mut found_conn = false;
-                 for device in devices {
-                     if let Some(ap) = device.active_ap {
-                         found_conn = true;
-                         
-                         // Calculate band steering score
-                         let score = ap.score(10, 15); // Default biases: +10 for 5GHz, +15 for 6GHz
-                         
-                         // Determine channel from frequency
-                         let channel = freq_to_channel(ap.frequency);
-                         
-                         // Signal quality description
-                         let signal_quality = match ap.signal_strength {
-                             s if s >= -50 => format!("{}Excellent{}", GREEN, NC),
-                             s if s >= -60 => format!("{}Good{}", GREEN, NC),
-                             s if s >= -70 => format!("{}Fair{}", YELLOW, NC),
-                             _ => format!("{}Poor{}", RED, NC),
-                         };
-                         
-                         println!("{}│{}  {}{}{}: {}", BLUE, NC, BOLD, device.interface, NC, ap.ssid);
-                         println!("{}│{}    ├─ BSSID:    {}", BLUE, NC, ap.bssid);
-                         println!("{}│{}    ├─ Band:     {:?} (Ch {} @ {} MHz)", BLUE, NC, ap.band, channel, ap.frequency);
-                         println!("{}│{}    ├─ Signal:   {} dBm ({})", BLUE, NC, ap.signal_strength, signal_quality);
-                         println!("{}│{}    ├─ Link:     {} Mbit/s", BLUE, NC, device.bitrate / 1000);
-                         println!("{}│{}    └─ Score:    {} (for band steering)", BLUE, NC, score);
-                     }
-                 }
-                 if !found_conn {
-                     // Check for ethernet connection instead
-                     let eth_conn = Command::new("nmcli")
-                         .args(["-t", "-f", "NAME,DEVICE,TYPE,STATE", "connection", "show", "--active"])
-                         .output()
-                         .ok()
-                         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                         .unwrap_or_default();
-                     
-                     let mut eth_found = false;
-                     for line in eth_conn.lines() {
-                         let parts: Vec<&str> = line.split(':').collect();
-                         if parts.len() >= 4 && parts[2] == "802-3-ethernet" && parts[3] == "activated" {
-                             eth_found = true;
-                             let conn_name = parts[0];
-                             let iface = parts[1];
-                             
-                             // Get ethernet speed
-                             let speed = Command::new("ethtool")
-                                 .arg(iface)
-                                 .output()
-                                 .ok()
-                                 .and_then(|o| {
-                                     let stdout = String::from_utf8_lossy(&o.stdout);
-                                     stdout.lines()
-                                         .find(|l| l.contains("Speed:"))
-                                         .map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string())
-                                 })
-                                 .unwrap_or_else(|| "Unknown".to_string());
-                             
-                             println!("{}│{}  {}{}{}: {} (Ethernet)", BLUE, NC, BOLD, iface, NC, conn_name);
-                             println!("{}│{}    ├─ Type:     Wired Ethernet", BLUE, NC);
-                             println!("{}│{}    ├─ Speed:    {}", BLUE, NC, speed);
-                             println!("{}│{}    └─ Latency:  {}Ultra-low{} (wired)", BLUE, NC, GREEN, NC);
-                         }
-                     }
-                     
-                     if !eth_found {
-                         println!("{}│{}  No active connection found", BLUE, NC);
-                     }
-                 }
+                let mut found_conn = false;
+                for device in devices {
+                    if let Some(ap) = device.active_ap {
+                        found_conn = true;
+
+                        // Calculate band steering score
+                        let score = ap.score(10, 15); // Default biases: +10 for 5GHz, +15 for 6GHz
+
+                        // Determine channel from frequency
+                        let channel = freq_to_channel(ap.frequency);
+
+                        // Signal quality description
+                        let signal_quality = match ap.signal_strength {
+                            s if s >= -50 => format!("{}Excellent{}", GREEN, NC),
+                            s if s >= -60 => format!("{}Good{}", GREEN, NC),
+                            s if s >= -70 => format!("{}Fair{}", YELLOW, NC),
+                            _ => format!("{}Poor{}", RED, NC),
+                        };
+
+                        println!(
+                            "{}│{}  {}{}{}: {}",
+                            BLUE, NC, BOLD, device.interface, NC, ap.ssid
+                        );
+                        println!("{}│{}    ├─ BSSID:    {}", BLUE, NC, ap.bssid);
+                        println!(
+                            "{}│{}    ├─ Band:     {:?} (Ch {} @ {} MHz)",
+                            BLUE, NC, ap.band, channel, ap.frequency
+                        );
+                        println!(
+                            "{}│{}    ├─ Signal:   {} dBm ({})",
+                            BLUE, NC, ap.signal_strength, signal_quality
+                        );
+                        println!(
+                            "{}│{}    ├─ Link:     {} Mbit/s",
+                            BLUE,
+                            NC,
+                            device.bitrate / 1000
+                        );
+                        println!(
+                            "{}│{}    └─ Score:    {} (for band steering)",
+                            BLUE, NC, score
+                        );
+                    }
+                }
+                if !found_conn {
+                    // Check for ethernet connection instead
+                    let eth_conn = Command::new("nmcli")
+                        .args([
+                            "-t",
+                            "-f",
+                            "NAME,DEVICE,TYPE,STATE",
+                            "connection",
+                            "show",
+                            "--active",
+                        ])
+                        .output()
+                        .ok()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                        .unwrap_or_default();
+
+                    let mut eth_found = false;
+                    for line in eth_conn.lines() {
+                        let parts: Vec<&str> = line.split(':').collect();
+                        if parts.len() >= 4
+                            && parts[2] == "802-3-ethernet"
+                            && parts[3] == "activated"
+                        {
+                            eth_found = true;
+                            let conn_name = parts[0];
+                            let iface = parts[1];
+
+                            // Get ethernet speed
+                            let speed = Command::new("ethtool")
+                                .arg(iface)
+                                .output()
+                                .ok()
+                                .and_then(|o| {
+                                    let stdout = String::from_utf8_lossy(&o.stdout);
+                                    stdout.lines().find(|l| l.contains("Speed:")).map(|l| {
+                                        l.split(':').nth(1).unwrap_or("").trim().to_string()
+                                    })
+                                })
+                                .unwrap_or_else(|| "Unknown".to_string());
+
+                            println!(
+                                "{}│{}  {}{}{}: {} (Ethernet)",
+                                BLUE, NC, BOLD, iface, NC, conn_name
+                            );
+                            println!("{}│{}    ├─ Type:     Wired Ethernet", BLUE, NC);
+                            println!("{}│{}    ├─ Speed:    {}", BLUE, NC, speed);
+                            println!(
+                                "{}│{}    └─ Latency:  {}Ultra-low{} (wired)",
+                                BLUE, NC, GREEN, NC
+                            );
+                        }
+                    }
+
+                    if !eth_found {
+                        println!("{}│{}  No active connection found", BLUE, NC);
+                    }
+                }
             }
             Err(_) => println!("{}│{}  Error querying NetworkManager", BLUE, NC),
         }
         println!("{}└{}", BLUE, NC);
     }
-    
+
     Ok(())
 }
 
@@ -760,20 +927,20 @@ fn run_install() -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
-    
+
     info!("=== Installing hifi-wifi Service ===\n");
 
     // Create persistent directory (survives SteamOS A/B updates)
     let var_lib = std::path::Path::new("/var/lib/hifi-wifi");
     fs::create_dir_all(var_lib)?;
-    
+
     // Copy binary to persistent location
     let current_exe = std::env::current_exe()?;
     let target_bin = var_lib.join("hifi-wifi");
-    
+
     info!("Copying binary to {}", target_bin.display());
     fs::copy(&current_exe, &target_bin)?;
-    
+
     // Make executable
     let mut perms = fs::metadata(&target_bin)?.permissions();
     perms.set_mode(0o755);
@@ -788,14 +955,14 @@ fn run_install() -> Result<()> {
             .arg("-v")
             .arg(&target_bin)
             .output();
-        
+
         // If restorecon doesn't set bin_t (var_lib default is var_lib_t), use chcon
         if restorecon.is_ok() {
             // Verify context - if still var_lib_t, force bin_t
             let context_check = Command::new("ls")
                 .args(["-Z", target_bin.to_str().unwrap()])
                 .output();
-            
+
             if let Ok(output) = context_check {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if stdout.contains("var_lib_t") {
@@ -821,15 +988,19 @@ fn run_install() -> Result<()> {
 
     let service_path = std::path::Path::new("/etc/systemd/system/hifi-wifi.service");
     info!("Creating systemd service: {}", service_path.display());
-    
+
     let mut file = File::create(service_path)?;
     file.write_all(service_content.as_bytes())?;
 
     // Reload systemd and enable service
     info!("Enabling service...");
     Command::new("systemctl").args(["daemon-reload"]).output()?;
-    Command::new("systemctl").args(["enable", "hifi-wifi.service"]).output()?;
-    Command::new("systemctl").args(["start", "hifi-wifi.service"]).output()?;
+    Command::new("systemctl")
+        .args(["enable", "hifi-wifi.service"])
+        .output()?;
+    Command::new("systemctl")
+        .args(["start", "hifi-wifi.service"])
+        .output()?;
 
     // Install NetworkManager dispatcher for connection events (per roadmap-beta2.md)
     install_nm_dispatcher()?;
@@ -838,15 +1009,15 @@ fn run_install() -> Result<()> {
     info!("Service installed and started.");
     info!("  Status: systemctl status hifi-wifi");
     info!("  Logs:   journalctl -u hifi-wifi -f");
-    
+
     // Setup CLI access via PATH in .bashrc (persists across SteamOS updates!)
     setup_user_path()?;
-    
+
     // Install user-level auto-repair service for SteamOS (survives updates in ~/.config/)
     if is_steamos() {
         install_user_repair_service()?;
     }
-    
+
     Ok(())
 }
 
@@ -856,17 +1027,20 @@ fn install_nm_dispatcher() -> Result<()> {
     use std::fs::{self, File};
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
-    
+
     let dispatcher_dir = std::path::Path::new("/etc/NetworkManager/dispatcher.d");
     let dispatcher_path = dispatcher_dir.join("99-hifi-wifi-connect");
-    
-    info!("Installing NetworkManager dispatcher: {}", dispatcher_path.display());
-    
+
+    info!(
+        "Installing NetworkManager dispatcher: {}",
+        dispatcher_path.display()
+    );
+
     // Create directory if needed (shouldn't be necessary, but be safe)
     if !dispatcher_dir.exists() {
         fs::create_dir_all(dispatcher_dir)?;
     }
-    
+
     // The dispatcher script - signals the daemon on connection up
     let dispatcher_content = r#"#!/bin/bash
 # hifi-wifi NetworkManager dispatcher
@@ -906,19 +1080,19 @@ logger -t hifi-wifi "Connection event: $INTERFACE $ACTION - signaled daemon"
 
     let mut file = File::create(&dispatcher_path)?;
     file.write_all(dispatcher_content.as_bytes())?;
-    
+
     // Must be executable
     let mut perms = fs::metadata(&dispatcher_path)?.permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&dispatcher_path, perms)?;
-    
+
     // Create the run directory and event file
     let run_dir = std::path::Path::new("/run/hifi-wifi");
     if !run_dir.exists() {
         fs::create_dir_all(run_dir)?;
     }
     fs::write("/run/hifi-wifi/connection-changed", "")?;
-    
+
     info!("NetworkManager dispatcher installed");
     Ok(())
 }
@@ -930,7 +1104,7 @@ fn setup_user_path() -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::io::{BufRead, BufReader, Write};
     use std::process::Command;
-    
+
     let sudo_user = std::env::var("SUDO_USER").unwrap_or_else(|_| "deck".to_string());
     let home = Command::new("getent")
         .args(["passwd", &sudo_user])
@@ -943,12 +1117,12 @@ fn setup_user_path() -> Result<()> {
                 .map(|s| s.to_string())
         })
         .unwrap_or_else(|| format!("/home/{}", sudo_user));
-    
+
     let bashrc_path = format!("{}/.bashrc", home);
     let path_line = r#"export PATH="$PATH:/var/lib/hifi-wifi""#;
-    
+
     info!("Setting up CLI access via PATH in {}", bashrc_path);
-    
+
     // Check if already present
     if let Ok(file) = fs::File::open(&bashrc_path) {
         let reader = BufReader::new(file);
@@ -961,28 +1135,34 @@ fn setup_user_path() -> Result<()> {
             }
         }
     }
-    
+
     // Append to bashrc
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&bashrc_path)?;
-    
+
     writeln!(file)?;
     writeln!(file, "# hifi-wifi CLI access (survives SteamOS updates)")?;
     writeln!(file, "{}", path_line)?;
-    
+
     // Fix ownership
     let uid_output = Command::new("id").args(["-u", &sudo_user]).output()?;
     let gid_output = Command::new("id").args(["-g", &sudo_user]).output()?;
-    let uid: u32 = String::from_utf8_lossy(&uid_output.stdout).trim().parse().unwrap_or(1000);
-    let gid: u32 = String::from_utf8_lossy(&gid_output.stdout).trim().parse().unwrap_or(1000);
-    
+    let uid: u32 = String::from_utf8_lossy(&uid_output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(1000);
+    let gid: u32 = String::from_utf8_lossy(&gid_output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(1000);
+
     let _ = std::os::unix::fs::chown(&bashrc_path, Some(uid), Some(gid));
-    
+
     info!("Added /var/lib/hifi-wifi to PATH in .bashrc");
     info!("Run 'source ~/.bashrc' or open a new terminal to use 'hifi-wifi' command");
-    
+
     Ok(())
 }
 
@@ -991,9 +1171,9 @@ fn setup_user_path() -> Result<()> {
 fn install_user_repair_service() -> Result<()> {
     use std::fs::{self, File};
     use std::io::Write;
-    use std::process::Command;
     use std::os::unix::fs::PermissionsExt;
-    
+    use std::process::Command;
+
     // Get the real user info
     let sudo_user = std::env::var("SUDO_USER").unwrap_or_else(|_| "deck".to_string());
     let home = std::process::Command::new("getent")
@@ -1007,15 +1187,15 @@ fn install_user_repair_service() -> Result<()> {
                 .map(|s| s.to_string())
         })
         .unwrap_or_else(|| format!("/home/{}", sudo_user));
-    
+
     let user_systemd_dir = format!("{}/.config/systemd/user", home);
     let repair_script_path = "/var/lib/hifi-wifi/repair.sh";
-    
+
     info!("Installing user repair service in {}", user_systemd_dir);
-    
+
     // Create user systemd directory
     fs::create_dir_all(&user_systemd_dir)?;
-    
+
     // Create a repair script that handles the sudo/polkit interaction
     // This script ensures hifi-wifi is running and optimizations are applied on EVERY boot
     // It handles both SteamOS update recovery AND normal boot optimization
@@ -1049,12 +1229,13 @@ exec pkexec "$BINARY" bootstrap
     let mut perms = fs::metadata(repair_script_path)?.permissions();
     perms.set_mode(0o755);
     fs::set_permissions(repair_script_path, perms)?;
-    
+
     // Create polkit rule to allow passwordless bootstrap (better UX)
     let polkit_dir = "/etc/polkit-1/rules.d";
     if std::path::Path::new("/etc/polkit-1").exists() {
         let _ = fs::create_dir_all(polkit_dir);
-        let polkit_rule = format!(r#"// Allow hifi-wifi bootstrap without password for {}
+        let polkit_rule = format!(
+            r#"// Allow hifi-wifi bootstrap without password for {}
 polkit.addRule(function(action, subject) {{
     if (action.id == "org.freedesktop.policykit.exec" &&
         action.lookup("program") == "/var/lib/hifi-wifi/hifi-wifi" &&
@@ -1062,19 +1243,22 @@ polkit.addRule(function(action, subject) {{
         return polkit.Result.YES;
     }}
 }});
-"#, sudo_user, sudo_user);
-        
+"#,
+            sudo_user, sudo_user
+        );
+
         let polkit_path = format!("{}/49-hifi-wifi.rules", polkit_dir);
         if let Ok(mut f) = File::create(&polkit_path) {
             let _ = f.write_all(polkit_rule.as_bytes());
             info!("Created polkit rule for passwordless repair");
         }
     }
-    
+
     // Create user systemd service
     // Note: With lingering enabled, this runs when user@.service starts at boot,
     // which happens early - even before graphical session in SteamOS Game Mode
-    let service_content = format!(r#"[Unit]
+    let service_content = format!(
+        r#"[Unit]
 Description=hifi-wifi Auto-Repair (restores after SteamOS updates)
 After=network-online.target
 
@@ -1085,23 +1269,35 @@ RemainAfterExit=yes
 
 [Install]
 WantedBy=default.target
-"#, repair_script_path);
+"#,
+        repair_script_path
+    );
 
     let service_path = format!("{}/hifi-wifi-repair.service", user_systemd_dir);
     let mut service_file = File::create(&service_path)?;
     service_file.write_all(service_content.as_bytes())?;
-    
+
     // Fix ownership of user config directory
     let uid_output = Command::new("id").args(["-u", &sudo_user]).output()?;
     let gid_output = Command::new("id").args(["-g", &sudo_user]).output()?;
-    let uid: u32 = String::from_utf8_lossy(&uid_output.stdout).trim().parse().unwrap_or(1000);
-    let gid: u32 = String::from_utf8_lossy(&gid_output.stdout).trim().parse().unwrap_or(1000);
-    
+    let uid: u32 = String::from_utf8_lossy(&uid_output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(1000);
+    let gid: u32 = String::from_utf8_lossy(&gid_output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(1000);
+
     // Recursively chown the .config/systemd directory
     let _ = Command::new("chown")
-        .args(["-R", &format!("{}:{}", uid, gid), &format!("{}/.config/systemd", home)])
+        .args([
+            "-R",
+            &format!("{}:{}", uid, gid),
+            &format!("{}/.config/systemd", home),
+        ])
         .output();
-    
+
     // Enable lingering for the user - ensures user systemd instance starts at boot
     // This is critical for SteamOS Game Mode where gamescope session might not
     // trigger graphical-session.target the same way as KDE Plasma desktop
@@ -1109,17 +1305,24 @@ WantedBy=default.target
         .args(["enable-linger", &sudo_user])
         .output();
     info!("Enabled user lingering for early boot service start");
-    
+
     // Enable the user service (must run as the user)
     let _ = Command::new("sudo")
         .args(["-u", &sudo_user, "systemctl", "--user", "daemon-reload"])
         .output();
     let _ = Command::new("sudo")
-        .args(["-u", &sudo_user, "systemctl", "--user", "enable", "hifi-wifi-repair.service"])
+        .args([
+            "-u",
+            &sudo_user,
+            "systemctl",
+            "--user",
+            "enable",
+            "hifi-wifi-repair.service",
+        ])
         .output();
-    
+
     info!("User repair service installed - will auto-repair at boot after SteamOS updates");
-    
+
     Ok(())
 }
 
@@ -1127,15 +1330,23 @@ WantedBy=default.target
 fn run_uninstall() -> Result<()> {
     use std::fs;
     use std::process::Command;
-    
+
     info!("=== Uninstalling hifi-wifi Service ===\n");
 
     // Stop and disable services
     info!("Stopping services...");
-    let _ = Command::new("systemctl").args(["stop", "hifi-wifi.service"]).output();
-    let _ = Command::new("systemctl").args(["stop", "hifi-wifi-bootstrap.timer"]).output();
-    let _ = Command::new("systemctl").args(["disable", "hifi-wifi.service"]).output();
-    let _ = Command::new("systemctl").args(["disable", "hifi-wifi-bootstrap.timer"]).output();
+    let _ = Command::new("systemctl")
+        .args(["stop", "hifi-wifi.service"])
+        .output();
+    let _ = Command::new("systemctl")
+        .args(["stop", "hifi-wifi-bootstrap.timer"])
+        .output();
+    let _ = Command::new("systemctl")
+        .args(["disable", "hifi-wifi.service"])
+        .output();
+    let _ = Command::new("systemctl")
+        .args(["disable", "hifi-wifi-bootstrap.timer"])
+        .output();
 
     // Remove service files and symlinks
     let files_to_remove = [
@@ -1148,7 +1359,7 @@ fn run_uninstall() -> Result<()> {
         "/etc/NetworkManager/conf.d/99-hifi-wifi-powersave.conf",
         "/etc/NetworkManager/conf.d/99-hifi-wifi-mac.conf",
     ];
-    
+
     for path in &files_to_remove {
         if std::path::Path::new(path).exists() {
             info!("Removing {}...", path);
@@ -1168,7 +1379,7 @@ fn run_uninstall() -> Result<()> {
 
     // Remove PATH from .bashrc
     remove_user_path();
-    
+
     // Remove user repair service
     remove_user_repair_service();
 
@@ -1182,7 +1393,7 @@ fn run_uninstall() -> Result<()> {
 /// Remove /var/lib/hifi-wifi from user's PATH in .bashrc
 fn remove_user_path() {
     use std::io::{BufRead, BufReader, Write};
-    
+
     let sudo_user = std::env::var("SUDO_USER").unwrap_or_else(|_| "deck".to_string());
     let home = std::process::Command::new("getent")
         .args(["passwd", &sudo_user])
@@ -1195,18 +1406,21 @@ fn remove_user_path() {
                 .map(|s| s.to_string())
         })
         .unwrap_or_else(|| format!("/home/{}", sudo_user));
-    
+
     let bashrc_path = format!("{}/.bashrc", home);
-    
+
     if let Ok(file) = std::fs::File::open(&bashrc_path) {
         let reader = BufReader::new(file);
         let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
-        
+
         // Filter out hifi-wifi PATH lines
-        let filtered: Vec<&String> = lines.iter()
-            .filter(|line| !line.contains("/var/lib/hifi-wifi") && !line.contains("# hifi-wifi CLI access"))
+        let filtered: Vec<&String> = lines
+            .iter()
+            .filter(|line| {
+                !line.contains("/var/lib/hifi-wifi") && !line.contains("# hifi-wifi CLI access")
+            })
             .collect();
-        
+
         if filtered.len() != lines.len() {
             // Write back filtered content
             if let Ok(mut file) = std::fs::File::create(&bashrc_path) {
@@ -1214,13 +1428,23 @@ fn remove_user_path() {
                     let _ = writeln!(file, "{}", line);
                 }
                 info!("Removed PATH entry from .bashrc");
-                
+
                 // Fix ownership
-                let uid_output = std::process::Command::new("id").args(["-u", &sudo_user]).output();
-                let gid_output = std::process::Command::new("id").args(["-g", &sudo_user]).output();
+                let uid_output = std::process::Command::new("id")
+                    .args(["-u", &sudo_user])
+                    .output();
+                let gid_output = std::process::Command::new("id")
+                    .args(["-g", &sudo_user])
+                    .output();
                 if let (Ok(uid_out), Ok(gid_out)) = (uid_output, gid_output) {
-                    let uid: u32 = String::from_utf8_lossy(&uid_out.stdout).trim().parse().unwrap_or(1000);
-                    let gid: u32 = String::from_utf8_lossy(&gid_out.stdout).trim().parse().unwrap_or(1000);
+                    let uid: u32 = String::from_utf8_lossy(&uid_out.stdout)
+                        .trim()
+                        .parse()
+                        .unwrap_or(1000);
+                    let gid: u32 = String::from_utf8_lossy(&gid_out.stdout)
+                        .trim()
+                        .parse()
+                        .unwrap_or(1000);
                     let _ = std::os::unix::fs::chown(&bashrc_path, Some(uid), Some(gid));
                 }
             }
@@ -1231,7 +1455,7 @@ fn remove_user_path() {
 /// Remove the user repair service
 fn remove_user_repair_service() {
     use std::process::Command;
-    
+
     let sudo_user = std::env::var("SUDO_USER").unwrap_or_else(|_| "deck".to_string());
     let home = std::process::Command::new("getent")
         .args(["passwd", &sudo_user])
@@ -1244,27 +1468,41 @@ fn remove_user_repair_service() {
                 .map(|s| s.to_string())
         })
         .unwrap_or_else(|| format!("/home/{}", sudo_user));
-    
+
     // Disable and remove user service
     let _ = Command::new("sudo")
-        .args(["-u", &sudo_user, "systemctl", "--user", "disable", "hifi-wifi-repair.service"])
+        .args([
+            "-u",
+            &sudo_user,
+            "systemctl",
+            "--user",
+            "disable",
+            "hifi-wifi-repair.service",
+        ])
         .output();
     let _ = Command::new("sudo")
-        .args(["-u", &sudo_user, "systemctl", "--user", "stop", "hifi-wifi-repair.service"])
+        .args([
+            "-u",
+            &sudo_user,
+            "systemctl",
+            "--user",
+            "stop",
+            "hifi-wifi-repair.service",
+        ])
         .output();
-    
+
     let service_path = format!("{}/.config/systemd/user/hifi-wifi-repair.service", home);
     if std::path::Path::new(&service_path).exists() {
         let _ = std::fs::remove_file(&service_path);
         info!("Removed user repair service");
     }
-    
+
     // Remove repair script
     let _ = std::fs::remove_file("/var/lib/hifi-wifi/repair.sh");
-    
+
     // Remove polkit rule
     let _ = std::fs::remove_file("/etc/polkit-1/rules.d/49-hifi-wifi.rules");
-    
+
     // Disable lingering (only if no other user services need it)
     // Note: We disable this cautiously - user may have other services that need it
     let _ = Command::new("loginctl")
@@ -1275,13 +1513,19 @@ fn remove_user_repair_service() {
 /// Turn off hifi-wifi (stop service, revert optimizations) for A/B testing
 fn run_off() -> Result<()> {
     use std::process::Command;
-    
+
     info!("=== Turning OFF hifi-wifi ===\n");
 
     // Stop service if running
-    if Command::new("systemctl").args(["is-active", "--quiet", "hifi-wifi"]).status()?.success() {
+    if Command::new("systemctl")
+        .args(["is-active", "--quiet", "hifi-wifi"])
+        .status()?
+        .success()
+    {
         info!("Stopping hifi-wifi service...");
-        Command::new("systemctl").args(["stop", "hifi-wifi.service"]).output()?;
+        Command::new("systemctl")
+            .args(["stop", "hifi-wifi.service"])
+            .output()?;
     } else {
         info!("Service not running.");
     }
@@ -1298,7 +1542,7 @@ fn run_off() -> Result<()> {
 /// Turn on hifi-wifi (start service, apply optimizations) for A/B testing
 fn run_on() -> Result<()> {
     use std::process::Command;
-    
+
     info!("=== Turning ON hifi-wifi ===\n");
 
     // Check if service exists
@@ -1309,7 +1553,9 @@ fn run_on() -> Result<()> {
 
     // Start service
     info!("Starting hifi-wifi service...");
-    Command::new("systemctl").args(["start", "hifi-wifi.service"]).output()?;
+    Command::new("systemctl")
+        .args(["start", "hifi-wifi.service"])
+        .output()?;
 
     info!("\n=== hifi-wifi is ON ===");
     info!("Network optimizations are active.");
@@ -1325,27 +1571,30 @@ fn run_on() -> Result<()> {
 fn run_bootstrap() -> Result<()> {
     use std::fs::File;
     use std::io::Write;
-    use std::process::Command;
     use std::path::Path;
-    
+    use std::process::Command;
+
     let service_path = Path::new("/etc/systemd/system/hifi-wifi.service");
     let binary_path = Path::new("/var/lib/hifi-wifi/hifi-wifi");
-    
+
     // Check if binary exists (if not, nothing we can do)
     if !binary_path.exists() {
-        warn!("Bootstrap: Binary not found at {}, skipping", binary_path.display());
+        warn!(
+            "Bootstrap: Binary not found at {}, skipping",
+            binary_path.display()
+        );
         return Ok(());
     }
-    
+
     let mut service_recreated = false;
-    
+
     // Step 1: Check if main service file exists, recreate if missing
     if !service_path.exists() {
         info!("Bootstrap: Service file missing (likely after SteamOS update), recreating...");
-        
+
         // Recreate service file
         let service_content = SYSTEMD_SERVICE_CONTENT;
-        
+
         if let Ok(mut file) = File::create(service_path) {
             let _ = file.write_all(service_content.as_bytes());
             service_recreated = true;
@@ -1353,13 +1602,15 @@ fn run_bootstrap() -> Result<()> {
         } else {
             error!("Bootstrap: Failed to create service file");
         }
-        
+
         // Reload systemd after creating service file
         info!("Bootstrap: Reloading systemd...");
         let _ = Command::new("systemctl").args(["daemon-reload"]).output();
-        let _ = Command::new("systemctl").args(["enable", "hifi-wifi.service"]).output();
+        let _ = Command::new("systemctl")
+            .args(["enable", "hifi-wifi.service"])
+            .output();
     }
-    
+
     // Step 2: Always apply optimizations on bootstrap
     // This ensures CAKE, power save, sysctl, etc. are applied on every boot
     // even if service is about to start (monitor mode also calls apply, but
@@ -1369,19 +1620,21 @@ fn run_bootstrap() -> Result<()> {
     if let Err(e) = run_apply(&config) {
         error!("Bootstrap: Failed to apply optimizations: {}", e);
     }
-    
+
     // Step 3: Ensure service is running
     let service_running = Command::new("systemctl")
         .args(["is-active", "--quiet", "hifi-wifi.service"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    
+
     if !service_running {
         info!("Bootstrap: Starting monitor service...");
-        let _ = Command::new("systemctl").args(["start", "hifi-wifi.service"]).output();
+        let _ = Command::new("systemctl")
+            .args(["start", "hifi-wifi.service"])
+            .output();
     }
-    
+
     if service_recreated {
         info!("Bootstrap: Full repair complete - hifi-wifi restored after SteamOS update");
     } else {
@@ -1436,7 +1689,10 @@ fn write_nm_powersave_config(mode: &str) -> Result<()> {
     match File::create(NM_POWERSAVE_CONF) {
         Ok(mut file) => {
             file.write_all(content.as_bytes())?;
-            info!("Created NM power save config: {} (wifi.powersave={})", NM_POWERSAVE_CONF, nm_value);
+            info!(
+                "Created NM power save config: {} (wifi.powersave={})",
+                NM_POWERSAVE_CONF, nm_value
+            );
 
             // Reload NM to pick up the new config immediately
             let _ = std::process::Command::new("nmcli")
@@ -1444,7 +1700,10 @@ fn write_nm_powersave_config(mode: &str) -> Result<()> {
                 .output();
         }
         Err(e) => {
-            warn!("Could not create NM powersave config (Read-only filesystem?): {}", e);
+            warn!(
+                "Could not create NM powersave config (Read-only filesystem?): {}",
+                e
+            );
         }
     }
 
@@ -1453,10 +1712,13 @@ fn write_nm_powersave_config(mode: &str) -> Result<()> {
 
 fn is_valid_mac_override(mac: &str) -> bool {
     let lower = mac.to_lowercase();
-    if matches!(lower.as_str(), "permanent" | "preserve" | "random" | "stable" | "stable-ssid") {
+    if matches!(
+        lower.as_str(),
+        "permanent" | "preserve" | "random" | "stable" | "stable-ssid"
+    ) {
         return true;
     }
-    
+
     let parts: Vec<&str> = if mac.contains(':') {
         mac.split(':').collect()
     } else if mac.contains('-') {
@@ -1464,11 +1726,11 @@ fn is_valid_mac_override(mac: &str) -> bool {
     } else {
         return false;
     };
-    
+
     if parts.len() != 6 {
         return false;
     }
-    
+
     for part in parts {
         if part.len() != 2 {
             return false;
@@ -1477,7 +1739,7 @@ fn is_valid_mac_override(mac: &str) -> bool {
             return false;
         }
     }
-    
+
     true
 }
 
@@ -1485,12 +1747,12 @@ fn is_valid_hostname(hostname: &str) -> bool {
     if hostname.is_empty() || hostname.len() > 20 {
         return false;
     }
-    
+
     for label in hostname.split('.') {
         if label.is_empty() || label.len() > 63 {
             return false;
         }
-        
+
         let chars: Vec<char> = label.chars().collect();
         if !chars[0].is_ascii_alphanumeric() {
             return false;
@@ -1498,14 +1760,14 @@ fn is_valid_hostname(hostname: &str) -> bool {
         if !chars[chars.len() - 1].is_ascii_alphanumeric() {
             return false;
         }
-        
+
         for c in chars {
             if !c.is_ascii_alphanumeric() && c != '-' {
                 return false;
             }
         }
     }
-    
+
     true
 }
 
@@ -1519,7 +1781,10 @@ fn write_nm_mac_config(mac: &Option<String>) -> Result<()> {
     if let Some(mac_val) = mac {
         let mac_val = mac_val.trim();
         if !is_valid_mac_override(mac_val) {
-            warn!("Invalid wifi_mac_address '{}' configured. Ignoring.", mac_val);
+            warn!(
+                "Invalid wifi_mac_address '{}' configured. Ignoring.",
+                mac_val
+            );
             return Ok(());
         }
         let content = format!(
@@ -1538,7 +1803,10 @@ fn write_nm_mac_config(mac: &Option<String>) -> Result<()> {
         match File::create(conf_path) {
             Ok(mut file) => {
                 file.write_all(content.as_bytes())?;
-                info!("Created NM MAC config: {} (wifi.cloned-mac-address={})", NM_MAC_CONF, mac_val);
+                info!(
+                    "Created NM MAC config: {} (wifi.cloned-mac-address={})",
+                    NM_MAC_CONF, mac_val
+                );
 
                 // Reload NM to pick up the new config immediately
                 let _ = std::process::Command::new("nmcli")
@@ -1570,7 +1838,10 @@ fn apply_system_hostname(hostname_opt: &Option<String>) -> Result<()> {
             return Ok(());
         }
         if !is_valid_hostname(target_hostname) {
-            warn!("Invalid hostname '{}' configured. Ignoring.", target_hostname);
+            warn!(
+                "Invalid hostname '{}' configured. Ignoring.",
+                target_hostname
+            );
             return Ok(());
         }
 
@@ -1583,7 +1854,10 @@ fn apply_system_hostname(hostname_opt: &Option<String>) -> Result<()> {
         };
 
         if current != target_hostname {
-            info!("System hostname differs (current: '{}', target: '{}'). Setting hostname...", current, target_hostname);
+            info!(
+                "System hostname differs (current: '{}', target: '{}'). Setting hostname...",
+                current, target_hostname
+            );
             match std::process::Command::new("hostnamectl")
                 .arg("set-hostname")
                 .arg(target_hostname)
@@ -1659,7 +1933,10 @@ fn generate_new_config_content(existing: &str, section: &str, key: &str, value: 
             result.push('\n');
         }
         if section == "power" {
-            result.push_str(&format!("\n[{}]\nenabled = true\n{} = {}\n", section, key, value));
+            result.push_str(&format!(
+                "\n[{}]\nenabled = true\n{} = {}\n",
+                section, key, value
+            ));
         } else {
             result.push_str(&format!("\n[{}]\n{} = {}\n", section, key, value));
         }
@@ -1718,7 +1995,8 @@ fn run_power_save(mode: &str, config: &config::structs::Config) -> Result<()> {
             // Show NM persistent config
             if std::path::Path::new(NM_POWERSAVE_CONF).exists() {
                 let nm_content = std::fs::read_to_string(NM_POWERSAVE_CONF).unwrap_or_default();
-                let nm_val = nm_content.lines()
+                let nm_val = nm_content
+                    .lines()
                     .find(|l| l.contains("wifi.powersave"))
                     .and_then(|l| l.split('=').nth(1))
                     .map(|v| v.trim())
@@ -1792,7 +2070,10 @@ fn run_power_save(mode: &str, config: &config::structs::Config) -> Result<()> {
                     }
                     _ => {
                         // Adaptive: let the governor handle it
-                        info!("Power save set to adaptive on {} (governor will manage)", ifc.name);
+                        info!(
+                            "Power save set to adaptive on {} (governor will manage)",
+                            ifc.name
+                        );
                     }
                 }
             }
@@ -1806,13 +2087,18 @@ fn run_power_save(mode: &str, config: &config::structs::Config) -> Result<()> {
 
             if service_running {
                 info!("Restarting hifi-wifi service to apply new config...");
-                let _ = Command::new("systemctl").args(["restart", "hifi-wifi.service"]).output();
+                let _ = Command::new("systemctl")
+                    .args(["restart", "hifi-wifi.service"])
+                    .output();
             }
 
             info!("Power save mode set to '{}' successfully", mode);
         }
         _ => {
-            error!("Invalid mode: '{}'. Use: off, on, adaptive, or status", mode);
+            error!(
+                "Invalid mode: '{}'. Use: off, on, adaptive, or status",
+                mode
+            );
             std::process::exit(1);
         }
     }
@@ -1843,9 +2129,17 @@ fn run_scan(mode: &str, config: &config::structs::Config) -> Result<()> {
 
             let scan_suppress = config.governor.scan_suppress;
             let mode_display = match scan_suppress {
-                ScanSuppressMode::Off => format!("{}ON{} (Background scans allowed — roaming enabled)", GREEN, NC),
-                ScanSuppressMode::On => format!("{}OFF{} (Background scans suppressed — lowest latency)", YELLOW, NC),
-                ScanSuppressMode::Adaptive => format!("{}ADAPTIVE{} (Latency-prioritized scans)", GREEN, NC),
+                ScanSuppressMode::Off => format!(
+                    "{}ON{} (Background scans allowed — roaming enabled)",
+                    GREEN, NC
+                ),
+                ScanSuppressMode::On => format!(
+                    "{}OFF{} (Background scans suppressed — lowest latency)",
+                    YELLOW, NC
+                ),
+                ScanSuppressMode::Adaptive => {
+                    format!("{}ADAPTIVE{} (Latency-prioritized scans)", GREEN, NC)
+                }
             };
             println!("  Config: {}", mode_display);
 
@@ -1862,8 +2156,10 @@ fn run_scan(mode: &str, config: &config::structs::Config) -> Result<()> {
                     ScanSuppressMode::On => "inactive",
                     ScanSuppressMode::Adaptive => "adaptive",
                 };
-                println!("  Service: {}Running{} (scanning {})",
-                    GREEN, NC, service_mode);
+                println!(
+                    "  Service: {}Running{} (scanning {})",
+                    GREEN, NC, service_mode
+                );
             } else {
                 println!("  Service: {}Not running{}", YELLOW, NC);
             }
@@ -1918,13 +2214,18 @@ fn run_scan(mode: &str, config: &config::structs::Config) -> Result<()> {
 
             if service_running {
                 info!("Restarting hifi-wifi service to apply new config...");
-                let _ = Command::new("systemctl").args(["restart", "hifi-wifi.service"]).output();
+                let _ = Command::new("systemctl")
+                    .args(["restart", "hifi-wifi.service"])
+                    .output();
             }
 
             info!("Background scanning set to '{}' successfully", mode);
         }
         _ => {
-            error!("Invalid mode: '{}'. Use: on, off, adaptive, or status", mode);
+            error!(
+                "Invalid mode: '{}'. Use: on, off, adaptive, or status",
+                mode
+            );
             std::process::exit(1);
         }
     }
@@ -1945,35 +2246,50 @@ mod main_tests {
     fn test_generate_new_config_empty() {
         let existing = "";
         let expected = "\n[governor]\nscan_suppress = true\n";
-        assert_eq!(generate_new_config_content(existing, "governor", "scan_suppress", "true"), expected);
+        assert_eq!(
+            generate_new_config_content(existing, "governor", "scan_suppress", "true"),
+            expected
+        );
     }
 
     #[test]
     fn test_generate_new_config_power_empty() {
         let existing = "";
         let expected = "\n[power]\nenabled = true\nwlan_power_save = \"off\"\n";
-        assert_eq!(generate_new_config_content(existing, "power", "wlan_power_save", "\"off\""), expected);
+        assert_eq!(
+            generate_new_config_content(existing, "power", "wlan_power_save", "\"off\""),
+            expected
+        );
     }
 
     #[test]
     fn test_generate_new_config_section_exists_no_key() {
         let existing = "[governor]\nbreathing_cake_enabled = true\n";
         let expected = "[governor]\nbreathing_cake_enabled = true\nscan_suppress = true\n";
-        assert_eq!(generate_new_config_content(existing, "governor", "scan_suppress", "true"), expected);
+        assert_eq!(
+            generate_new_config_content(existing, "governor", "scan_suppress", "true"),
+            expected
+        );
     }
 
     #[test]
     fn test_generate_new_config_key_exists() {
         let existing = "[governor]\nscan_suppress = false\n";
         let expected = "[governor]\nscan_suppress = true\n";
-        assert_eq!(generate_new_config_content(existing, "governor", "scan_suppress", "true"), expected);
+        assert_eq!(
+            generate_new_config_content(existing, "governor", "scan_suppress", "true"),
+            expected
+        );
     }
 
     #[test]
     fn test_generate_new_config_multiple_sections() {
         let existing = "[power]\nenabled = true\nwlan_power_save = \"off\"\n\n[governor]\nscan_suppress = false\n";
         let expected = "[power]\nenabled = true\nwlan_power_save = \"off\"\n\n[governor]\nscan_suppress = true\n";
-        assert_eq!(generate_new_config_content(existing, "governor", "scan_suppress", "true"), expected);
+        assert_eq!(
+            generate_new_config_content(existing, "governor", "scan_suppress", "true"),
+            expected
+        );
     }
 
     #[test]
@@ -1985,7 +2301,10 @@ mod main_tests {
             hostname = "steamdeck"
         "#;
         let parsed: crate::config::structs::Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(parsed.wifi.wifi_mac_address, Some("00:11:22:33:44:55".to_string()));
+        assert_eq!(
+            parsed.wifi.wifi_mac_address,
+            Some("00:11:22:33:44:55".to_string())
+        );
         assert_eq!(parsed.system.hostname, Some("steamdeck".to_string()));
     }
 

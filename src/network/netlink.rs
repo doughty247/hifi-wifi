@@ -3,12 +3,12 @@
 //! Listens to kernel link events (RTMGRP_LINK) using a raw Netlink socket
 //! to trigger instant, event-driven updates in the governor.
 
-use std::os::unix::io::AsRawFd;
-use std::os::fd::{OwnedFd, FromRawFd};
-use tokio::io::unix::AsyncFd;
-use anyhow::{Result, Context};
-use log::{info, debug};
+use anyhow::{Context, Result};
+use log::{debug, info};
 use nix::libc;
+use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::io::AsRawFd;
+use tokio::io::unix::AsyncFd;
 
 pub struct NetlinkListener {
     async_fd: AsyncFd<OwnedFd>,
@@ -27,8 +27,7 @@ impl NetlinkListener {
         };
 
         if fd < 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("Failed to create Netlink socket");
+            return Err(std::io::Error::last_os_error()).context("Failed to create Netlink socket");
         }
 
         // Bind to RTMGRP_LINK (multicast group 1)
@@ -46,7 +45,9 @@ impl NetlinkListener {
 
         if bind_ret < 0 {
             let err = std::io::Error::last_os_error();
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(err).context("Failed to bind Netlink socket to RTMGRP_LINK");
         }
 
@@ -60,18 +61,11 @@ impl NetlinkListener {
     /// Wait for the next Netlink link event to occur (non-blocking async)
     pub async fn next_event(&self) -> Result<()> {
         let mut guard = self.async_fd.readable().await?;
-        
+
         let mut buf = [0u8; 4096];
         let fd = self.async_fd.as_raw_fd();
-        
-        let n = unsafe {
-            libc::recv(
-                fd,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-                0,
-            )
-        };
+
+        let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
 
         if n > 0 {
             debug!("Netlink event received (size: {} bytes)", n);

@@ -3,11 +3,11 @@
 //! Queries the kernel tcp_info struct of active socket connections
 //! owned by gaming and streaming processes to monitor RTT and jitter in real-time.
 
-use std::fs;
-use std::path::Path;
-use std::os::unix::io::AsRawFd;
-use nix::libc;
 use anyhow::Result;
+use nix::libc;
+use std::fs;
+use std::os::unix::io::AsRawFd;
+use std::path::Path;
 
 #[derive(Debug, Clone, Default)]
 pub struct SocketTelemetry {
@@ -21,7 +21,7 @@ pub struct SocketTelemetry {
 pub fn get_process_tcp_telemetry(pid: u32) -> Result<Vec<SocketTelemetry>> {
     let mut results = Vec::new();
     let fd_dir = format!("/proc/{}/fd", pid);
-    
+
     if !Path::new(&fd_dir).exists() {
         return Ok(results);
     }
@@ -33,7 +33,7 @@ pub fn get_process_tcp_telemetry(pid: u32) -> Result<Vec<SocketTelemetry>> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        
+
         // Check if link points to a socket
         let link_target = match fs::read_link(&path) {
             Ok(t) => t.to_string_lossy().to_string(),
@@ -44,10 +44,10 @@ pub fn get_process_tcp_telemetry(pid: u32) -> Result<Vec<SocketTelemetry>> {
             // Open the /proc/<pid>/fd/<fd> descriptor to get a duplicate socket FD
             if let Ok(file) = fs::File::open(&path) {
                 let raw_fd = file.as_raw_fd();
-                
+
                 let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
                 let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
-                
+
                 let ret = unsafe {
                     libc::getsockopt(
                         raw_fd,
@@ -57,7 +57,7 @@ pub fn get_process_tcp_telemetry(pid: u32) -> Result<Vec<SocketTelemetry>> {
                         &mut len,
                     )
                 };
-                
+
                 if ret == 0 {
                     // Check if it's an active connection (state 1 is TCP_ESTABLISHED)
                     if info.tcpi_state == 1 {
@@ -80,7 +80,7 @@ pub fn get_process_tcp_telemetry(pid: u32) -> Result<Vec<SocketTelemetry>> {
 /// Collect telemetry for all gaming and streaming processes
 pub fn get_gaming_telemetry() -> Result<SocketTelemetry> {
     let pids = collect_gaming_pids()?;
-    
+
     let mut total_rtt = 0u64;
     let mut total_rttvar = 0u64;
     let mut total_retrans = 0u32;
@@ -117,13 +117,13 @@ pub fn get_gaming_telemetry() -> Result<SocketTelemetry> {
 /// Collect process IDs for running games, streaming applications, and steam clients
 fn collect_gaming_pids() -> Result<Vec<u32>> {
     let mut pids = Vec::new();
-    
+
     // 1. Try reading PIDs from cgroup user slices (gamescope and app slices)
     let cgroup_base = Path::new("/sys/fs/cgroup/user.slice");
     if cgroup_base.exists() {
         let mut cgroup_paths = Vec::new();
         find_cgroup_procs_paths(cgroup_base, &mut cgroup_paths);
-        
+
         for path in cgroup_paths {
             if let Ok(content) = fs::read_to_string(path) {
                 for line in content.lines() {
@@ -136,7 +136,7 @@ fn collect_gaming_pids() -> Result<Vec<u32>> {
             }
         }
     }
-    
+
     // 2. Fallback: Search all active /proc processes if cgroups were empty or unavailable
     if pids.is_empty() {
         if let Ok(entries) = fs::read_dir("/proc") {
@@ -153,7 +153,7 @@ fn collect_gaming_pids() -> Result<Vec<u32>> {
 
     pids.sort();
     pids.dedup();
-    
+
     Ok(pids)
 }
 
@@ -182,20 +182,20 @@ fn is_gaming_process(pid: u32) -> bool {
     let comm_path = format!("/proc/{}/comm", pid);
     if let Ok(comm) = fs::read_to_string(&comm_path) {
         let comm_lower = comm.trim().to_lowercase();
-        
+
         // Known game clients, streaming engines, and game processes
-        comm_lower.contains("steam") ||
-        comm_lower.contains("gamescope") ||
-        comm_lower.contains("moonlight") ||
-        comm_lower.contains("sunshine") ||
-        comm_lower.contains("retroarch") ||
-        comm_lower.contains("wine") ||
-        comm_lower.contains("proton") ||
-        comm_lower.contains("heroic") ||
-        comm_lower.contains("lutris") ||
-        comm_lower.contains("csgo") ||
-        comm_lower.contains("dota") ||
-        comm_lower.contains("hl2")
+        comm_lower.contains("steam")
+            || comm_lower.contains("gamescope")
+            || comm_lower.contains("moonlight")
+            || comm_lower.contains("sunshine")
+            || comm_lower.contains("retroarch")
+            || comm_lower.contains("wine")
+            || comm_lower.contains("proton")
+            || comm_lower.contains("heroic")
+            || comm_lower.contains("lutris")
+            || comm_lower.contains("csgo")
+            || comm_lower.contains("dota")
+            || comm_lower.contains("hl2")
     } else {
         false
     }
