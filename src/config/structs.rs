@@ -14,6 +14,8 @@ pub struct Config {
     pub backend: BackendConfig,
     #[serde(default)]
     pub governor: GovernorConfig,
+    #[serde(default)]
+    pub multipath: MultipathConfig,
 }
 
 impl Default for Config {
@@ -25,6 +27,7 @@ impl Default for Config {
             system: SystemConfig::default(),
             backend: BackendConfig::default(),
             governor: GovernorConfig::default(),
+            multipath: MultipathConfig::default(),
         }
     }
 }
@@ -124,6 +127,13 @@ pub struct SystemConfig {
     /// Custom system hostname to set at startup
     #[serde(default)]
     pub hostname: Option<String>,
+    /// TCP congestion control algorithm (e.g., "bbr", "cubic")
+    #[serde(default = "default_tcp_congestion")]
+    pub tcp_congestion_control: String,
+}
+
+fn default_tcp_congestion() -> String {
+    "bbr".to_string()
 }
 
 impl Default for SystemConfig {
@@ -133,6 +143,7 @@ impl Default for SystemConfig {
             irq_affinity_enabled: true,
             driver_tweaks_enabled: true,
             hostname: None,
+            tcp_congestion_control: default_tcp_congestion(),
         }
     }
 }
@@ -307,6 +318,23 @@ impl Default for GovernorConfig {
         }
     }
 }
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MultipathConfig {
+    pub enabled: bool,
+    pub game_stream_bitrate: u32,
+    pub auto_suppress_on_congestion: bool,
+}
+
+impl Default for MultipathConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            game_stream_bitrate: 50,
+            auto_suppress_on_congestion: true,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -335,5 +363,22 @@ mod tests {
 
         let c: TestConfig = toml::from_str("scan_suppress = \"adaptive\"").unwrap();
         assert_eq!(c.scan_suppress, ScanSuppressMode::Adaptive);
+    }
+
+    #[test]
+    fn test_backward_compatible_deserialization() {
+        let toml_str = r#"
+            [governor]
+            breathing_cake_enabled = true
+        "#;
+        let c: Config = toml::from_str(toml_str).unwrap();
+        assert!(c.governor.breathing_cake_enabled);
+        assert!(c.governor.ebpf_bypass_enabled);
+        assert!(c.governor.multipath_bonding_enabled);
+        assert_eq!(c.governor.multipath_packet_loss_threshold, 0.02);
+        assert_eq!(c.governor.multipath_jitter_threshold_ms, 15.0);
+        assert!(c.multipath.enabled);
+        assert_eq!(c.multipath.game_stream_bitrate, 50);
+        assert!(c.multipath.auto_suppress_on_congestion);
     }
 }

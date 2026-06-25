@@ -1,27 +1,70 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use log::{debug, info, warn};
-use std::fs;
+use std::net::IpAddr;
 use std::process::Command;
+use std::str::FromStr;
+
+fn is_valid_interface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 15
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
 
 pub struct MultipathManager {
-    is_active: bool,
+    pub is_active: bool,
     primary_interface: Option<String>,
-    secondary_interface: Option<String>,
-    secondary_gateway: Option<String>,
+    gateway_ip: Option<String>,
+    xt_tee_supported: bool,
+    pub mock_mode: bool,
+    pub mock_iptables_fail: bool,
 }
 
 impl MultipathManager {
     pub fn new() -> Self {
+        let xt_tee_supported = Self::check_xt_tee_supported();
+        if !xt_tee_supported {
+            warn!("xt_TEE netfilter kernel module is not supported (modprobe xt_TEE failed). Single-connection temporal duplication will be disabled.");
+        }
         Self {
             is_active: false,
             primary_interface: None,
-            secondary_interface: None,
-            secondary_gateway: None,
+            gateway_ip: None,
+            xt_tee_supported,
+            mock_mode: false,
+            mock_iptables_fail: false,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn enable_mock_mode(&mut self, gateway: &str) {
+        self.mock_mode = true;
+        self.xt_tee_supported = true;
+        self.gateway_ip = Some(gateway.to_string());
+    }
+
+    #[allow(dead_code)]
+    pub fn set_mock_iptables_fail(&mut self, fail: bool) {
+        self.mock_iptables_fail = fail;
+    }
+
+    /// Check if xt_TEE netfilter module is loadable/supported
+    fn check_xt_tee_supported() -> bool {
+        let output = Command::new("modprobe")
+            .args(["--dry-run", "xt_TEE"])
+            .output();
+        match output {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
         }
     }
 
     /// Retrieve the default gateway IP for a specific interface
     fn get_default_gateway(interface: &str) -> Option<String> {
+        if !is_valid_interface_name(interface) {
+            return None;
+        }
         let output = Command::new("ip")
             .args(["route", "show", "dev", interface])
             .output()
@@ -32,39 +75,9 @@ impl MultipathManager {
             let parts: Vec<&str> = line.split_whitespace().collect();
             for i in 0..parts.len() {
                 if parts[i] == "default" && i + 2 < parts.len() && parts[i + 1] == "via" {
-                    return Some(parts[i + 2].to_string());
-                }
-            }
-        }
-        None
-    }
-
-    /// Detect if the interface link carrier is up
-    fn is_interface_up(interface: &str) -> bool {
-        let path = format!("/sys/class/net/{}/carrier", interface);
-        if let Ok(content) = fs::read_to_string(path) {
-            content.trim() == "1"
-        } else {
-            false
-        }
-    }
-
-    /// Identify a suitable secondary interface that has carrier up and a default gateway
-    fn find_secondary_interface(&self, primary: &str) -> Option<(String, String)> {
-        if let Ok(entries) = fs::read_dir("/sys/class/net") {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name != primary
-                    && name != "lo"
-                    && !name.starts_with("ifb")
-                    && !name.starts_with("docker")
-                    && !name.starts_with("br-")
-                    && !name.starts_with("veth")
-                    && Self::is_interface_up(&name)
-                {
-                    if let Some(gw) = Self::get_default_gateway(&name) {
-                        debug!("Found candidate secondary interface: {} via {}", name, gw);
-                        return Some((name, gw));
+                    let gw = parts[i + 2].to_string();
+                    if IpAddr::from_str(&gw).is_ok() {
+                        return Some(gw);
                     }
                 }
             }
@@ -72,111 +85,97 @@ impl MultipathManager {
         None
     }
 
-    /// Activate predictive packet duplication for Moonlight and Steam Link UDP traffic
+    /// Activate single-connection temporal packet duplication for Moonlight and Steam Link UDP traffic.
+    /// Clones egress UDP packets using the iptables TEE target and directs them to the default gateway,
+    /// while adding a loop blocker mark (0x99) to avoid infinite packet-cloning loops.
     pub fn activate_duplication(&mut self, primary: &str) -> Result<()> {
+        if !is_valid_interface_name(primary) {
+            anyhow::bail!("Invalid interface name: {}", primary);
+        }
         if self.is_active {
             return Ok(());
         }
 
-        info!("Telemetry indicates high jitter/loss. Attempting to activate predictive packet duplication on {}...", primary);
+        if !self.xt_tee_supported {
+            warn!("Skipping duplication activation: xt_TEE kernel module is not supported");
+            return Ok(());
+        }
 
-        if let Some((sec_iface, sec_gw)) = self.find_secondary_interface(primary) {
+        info!("Telemetry indicates high jitter/loss. Attempting to activate single-connection temporal packet duplication on {}...", primary);
+
+        let gw_ip_opt = if self.mock_mode {
+            self.gateway_ip.clone().or_else(|| Some("192.168.1.1".to_string()))
+        } else {
+            Self::get_default_gateway(primary)
+        };
+
+        if let Some(gw_ip) = gw_ip_opt {
             info!(
-                "Activating packet duplication from {} to {} via gateway {}",
-                primary, sec_iface, sec_gw
+                "Activating temporal packet duplication on {} via gateway {}",
+                primary, gw_ip
             );
 
             self.primary_interface = Some(primary.to_string());
-            self.secondary_interface = Some(sec_iface);
-            self.secondary_gateway = Some(sec_gw.clone());
+            self.gateway_ip = Some(gw_ip.clone());
 
-            // 1. Create duplication rules using iptables TEE target
-            // Moonlight UDP ports
-            let ml_rule = Command::new("iptables")
-                .args([
-                    "-t",
-                    "mangle",
-                    "-A",
-                    "POSTROUTING",
-                    "-o",
-                    primary,
-                    "-p",
-                    "udp",
-                    "--dport",
-                    "47998:48010",
-                    "-j",
-                    "TEE",
-                    "--gateway",
-                    &sec_gw,
-                ])
-                .output()
-                .context("Failed to run iptables Moonlight duplication command")?;
-
-            let ml_ok = if ml_rule.status.success() {
-                true
+            let (ml_tee_ok, ml_mark_ok, sl_tee_ok, sl_mark_ok) = if self.mock_mode {
+                let success = !self.mock_iptables_fail;
+                (success, success, success, success)
             } else {
-                let stderr = String::from_utf8_lossy(&ml_rule.stderr);
-                warn!("iptables Moonlight TEE failed: {}", stderr.trim());
-                false
+                let ml_tee = Command::new("iptables")
+                    .args([
+                        "-t", "mangle", "-A", "POSTROUTING", "-o", primary,
+                        "-p", "udp", "--dport", "47998:48010",
+                        "-m", "mark", "!", "--mark", "0x99",
+                        "-j", "TEE", "--gateway", &gw_ip
+                    ])
+                    .output();
+                let ml_mark = Command::new("iptables")
+                    .args([
+                        "-t", "mangle", "-A", "POSTROUTING", "-o", primary,
+                        "-p", "udp", "--dport", "47998:48010",
+                        "-m", "mark", "!", "--mark", "0x99",
+                        "-j", "MARK", "--set-mark", "0x99"
+                    ])
+                    .output();
+                let sl_tee = Command::new("iptables")
+                    .args([
+                        "-t", "mangle", "-A", "POSTROUTING", "-o", primary,
+                        "-p", "udp", "--dport", "27031:27036",
+                        "-m", "mark", "!", "--mark", "0x99",
+                        "-j", "TEE", "--gateway", &gw_ip
+                    ])
+                    .output();
+                let sl_mark = Command::new("iptables")
+                    .args([
+                        "-t", "mangle", "-A", "POSTROUTING", "-o", primary,
+                        "-p", "udp", "--dport", "27031:27036",
+                        "-m", "mark", "!", "--mark", "0x99",
+                        "-j", "MARK", "--set-mark", "0x99"
+                    ])
+                    .output();
+
+                let ml_tee_status = ml_tee.ok().map(|o| o.status.success()).unwrap_or(false);
+                let ml_mark_status = ml_mark.ok().map(|o| o.status.success()).unwrap_or(false);
+                let sl_tee_status = sl_tee.ok().map(|o| o.status.success()).unwrap_or(false);
+                let sl_mark_status = sl_mark.ok().map(|o| o.status.success()).unwrap_or(false);
+                (ml_tee_status, ml_mark_status, sl_tee_status, sl_mark_status)
             };
 
-            // Steam Link UDP ports
-            let sl_rule = Command::new("iptables")
-                .args([
-                    "-t",
-                    "mangle",
-                    "-A",
-                    "POSTROUTING",
-                    "-o",
-                    primary,
-                    "-p",
-                    "udp",
-                    "--dport",
-                    "27031:27036",
-                    "-j",
-                    "TEE",
-                    "--gateway",
-                    &sec_gw,
-                ])
-                .output()
-                .context("Failed to run iptables Steam Link duplication command")?;
-
-            let sl_ok = if sl_rule.status.success() {
-                true
-            } else {
-                let stderr = String::from_utf8_lossy(&sl_rule.stderr);
-                warn!("iptables Steam Link TEE failed: {}", stderr.trim());
-                false
-            };
+            let ml_ok = ml_tee_ok && ml_mark_ok;
+            let sl_ok = sl_tee_ok && sl_mark_ok;
 
             if ml_ok && sl_ok {
                 self.is_active = true;
-                info!("Predictive packet duplication active on {}", primary);
+                info!("Single-connection temporal duplication active on {}", primary);
             } else {
-                if ml_ok {
-                    let _ = Command::new("iptables")
-                        .args([
-                            "-t",
-                            "mangle",
-                            "-D",
-                            "POSTROUTING",
-                            "-o",
-                            primary,
-                            "-p",
-                            "udp",
-                            "--dport",
-                            "47998:48010",
-                            "-j",
-                            "TEE",
-                            "--gateway",
-                            &sec_gw,
-                        ])
-                        .output();
-                }
-                warn!("Failed to activate predictive packet duplication rules");
+                warn!("Failed to activate temporal duplication rules, rolling back");
+                self.is_active = true; // force deactivation to run deletions
+                let _ = self.deactivate_duplication();
+                anyhow::bail!("Failed to apply all iptables rules for single-connection temporal duplication");
             }
         } else {
-            debug!("No suitable secondary interface found for packet duplication");
+            debug!("No default gateway found on interface {} for packet duplication", primary);
         }
 
         Ok(())
@@ -188,55 +187,56 @@ impl MultipathManager {
             return Ok(());
         }
 
-        info!("Deactivating predictive packet duplication...");
+        info!("Deactivating single-connection temporal packet duplication...");
 
-        if let (Some(primary), Some(sec_gw)) = (&self.primary_interface, &self.secondary_gateway) {
-            // Delete Moonlight TEE rule
-            let _ = Command::new("iptables")
-                .args([
-                    "-t",
-                    "mangle",
-                    "-D",
-                    "POSTROUTING",
-                    "-o",
-                    primary,
-                    "-p",
-                    "udp",
-                    "--dport",
-                    "47998:48010",
-                    "-j",
-                    "TEE",
-                    "--gateway",
-                    sec_gw,
-                ])
-                .output();
+        if let (Some(primary), Some(gw_ip)) = (&self.primary_interface, &self.gateway_ip) {
+            if !self.mock_mode {
+                // Delete Moonlight TEE rule
+                let _ = Command::new("iptables")
+                    .args([
+                        "-t", "mangle", "-D", "POSTROUTING", "-o", primary,
+                        "-p", "udp", "--dport", "47998:48010",
+                        "-m", "mark", "!", "--mark", "0x99",
+                        "-j", "TEE", "--gateway", gw_ip
+                    ])
+                    .output();
 
-            // Delete Steam Link TEE rule
-            let _ = Command::new("iptables")
-                .args([
-                    "-t",
-                    "mangle",
-                    "-D",
-                    "POSTROUTING",
-                    "-o",
-                    primary,
-                    "-p",
-                    "udp",
-                    "--dport",
-                    "27031:27036",
-                    "-j",
-                    "TEE",
-                    "--gateway",
-                    sec_gw,
-                ])
-                .output();
+                // Delete Moonlight MARK rule
+                let _ = Command::new("iptables")
+                    .args([
+                        "-t", "mangle", "-D", "POSTROUTING", "-o", primary,
+                        "-p", "udp", "--dport", "47998:48010",
+                        "-m", "mark", "!", "--mark", "0x99",
+                        "-j", "MARK", "--set-mark", "0x99"
+                    ])
+                    .output();
+
+                // Delete Steam Link TEE rule
+                let _ = Command::new("iptables")
+                    .args([
+                        "-t", "mangle", "-D", "POSTROUTING", "-o", primary,
+                        "-p", "udp", "--dport", "27031:27036",
+                        "-m", "mark", "!", "--mark", "0x99",
+                        "-j", "TEE", "--gateway", gw_ip
+                    ])
+                    .output();
+
+                // Delete Steam Link MARK rule
+                let _ = Command::new("iptables")
+                    .args([
+                        "-t", "mangle", "-D", "POSTROUTING", "-o", primary,
+                        "-p", "udp", "--dport", "27031:27036",
+                        "-m", "mark", "!", "--mark", "0x99",
+                        "-j", "MARK", "--set-mark", "0x99"
+                    ])
+                    .output();
+            }
         }
 
         self.is_active = false;
         self.primary_interface = None;
-        self.secondary_interface = None;
-        self.secondary_gateway = None;
-        info!("Predictive packet duplication deactivated cleanly");
+        self.gateway_ip = None;
+        info!("Single-connection temporal packet duplication deactivated cleanly");
         Ok(())
     }
 
@@ -261,13 +261,7 @@ mod tests {
         let manager = MultipathManager::new();
         assert!(!manager.is_active);
         assert!(manager.primary_interface.is_none());
-        assert!(manager.secondary_interface.is_none());
-        assert!(manager.secondary_gateway.is_none());
-    }
-
-    #[test]
-    fn test_is_interface_up_invalid() {
-        assert!(!MultipathManager::is_interface_up("nonexistent_device_123"));
+        assert!(manager.gateway_ip.is_none());
     }
 
     #[test]
@@ -278,9 +272,12 @@ mod tests {
     #[test]
     fn test_activate_deactivate_resilient() {
         let mut manager = MultipathManager::new();
-        let res = manager.activate_duplication("nonexistent_device");
+        let res = manager.activate_duplication("dummy0");
         assert!(res.is_ok());
         assert!(!manager.is_active);
+
+        let res = manager.activate_duplication("invalid_device_name_too_long");
+        assert!(res.is_err());
 
         let res = manager.deactivate_duplication();
         assert!(res.is_ok());

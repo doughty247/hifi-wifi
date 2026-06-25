@@ -77,8 +77,23 @@ pub fn get_process_tcp_telemetry(pid: u32) -> Result<Vec<SocketTelemetry>> {
     Ok(results)
 }
 
+static MOCK_TELEMETRY: std::sync::Mutex<Option<SocketTelemetry>> = std::sync::Mutex::new(None);
+
+/// Set simulated TCP telemetry for testing
+#[allow(dead_code)]
+pub fn set_mock_telemetry(telemetry: Option<SocketTelemetry>) {
+    if let Ok(mut mock) = MOCK_TELEMETRY.lock() {
+        *mock = telemetry;
+    }
+}
+
 /// Collect telemetry for all gaming and streaming processes
 pub fn get_gaming_telemetry() -> Result<SocketTelemetry> {
+    if let Ok(mock) = MOCK_TELEMETRY.lock() {
+        if let Some(ref val) = *mock {
+            return Ok(val.clone());
+        }
+    }
     let pids = collect_gaming_pids()?;
 
     let mut total_rtt = 0u64;

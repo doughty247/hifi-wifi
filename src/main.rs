@@ -20,8 +20,9 @@ Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Security hardening
 # Note: ProtectSystem cannot be used - we need to write to /etc/modprobe.d, /etc/sysctl.d, /etc/iwd
-ProtectHome=true
-NoNewPrivileges=true
+# ProtectHome=false is required on SteamOS/Bazzite because helper binaries compiled
+# via Homebrew depend on the dynamic linker interpreter in /home/linuxbrew/.linuxbrew
+ProtectHome=false
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
 
@@ -95,6 +96,12 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Sanitize PATH environment variable to prevent binary hijacking
+    std::env::set_var(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    );
+
     utils::logger::init();
 
     let cli = Cli::parse();
@@ -192,6 +199,7 @@ fn run_apply(config: &config::structs::Config) -> Result<()> {
             config.system.sysctl_enabled,
             config.system.irq_affinity_enabled,
             config.system.driver_tweaks_enabled,
+            config.system.tcp_congestion_control.clone(),
         );
 
         // Only optimize connected/active interfaces
@@ -362,16 +370,15 @@ fn run_revert() -> Result<()> {
 
     let wifi_mgr = WifiManager::new()?;
 
-    // Remove CAKE qdiscs and restore defaults
+    // Remove CAKE qdiscs, ingress qdiscs, eBPF filters, and restore defaults on all interfaces (connected or not)
+    let ebpf_mgr = crate::network::ebpf::EbpfManager::new();
     for ifc in wifi_mgr.interfaces() {
-        // Only operate on connected interfaces
-        if !wifi_mgr.is_interface_connected(ifc) {
-            info!("Skipping {} (not connected)", ifc.name);
-            continue;
-        }
-
         info!("Reverting optimizations on {}", ifc.name);
-        wifi_mgr.remove_cake(ifc)?;
+        let _ = wifi_mgr.remove_cake(ifc);
+        let _ = ebpf_mgr.unload_bypass(&ifc.name);
+        let _ = std::process::Command::new("tc")
+            .args(["qdisc", "del", "dev", &ifc.name, "ingress"])
+            .output();
 
         // Restore power-related defaults based on interface type
         match ifc.interface_type {
@@ -387,16 +394,24 @@ fn run_revert() -> Result<()> {
         }
     }
 
+    // Clean up DSCP cgroups tagging
+    let _ = crate::network::cgroups::set_dscp_prioritization(false);
+
     // Remove NM power save config
     remove_nm_powersave_config();
 
-    // Revert system optimizations
+    // Revert system optimizations (ASPM, TSO/GSO, sysctls)
     let sys_opt = SystemOptimizer::default();
     sys_opt.revert()?;
 
-    // Revert backend tuning
+    // Revert backend tuning (iwd/supplicant)
     let backend_tuner = BackendTuner::default();
     backend_tuner.revert()?;
+
+    // Revert multipath duplication / IPTables TEE rules
+    let mut multipath_mgr = crate::network::multipath::MultipathManager::new();
+    multipath_mgr.is_active = true;
+    let _ = multipath_mgr.deactivate_duplication();
 
     info!("\n=== Revert Complete ===");
     Ok(())
@@ -426,6 +441,7 @@ async fn run_monitor(config: &config::structs::Config) -> Result<()> {
         config.wifi.clone(),
         config.power.clone(),
         config.system.clone(),
+        config.multipath.clone(),
     )
     .await?;
 
@@ -1510,25 +1526,20 @@ fn remove_user_repair_service() {
         .output();
 }
 
-/// Turn off hifi-wifi (stop service, revert optimizations) for A/B testing
+/// Turn off hifi-wifi (stop service, disable service, revert optimizations) for A/B testing
 fn run_off() -> Result<()> {
     use std::process::Command;
 
     info!("=== Turning OFF hifi-wifi ===\n");
 
-    // Stop service if running
-    if Command::new("systemctl")
-        .args(["is-active", "--quiet", "hifi-wifi"])
-        .status()?
-        .success()
-    {
-        info!("Stopping hifi-wifi service...");
-        Command::new("systemctl")
-            .args(["stop", "hifi-wifi.service"])
-            .output()?;
-    } else {
-        info!("Service not running.");
-    }
+    // Stop and disable service
+    info!("Stopping and disabling hifi-wifi service...");
+    let _ = Command::new("systemctl")
+        .args(["stop", "hifi-wifi.service"])
+        .output();
+    let _ = Command::new("systemctl")
+        .args(["disable", "hifi-wifi.service"])
+        .output();
 
     // Revert all optimizations
     run_revert()?;
@@ -1539,7 +1550,7 @@ fn run_off() -> Result<()> {
     Ok(())
 }
 
-/// Turn on hifi-wifi (start service, apply optimizations) for A/B testing
+/// Turn on hifi-wifi (enable and start service) for A/B testing
 fn run_on() -> Result<()> {
     use std::process::Command;
 
@@ -1551,10 +1562,10 @@ fn run_on() -> Result<()> {
         return Ok(());
     }
 
-    // Start service
-    info!("Starting hifi-wifi service...");
+    // Enable and start service
+    info!("Enabling and starting hifi-wifi service...");
     Command::new("systemctl")
-        .args(["start", "hifi-wifi.service"])
+        .args(["enable", "--now", "hifi-wifi.service"])
         .output()?;
 
     info!("\n=== hifi-wifi is ON ===");
@@ -1663,6 +1674,10 @@ const HIFI_CONFIG_PATH: &str = "/etc/hifi-wifi/config.toml";
 ///   2 = disable
 ///   3 = enable
 fn write_nm_powersave_config(mode: &str) -> Result<()> {
+    if mode != "on" && mode != "off" && mode != "adaptive" {
+        anyhow::bail!("Invalid power save mode: {}", mode);
+    }
+
     use std::fs::{self, File};
     use std::io::Write;
 

@@ -129,12 +129,12 @@ setup_homebrew_build_deps() {
     local HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"
     eval "$($HOMEBREW_PREFIX/bin/brew shellenv)"
     
-    # Install gcc (includes everything needed for Rust compilation) and iproute2 (for tc)
+    # Install gcc, llvm (for clang/eBPF compilation), linux-headers (for UAPI headers), and iproute2 (for tc)
     # Note: brew install may return non-zero for post-install warnings
     if [[ $EUID -eq 0 ]] && [[ -n "$SUDO_USER" ]]; then
-        sudo -u "$SUDO_USER" "$HOMEBREW_PREFIX/bin/brew" install gcc iproute2 || true
+        sudo -u "$SUDO_USER" "$HOMEBREW_PREFIX/bin/brew" install gcc llvm linux-headers iproute2 || true
     else
-        brew install gcc iproute2 || true
+        brew install gcc llvm linux-headers iproute2 || true
     fi
     
     # Verify GCC actually works by finding the versioned binary
@@ -186,12 +186,52 @@ setup_homebrew_runtime_deps() {
     return 1
 }
 
-
-# Setup SteamOS build environment using Homebrew (persists across updates!)
-setup_steamos_build_env() {
-    echo -e "${BLUE}[SteamOS] Preparing build environment via Homebrew...${NC}"
-    echo -e "${YELLOW}Homebrew installs to home directory - survives SteamOS updates!${NC}\n"
+# Install eBPF dependencies via Homebrew (when native GCC is available)
+setup_homebrew_ebpf_deps() {
+    echo -e "${BLUE}Installing eBPF compile dependencies via Homebrew...${NC}"
     
+    local HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"
+    eval "$($HOMEBREW_PREFIX/bin/brew shellenv)"
+    
+    if [[ $EUID -eq 0 ]] && [[ -n "$SUDO_USER" ]]; then
+        sudo -u "$SUDO_USER" "$HOMEBREW_PREFIX/bin/brew" install llvm linux-headers iproute2 || true
+    else
+        brew install llvm linux-headers iproute2 || true
+    fi
+    return 0
+}
+
+# Setup SteamOS/Bazzite build environment
+setup_steamos_build_env() {
+    echo -e "${BLUE}[SteamOS/Bazzite] Preparing build environment...${NC}"
+    
+    # Check if a native CC already exists and is working (not Homebrew)
+    local has_native_cc=false
+    if command -v cc &>/dev/null; then
+        local cc_path
+        cc_path=$(command -v cc)
+        if [[ "$cc_path" != *"/home/linuxbrew/.linuxbrew/"* ]]; then
+            has_native_cc=true
+        fi
+    fi
+
+    if [ "$has_native_cc" = true ]; then
+        echo -e "${GREEN}Native system compiler found at $(command -v cc). Skipping Homebrew GCC setup.${NC}"
+        
+        # We still need clang/llvm-strip and linux-headers for eBPF.
+        # Check if native clang is available.
+        if ! command -v clang &>/dev/null; then
+            setup_homebrew || exit 1
+            setup_homebrew_ebpf_deps || exit 1
+            export PATH="/home/linuxbrew/.linuxbrew/opt/llvm/bin:/home/linuxbrew/.linuxbrew/bin:$PATH"
+        fi
+        echo -e "${GREEN}Build environment ready! (using native system CC)${NC}\n"
+        return 0
+    fi
+    
+    echo -e "${YELLOW}No native system compiler found. Setting up Homebrew build environment...${NC}"
+    echo -e "${YELLOW}Homebrew installs to home directory - survives OS updates!${NC}\n"
+
     # Homebrew approach - no root needed, persists across updates
     setup_homebrew || {
         echo -e "${RED}Failed to set up Homebrew${NC}"
@@ -222,11 +262,11 @@ setup_steamos_build_env() {
         ln -sf "$gxx_bin" "$HOMEBREW_PREFIX/bin/c++"
     fi
     
-    export PATH="$HOMEBREW_PREFIX/bin:$PATH"
+    export PATH="$HOMEBREW_PREFIX/opt/llvm/bin:$HOMEBREW_PREFIX/bin:$PATH"
     export CC="$gcc_bin"
     export CXX="$gxx_bin"
     
-    echo -e "${GREEN}Build environment ready! (CC=$CC)${NC}\n"
+    echo -e "${GREEN}Build environment ready! (CC=$CC, PATH includes LLVM)${NC}\n"
 }
 
 # Check for Rust toolchain, install if missing
@@ -454,32 +494,34 @@ main() {
         echo -e "${YELLOW}║  • Intended for testing and feedback purposes only           ║${NC}"
         echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}\n"
         
-        # SteamOS-specific: Homebrew build info
-        if [[ "$distro_id" == "steamos" ]]; then
-            echo -e "${BLUE}SteamOS Build Info:${NC} First-time setup uses Homebrew (~10 min)."
-            echo -e "Build environment persists across SteamOS updates.\n"
+        # SteamOS/Bazzite-specific: Homebrew build info
+        if [[ "$distro_id" == "steamos" || "$distro_id" == "bazzite" ]]; then
+            echo -e "${BLUE}SteamOS/Bazzite Build Info:${NC} First-time setup uses Homebrew (~10 min)."
+            echo -e "Build environment persists across system updates.\n"
         fi
         
             read -p "I understand this is pre-release software for testing only. Continue? [y/N] " -n 1 -r
             echo
             [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
             
-            # Step 2: Setup build environment (SteamOS uses Homebrew, others use system packages)
-            if [[ "$distro_id" == "steamos" ]]; then
+            # Step 2: Setup build environment (SteamOS/Bazzite use Homebrew, others use system packages)
+            if [[ "$distro_id" == "steamos" || "$distro_id" == "bazzite" ]]; then
                 echo -e "${BLUE}[2/5] Setting up Homebrew build environment...${NC}"
                 setup_steamos_build_env
             elif [[ "$distro_id" == *"arch"* ]]; then
-                if ! command -v cc &>/dev/null; then
+                if ! command -v cc &>/dev/null || ! command -v clang &>/dev/null; then
                     echo -e "${BLUE}[2/5] Setting up build environment...${NC}"
                     # Arch but not SteamOS - use pacman directly
-                    sudo pacman -Sy --noconfirm --needed base-devel
+                    sudo pacman -Sy --noconfirm --needed base-devel clang llvm
                 else
                     echo -e "${BLUE}[2/5] Build tools already installed${NC}\n"
                 fi
             else
                 echo -e "${BLUE}[2/5] Build environment check...${NC}"
-                if ! command -v cc &>/dev/null && [[ "$distro_id" == "bazzite" ]]; then
-                    echo -e "${YELLOW}gcc not found. On Bazzite, run: ${BLUE}ujust install-rust${NC}\n"
+                if (! command -v cc &>/dev/null || ! command -v clang &>/dev/null) && [[ "$distro_id" == "bazzite" ]]; then
+                    echo -e "${YELLOW}gcc or clang not found. On Bazzite, run: ${BLUE}ujust install-rust${NC} and install clang/llvm using rpm-ostree if needed.\n"
+                elif ! command -v cc &>/dev/null || ! command -v clang &>/dev/null; then
+                    echo -e "${YELLOW}Warning: gcc or clang not found. Ensure build-essential/base-devel and clang/llvm are installed on your system.${NC}\n"
                 else
                     echo -e "${GREEN}Build tools available${NC}\n"
                 fi
@@ -497,7 +539,7 @@ main() {
     
     # Step 5: Install
     echo -e "${BLUE}[5/5] Installing service...${NC}"
-    if [[ "$distro_id" == "steamos" ]]; then
+    if [[ "$distro_id" == "steamos" || "$distro_id" == "bazzite" ]]; then
         setup_homebrew_runtime_deps || {
             echo -e "${YELLOW}Warning: Failed to setup Homebrew runtime dependencies.${NC}"
         }

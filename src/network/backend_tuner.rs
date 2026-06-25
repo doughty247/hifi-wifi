@@ -118,7 +118,8 @@ impl BackendTuner {
         }
 
         let config = format!(
-            r#"[General]
+            r#"# Created by hifi-wifi
+[General]
 # Use control port over nl80211 for better performance
 ControlPortOverNL80211=true
 
@@ -174,9 +175,29 @@ BandModifier6GHz=3.0
             }
         };
 
-        // Check if DisablePeriodicScan is already set
-        if content.contains("DisablePeriodicScan") {
-            debug!("DisablePeriodicScan already configured in iwd");
+        let target_val = if self.disable_periodic_scan { "true" } else { "false" };
+        let target_line = format!("DisablePeriodicScan={}", target_val);
+
+        if content.contains(&target_line) {
+            debug!("DisablePeriodicScan already configured correctly in iwd");
+            return Ok(());
+        }
+
+        // If it contains the key but with a different value
+        if content.contains("DisablePeriodicScan=") {
+            info!("Updating DisablePeriodicScan in existing iwd config...");
+            let updated = if self.disable_periodic_scan {
+                content.replace("DisablePeriodicScan=false", "DisablePeriodicScan=true")
+            } else {
+                content.replace("DisablePeriodicScan=true", "DisablePeriodicScan=false")
+            };
+            if let Ok(mut file) = File::create(path) {
+                file.write_all(updated.as_bytes())?;
+                // Restart iwd to apply changes
+                let _ = Command::new("systemctl")
+                    .args(["restart", "iwd.service"])
+                    .output();
+            }
             return Ok(());
         }
 
@@ -187,10 +208,33 @@ BandModifier6GHz=3.0
                     let _ = writeln!(file, "\n[Scan]");
                     let _ = writeln!(file, "DisablePeriodicScan=true");
                     info!("Added DisablePeriodicScan to existing iwd config");
+                    // Restart iwd to apply changes
+                    let _ = Command::new("systemctl")
+                        .args(["restart", "iwd.service"])
+                        .output();
                 }
                 Err(e) => {
                     warn!("Could not update iwd config (Read-only filesystem?): {}", e);
                 }
+            }
+        } else if content.contains("[Scan]") {
+            // Scan section exists but doesn't have DisablePeriodicScan key
+            info!("Adding DisablePeriodicScan key under [Scan] in existing iwd config...");
+            let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+            let mut new_lines = Vec::new();
+            for line in lines {
+                new_lines.push(line.clone());
+                if line.trim() == "[Scan]" {
+                    new_lines.push(target_line.clone());
+                }
+            }
+            let updated = new_lines.join("\n");
+            if let Ok(mut file) = File::create(path) {
+                file.write_all(updated.as_bytes())?;
+                // Restart iwd to apply changes
+                let _ = Command::new("systemctl")
+                    .args(["restart", "iwd.service"])
+                    .output();
             }
         }
 
@@ -209,12 +253,26 @@ BandModifier6GHz=3.0
     pub fn revert(&self) -> Result<()> {
         info!("Reverting backend tuning...");
 
-        // Only remove config files we created (check for our marker comment)
         let iwd_conf = Path::new("/etc/iwd/main.conf");
         if iwd_conf.exists() {
             if let Ok(content) = fs::read_to_string(iwd_conf) {
-                if content.contains("ControlPortOverNL80211") {
-                    warn!("Not removing /etc/iwd/main.conf - may contain user customizations");
+                if content.contains("# Created by hifi-wifi") {
+                    info!("Removing /etc/iwd/main.conf created by hifi-wifi...");
+                    let _ = fs::remove_file(iwd_conf);
+                    // Restart iwd to apply default settings
+                    let _ = Command::new("systemctl")
+                        .args(["restart", "iwd.service"])
+                        .output();
+                } else if content.contains("DisablePeriodicScan=true") {
+                    info!("Reverting DisablePeriodicScan in /etc/iwd/main.conf...");
+                    let updated = content.replace("DisablePeriodicScan=true", "DisablePeriodicScan=false");
+                    if let Ok(mut file) = File::create(iwd_conf) {
+                        let _ = file.write_all(updated.as_bytes());
+                        // Restart iwd to apply default settings
+                        let _ = Command::new("systemctl")
+                            .args(["restart", "iwd.service"])
+                            .output();
+                    }
                 }
             }
         }

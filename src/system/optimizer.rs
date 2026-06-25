@@ -16,14 +16,21 @@ pub struct SystemOptimizer {
     sysctl_enabled: bool,
     irq_affinity_enabled: bool,
     driver_tweaks_enabled: bool,
+    tcp_congestion_control: String,
 }
 
 impl SystemOptimizer {
-    pub fn new(sysctl: bool, irq: bool, driver: bool) -> Self {
+    pub fn new(
+        sysctl: bool,
+        irq: bool,
+        driver: bool,
+        tcp_congestion_control: String,
+    ) -> Self {
         Self {
             sysctl_enabled: sysctl,
             irq_affinity_enabled: irq,
             driver_tweaks_enabled: driver,
+            tcp_congestion_control,
         }
     }
 
@@ -58,33 +65,54 @@ impl SystemOptimizer {
         Ok(())
     }
 
+    /// Apply optimizations to a single interface (used for hot-plugged/newly connected interfaces)
+    pub fn apply_single_interface(&self, ifc: &WifiInterface) -> Result<()> {
+        if self.driver_tweaks_enabled {
+            self.apply_driver_config(&ifc.category)?;
+            if ifc.interface_type == InterfaceType::Wifi {
+                if let Err(e) = Self::apply_pcie_aspm_sysfs(&ifc.name, true) {
+                    warn!("Failed to disable PCIe ASPM sysfs for {}: {}", ifc.name, e);
+                }
+            }
+        }
+
+        if self.irq_affinity_enabled {
+            self.optimize_irq_affinity(ifc)?;
+        }
+
+        self.apply_ethtool_settings(ifc)?;
+
+        Ok(())
+    }
+
+
     /// Apply sysctl tuning for network performance
     fn apply_sysctl_tuning(&self) -> Result<()> {
         info!("Applying sysctl network optimizations...");
 
-        let settings = [
-            ("net.ipv4.tcp_congestion_control", "bbr"),
-            ("net.core.rmem_default", "262144"),
-            ("net.core.wmem_default", "262144"),
-            ("net.core.rmem_max", "4194304"),
-            ("net.core.wmem_max", "4194304"),
-            ("net.ipv4.tcp_rmem", "4096 131072 4194304"),
-            ("net.ipv4.tcp_wmem", "4096 65536 4194304"),
-            ("net.ipv4.tcp_fastopen", "3"),
-            ("net.core.netdev_max_backlog", "2000"),
-            ("net.core.netdev_budget", "600"),
-            ("net.core.netdev_budget_usecs", "8000"),
-            ("net.ipv4.tcp_slow_start_after_idle", "0"),
-            ("net.ipv4.tcp_ecn", "1"),
-            ("net.ipv4.tcp_keepalive_time", "60"),
-            ("net.ipv4.tcp_keepalive_intvl", "10"),
-            ("net.ipv4.tcp_keepalive_probes", "6"),
-            ("net.ipv4.tcp_tw_reuse", "1"),
+        let settings = vec![
+            ("net.ipv4.tcp_congestion_control".to_string(), self.tcp_congestion_control.clone()),
+            ("net.core.rmem_default".to_string(), "262144".to_string()),
+            ("net.core.wmem_default".to_string(), "262144".to_string()),
+            ("net.core.rmem_max".to_string(), "4194304".to_string()),
+            ("net.core.wmem_max".to_string(), "4194304".to_string()),
+            ("net.ipv4.tcp_rmem".to_string(), "4096 131072 4194304".to_string()),
+            ("net.ipv4.tcp_wmem".to_string(), "4096 65536 4194304".to_string()),
+            ("net.ipv4.tcp_fastopen".to_string(), "3".to_string()),
+            ("net.core.netdev_max_backlog".to_string(), "2000".to_string()),
+            ("net.core.netdev_budget".to_string(), "600".to_string()),
+            ("net.core.netdev_budget_usecs".to_string(), "8000".to_string()),
+            ("net.ipv4.tcp_slow_start_after_idle".to_string(), "0".to_string()),
+            ("net.ipv4.tcp_ecn".to_string(), "1".to_string()),
+            ("net.ipv4.tcp_keepalive_time".to_string(), "60".to_string()),
+            ("net.ipv4.tcp_keepalive_intvl".to_string(), "10".to_string()),
+            ("net.ipv4.tcp_keepalive_probes".to_string(), "6".to_string()),
+            ("net.ipv4.tcp_tw_reuse".to_string(), "1".to_string()),
         ];
 
         let sysctl_path = Path::new("/etc/sysctl.d/99-hifi-wifi.conf");
         let mut config_content = String::from("# hifi-wifi Network Optimizations\n");
-        for (key, val) in settings.iter() {
+        for (key, val) in &settings {
             config_content.push_str(&format!("{} = {}\n", key, val));
         }
 
@@ -129,7 +157,7 @@ impl SystemOptimizer {
 
         // Fallback: Apply manually
         info!("Applying sysctl settings transiently (runtime only)...");
-        for (key, val) in settings.iter() {
+        for (key, val) in &settings {
             let _ = Command::new("sysctl")
                 .arg("-w")
                 .arg(format!("{}={}", key, val))
@@ -336,10 +364,23 @@ options mwifiex disable_auto_ds=1
     fn apply_ethtool_settings(&self, ifc: &WifiInterface) -> Result<()> {
         debug!("Applying ethtool settings for {}", ifc.name);
 
-        // Disable TSO/GSO for all interfaces (reduces latency, CAKE handles segmentation)
+        // GRO is safe and beneficial for both media types as it coalesces incoming packets
         let _ = Command::new("ethtool")
-            .args(["-K", &ifc.name, "tso", "off", "gso", "off", "gro", "on"])
+            .args(["-K", &ifc.name, "gro", "on"])
             .output();
+
+        // Restrict TSO/GSO disablement strictly to wireless interfaces
+        if ifc.interface_type == InterfaceType::Wifi {
+            info!("Disabling TSO/GSO on wireless interface {} to minimize airtime jitter", ifc.name);
+            let _ = Command::new("ethtool")
+                .args(["-K", &ifc.name, "tso", "off", "gso", "off"])
+                .output();
+        } else {
+            info!("Preserving hardware TSO/GSO offloading on wired interface {} for wire-speed throughput", ifc.name);
+            let _ = Command::new("ethtool")
+                .args(["-K", &ifc.name, "tso", "on", "gso", "on"])
+                .output();
+        }
 
         // Ethernet-specific optimizations for streaming/gaming
         if ifc.interface_type == InterfaceType::Ethernet {
@@ -366,9 +407,17 @@ options mwifiex disable_auto_ds=1
                 }
                 Err(e) => debug!("EEE command failed: {}", e),
             }
+        }
 
-            // Set initial low-latency coalescing defaults for ethernet
-            // The governor will dynamically adjust this based on CPU load
+        // Dynamically check if the interface driver supports ethtool coalescing queries
+        let coalescing_supported = Command::new("ethtool")
+            .args(["-c", &ifc.name])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if coalescing_supported {
+            // Set initial low-latency coalescing defaults
             // rx-usecs=0, rx-frames=1 means "interrupt immediately on every packet"
             let coal_result = Command::new("ethtool")
                 .args([
@@ -396,10 +445,15 @@ options mwifiex disable_auto_ds=1
                 Err(e) => debug!("Coalescing command failed: {}", e),
             }
 
-            // Disable adaptive coalescing (we manage it ourselves based on CPU headroom)
+            // Disable adaptive coalescing
             let _ = Command::new("ethtool")
                 .args(["-C", &ifc.name, "adaptive-rx", "off", "adaptive-tx", "off"])
                 .output();
+        } else {
+            debug!(
+                "Interrupt coalescing query not supported on {}. Skipping coalescing configuration.",
+                ifc.name
+            );
         }
 
         Ok(())
@@ -490,12 +544,17 @@ options mwifiex disable_auto_ds=1
             let _ = fs::remove_file(path);
         }
 
-        // Revert PCIe ASPM for any WiFi interface we find in /sys/class/net
+        // Revert PCIe ASPM and TSO/GSO/gro offloads for any physical interfaces
         if let Ok(entries) = fs::read_dir("/sys/class/net") {
             for entry in entries.filter_map(|e| e.ok()) {
                 let iface_name = entry.file_name().to_string_lossy().into_owned();
                 let device_path = format!("/sys/class/net/{}/device", iface_name);
                 if Path::new(&device_path).exists() {
+                    // Revert TSO/GSO/gro to default enabled state
+                    let _ = Command::new("ethtool")
+                        .args(["-K", &iface_name, "tso", "on", "gso", "on", "gro", "on"])
+                        .output();
+
                     let phy_path = format!("/sys/class/net/{}/phy80211", iface_name);
                     if Path::new(&phy_path).exists() || iface_name.starts_with('w') {
                         let _ = Self::apply_pcie_aspm_sysfs(&iface_name, false);
@@ -504,6 +563,9 @@ options mwifiex disable_auto_ds=1
             }
         }
 
+        // Reload system default sysctl parameters to clear our runtime updates
+        let _ = Command::new("sysctl").arg("--system").output();
+
         info!("System optimizations reverted");
         Ok(())
     }
@@ -511,7 +573,7 @@ options mwifiex disable_auto_ds=1
 
 impl Default for SystemOptimizer {
     fn default() -> Self {
-        Self::new(true, true, true)
+        Self::new(true, true, true, "bbr".to_string())
     }
 }
 

@@ -4,84 +4,33 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+const BPF_BYTECODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/game_bypass.o"));
+
 pub struct EbpfManager {
     bpf_object_path: String,
-    bpf_source_path: String,
+}
+
+fn is_valid_interface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 15
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
 impl EbpfManager {
     pub fn new() -> Self {
         Self {
             bpf_object_path: "/var/lib/hifi-wifi/game_bypass.o".to_string(),
-            bpf_source_path: "/var/lib/hifi-wifi/game_bypass.c".to_string(),
         }
-    }
-
-    /// Setup the BPF source file and attempt to compile it if clang is available
-    fn compile_bpf_program(&self) -> Result<bool> {
-        // Ensure destination folder exists
-        if let Some(parent) = Path::new(&self.bpf_object_path).parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)
-                    .context("Failed to create /var/lib/hifi-wifi directory")?;
-            }
-        }
-
-        // Copy source file to /var/lib/hifi-wifi/game_bypass.c if it exists in the workspace
-        let workspace_src = "src/bpf/game_bypass.c";
-        if Path::new(workspace_src).exists() {
-            fs::copy(workspace_src, &self.bpf_source_path)
-                .context("Failed to copy BPF source file")?;
-        } else {
-            // Write it directly if not running in workspace
-            let embedded_c = include_str!("../bpf/game_bypass.c");
-            fs::write(&self.bpf_source_path, embedded_c)
-                .context("Failed to write embedded BPF source")?;
-        }
-
-        // Check if clang is present
-        let clang_check = Command::new("which").arg("clang").output();
-
-        let has_clang = match clang_check {
-            Ok(out) => out.status.success(),
-            Err(_) => false,
-        };
-
-        if !has_clang {
-            debug!("clang compiler not found, cannot build eBPF source dynamically");
-            return Ok(false);
-        }
-
-        info!(
-            "Compiling eBPF program: {} -> {}",
-            self.bpf_source_path, self.bpf_object_path
-        );
-        let output = Command::new("clang")
-            .args([
-                "-O2",
-                "-target",
-                "bpf",
-                "-c",
-                &self.bpf_source_path,
-                "-o",
-                &self.bpf_object_path,
-            ])
-            .output()
-            .context("Failed to execute clang command")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("clang failed to compile BPF program: {}", stderr.trim());
-            return Ok(false);
-        }
-
-        info!("Successfully compiled eBPF game bypass filter");
-        Ok(true)
     }
 
     /// Load the eBPF game bypass program onto the ingress qdisc of the specified interface.
     /// Falls back to standard TC filtering if BPF compilation or loading is unsupported.
     pub fn load_bypass(&self, interface: &str) -> Result<()> {
+        if !is_valid_interface_name(interface) {
+            anyhow::bail!("Invalid interface name: {}", interface);
+        }
         info!("Setting up eBPF bypass for {}", interface);
 
         // Ensure ingress qdisc exists
@@ -89,12 +38,24 @@ impl EbpfManager {
             .args(["qdisc", "add", "dev", interface, "ingress"])
             .output();
 
-        // 1. Try to compile and load eBPF
-        let mut bpf_ready = Path::new(&self.bpf_object_path).exists();
-        if !bpf_ready {
-            match self.compile_bpf_program() {
-                Ok(success) => bpf_ready = success,
-                Err(e) => warn!("BPF compilation check failed: {}", e),
+        let mut bpf_ready = false;
+
+        if BPF_BYTECODE.is_empty() {
+            debug!("Embedded eBPF bytecode is empty (clang was missing at build time), using legacy TC filters");
+        } else {
+            // Ensure destination directory exists and write BPF bytecode
+            if let Some(parent) = Path::new(&self.bpf_object_path).parent() {
+                if !parent.exists() {
+                    let _ = fs::create_dir_all(parent);
+                }
+            }
+            if fs::write(&self.bpf_object_path, BPF_BYTECODE).is_ok() {
+                bpf_ready = true;
+            } else {
+                warn!(
+                    "Failed to write embedded eBPF object to {}",
+                    self.bpf_object_path
+                );
             }
         }
 
@@ -187,8 +148,10 @@ impl EbpfManager {
         Ok(())
     }
 
-    /// Unload the eBPF or fallback filters from the interface
     pub fn unload_bypass(&self, interface: &str) -> Result<()> {
+        if !is_valid_interface_name(interface) {
+            anyhow::bail!("Invalid interface name: {}", interface);
+        }
         info!("Unloading bypass filters on {}", interface);
 
         // Remove filters at prio 1, 2, 3 on the ingress qdisc
@@ -210,7 +173,6 @@ mod tests {
     fn test_ebpf_manager_init() {
         let manager = EbpfManager::new();
         assert_eq!(manager.bpf_object_path, "/var/lib/hifi-wifi/game_bypass.o");
-        assert_eq!(manager.bpf_source_path, "/var/lib/hifi-wifi/game_bypass.c");
     }
 
     #[test]

@@ -9,17 +9,42 @@ use std::collections::VecDeque;
 use std::process::Command;
 use std::sync::{OnceLock, RwLock};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClassStats {
+    pub bytes: u64,
+    pub packets: u64,
+    pub dropped: u64,
+    pub overlimits: u64,
+}
+
 static GATEWAY_RTT: RwLock<Option<String>> = RwLock::new(None);
 static TC_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 /// Check if the `tc` command is available on the system
 pub fn is_tc_available() -> bool {
     *TC_AVAILABLE.get_or_init(|| {
-        let available = Command::new("tc").arg("-Version").output().is_ok();
-        if !available {
-            warn!("Traffic Control (tc) binary not found. CAKE QoS features will be disabled.");
+        match Command::new("tc").arg("-Version").output() {
+            Ok(output) => {
+                if output.status.success() {
+                    true
+                } else {
+                    warn!(
+                        "Traffic Control (tc) check exited with code {:?}. Stderr: {}",
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                    false
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Traffic Control (tc) binary check failed to execute: {}. PATH is {:?}",
+                    e,
+                    std::env::var("PATH").unwrap_or_default()
+                );
+                false
+            }
         }
-        available
     })
 }
 
@@ -151,6 +176,8 @@ pub struct TcManager {
     internet_download_mbit: Option<u32>,
     /// Configured internet upload limit (Mbit)
     internet_upload_mbit: Option<u32>,
+    /// Exponential moving average of physical bandwidth (Mbit)
+    ema_bandwidth: Option<f64>,
 }
 
 impl TcManager {
@@ -208,6 +235,7 @@ impl TcManager {
             qos_use_ifb: resolved_qos_use_ifb,
             internet_download_mbit,
             internet_upload_mbit,
+            ema_bandwidth: None,
         }
     }
 
@@ -237,6 +265,17 @@ impl TcManager {
             debug!("CAKE: Measured throughput {} Mbit/s", mbit);
         }
     }
+
+    /// Get the last applied bandwidth (Mbit)
+    pub fn get_last_bandwidth(&self) -> Option<u32> {
+        self.last_bandwidth
+    }
+
+    /// Get the current measured throughput in Mbps
+    pub fn get_current_throughput_mbps(&self) -> u32 {
+        self.throughput_bandwidth.unwrap_or(0)
+    }
+
 
     /// Enter game mode - freeze CAKE at current value
     pub fn enter_game_mode(&mut self) {
@@ -273,11 +312,19 @@ impl TcManager {
             return false;
         }
 
-        // Use PHY rate as the primary signal
-        // Throughput monitoring is informational only - PHY rate changes based on signal quality
-        // and the driver/AP negotiate the best rate. Measuring actual throughput and capping
-        // to it creates a chicken-and-egg problem during speed tests.
-        let effective_mbit = phy_rate_mbit;
+        // Use PHY rate as the primary signal, smoothed via an EMA (alpha=0.3)
+        // to filter out transient microsecond-level hardware tracking dips.
+        let rate_f = phy_rate_mbit as f64;
+        let smoothed_f = if let Some(prev) = self.ema_bandwidth {
+            let alpha = 0.3;
+            let current = (alpha * rate_f) + ((1.0 - alpha) * prev);
+            self.ema_bandwidth = Some(current);
+            current
+        } else {
+            self.ema_bandwidth = Some(rate_f);
+            rate_f
+        };
+        let effective_mbit = smoothed_f.round() as u32;
 
         // Stage 1: Add to rolling window
         self.sample_window.push_back(effective_mbit);
@@ -469,85 +516,210 @@ impl TcManager {
             }
         }
 
-        // 2. Egress Shaping (Upload)
-        // Check number of TX queues on the interface: /sys/class/net/<interface>/queues/tx-*
-        let mut tx_queues = 1;
-        if let Ok(entries) = std::fs::read_dir(format!("/sys/class/net/{}/queues", interface)) {
-            let count = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_name().to_string_lossy().starts_with("tx-"))
-                .count();
-            if count > 0 {
-                tx_queues = count;
-            }
-        }
-
+        // 2. Egress Shaping (Upload) via classful HTB hierarchy
+        // This enforces a global bandwidth ceiling across both primary CAKE and netem delay paths.
         info!(
-            "Applying egress CAKE on {} (upload limit: {}mbit, TX queues: {})",
-            interface, upload_limit, tx_queues
+            "Applying egress HTB classful hierarchy on {} (upload limit: {}mbit)",
+            interface, upload_limit
         );
 
-        if tx_queues > 1 {
-            // Apply mq as root qdisc (preserving EDCA)
-            let output = Command::new("tc")
-                .args([
-                    "qdisc", "replace", "dev", interface, "root", "handle", "1:", "mq",
-                ])
-                .output()
-                .context("Failed to apply mq root qdisc")?;
-
-            if output.status.success() {
-                // Apply CAKE on each queue parent under mq
-                let rtt = detect_gateway_rtt();
-                for q in 1..=tx_queues {
-                    let parent_id = format!("1:{}", q);
-                    let output = Command::new("tc")
-                        .args([
-                            "qdisc",
-                            "replace",
-                            "dev",
-                            interface,
-                            "parent",
-                            &parent_id,
-                            "cake",
-                            "bandwidth",
-                            &format!("{}mbit", upload_limit),
-                            "rtt",
-                            &rtt,
-                            "diffserv4",
-                            "dual-dsthost",
-                            "nat",
-                            "wash",
-                            "ack-filter",
-                        ])
-                        .output();
-
-                    if let Ok(out_cake) = output {
-                        if !out_cake.status.success() {
-                            let stderr = String::from_utf8_lossy(&out_cake.stderr);
-                            warn!(
-                                "Failed to apply CAKE to parent {} on {}: {}",
-                                parent_id, interface, stderr
-                            );
-                        }
-                    }
-                }
-                info!("Egress MQ+CAKE applied successfully on {}", interface);
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!("Failed to apply mq root on {}: {}", interface, stderr);
-                // Fallback to direct root CAKE if mq fails
-                self.apply_root_cake_fallback(interface, upload_limit)?;
+        if self.last_bandwidth.is_some() {
+            if let Err(e) = self.change_htb_rates(interface, upload_limit) {
+                warn!("Failed to dynamically change HTB rates: {}, re-applying fresh hierarchy", e);
+                self.apply_htb_hierarchy(interface, upload_limit)?;
             }
         } else {
-            // Single TX queue: apply CAKE directly as root
-            self.apply_root_cake_fallback(interface, upload_limit)?;
+            self.apply_htb_hierarchy(interface, upload_limit)?;
         }
 
         self.last_bandwidth = Some(dynamic_bandwidth);
         Ok(())
     }
 
+    /// Set up a fresh classful HTB shaping hierarchy on the given interface.
+    /// Redirects marked packets (fwmark 0x99) into the 3ms netem delay queue (1:12)
+    /// while primary traffic runs through the unshaped flow-isolating CAKE queue (1:11).
+    pub fn apply_htb_hierarchy(&self, interface: &str, bandwidth_mbit: u32) -> Result<()> {
+        if !is_tc_available() {
+            return Ok(());
+        }
+
+        // 1. Delete any existing root qdisc
+        let _ = Command::new("tc")
+            .args(["qdisc", "del", "dev", interface, "root"])
+            .output();
+
+        // 2. Add root HTB qdisc with default class 11
+        let root_status = Command::new("tc")
+            .args([
+                "qdisc", "add", "dev", interface, "root", "handle", "1:", "htb", "default", "11"
+            ])
+            .status()
+            .context("Failed to add root htb qdisc")?;
+
+        if !root_status.success() {
+            anyhow::bail!("Failed to add root htb qdisc on {}", interface);
+        }
+
+        // 3. Add parent class with global ceiling.
+        // Allocate custom burst depth based on rate: ~15KB per 100 Mbps (min 15k) to prevent token starvation.
+        let burst_kb = ((bandwidth_mbit as f64 / 100.0) * 15.0).max(15.0).round() as u32;
+        let burst_str = format!("{}k", burst_kb);
+
+        let parent_status = Command::new("tc")
+            .args([
+                "class", "add", "dev", interface, "parent", "1:", "classid", "1:1",
+                "htb", "rate", &format!("{}mbit", bandwidth_mbit),
+                "ceil", &format!("{}mbit", bandwidth_mbit),
+                "burst", &burst_str, "cburst", &burst_str
+            ])
+            .status()
+            .context("Failed to add parent htb class")?;
+
+        if !parent_status.success() {
+            anyhow::bail!("Failed to add parent htb class on {}", interface);
+        }
+
+        // 4. Add primary class (1:11) - 85% rate limit, can borrow up to ceil (100%)
+        let primary_rate = (bandwidth_mbit * 85) / 100;
+        let primary_rate = primary_rate.max(1);
+        let primary_status = Command::new("tc")
+            .args([
+                "class", "add", "dev", interface, "parent", "1:1", "classid", "1:11",
+                "htb", "rate", &format!("{}mbit", primary_rate),
+                "ceil", &format!("{}mbit", bandwidth_mbit),
+                "burst", &burst_str, "cburst", &burst_str, "prio", "1"
+            ])
+            .status()
+            .context("Failed to add primary htb class")?;
+
+        if !primary_status.success() {
+            anyhow::bail!("Failed to add primary htb class on {}", interface);
+        }
+
+        // 5. Add delayed class (1:12) - 15% rate limit, can borrow up to ceil
+        let delayed_rate = (bandwidth_mbit * 15) / 100;
+        let delayed_rate = delayed_rate.max(1);
+        let delayed_status = Command::new("tc")
+            .args([
+                "class", "add", "dev", interface, "parent", "1:1", "classid", "1:12",
+                "htb", "rate", &format!("{}mbit", delayed_rate),
+                "ceil", &format!("{}mbit", bandwidth_mbit),
+                "burst", &burst_str, "cburst", &burst_str, "prio", "2"
+            ])
+            .status()
+            .context("Failed to add delayed htb class")?;
+
+        if !delayed_status.success() {
+            anyhow::bail!("Failed to add delayed htb class on {}", interface);
+        }
+
+        // 6. Attach CAKE leaf to primary class (1:11) for pure flow isolation
+        let rtt = detect_gateway_rtt();
+        let cake_status = Command::new("tc")
+            .args([
+                "qdisc", "add", "dev", interface, "parent", "1:11", "handle", "10:",
+                "cake", "rtt", &rtt, "triple-isolate", "wash", "nat", "ack-filter"
+            ])
+            .status()
+            .context("Failed to attach CAKE qdisc to primary class")?;
+
+        if !cake_status.success() {
+            anyhow::bail!("Failed to attach CAKE qdisc to primary class on {}", interface);
+        }
+
+        // 7. Attach netem delay leaf to delayed class (1:12)
+        let netem_status = Command::new("tc")
+            .args([
+                "qdisc", "add", "dev", interface, "parent", "1:12", "handle", "20:",
+                "netem", "delay", "3ms"
+            ])
+            .status()
+            .context("Failed to attach netem qdisc to delayed class")?;
+
+        if !netem_status.success() {
+            anyhow::bail!("Failed to attach netem qdisc to delayed class on {}", interface);
+        }
+
+        // 8. Add fw filter mapping fwmark 0x99 to class 1:12
+        let filter_status = Command::new("tc")
+            .args([
+                "filter", "add", "dev", interface, "protocol", "ip", "parent", "1:0",
+                "prio", "1", "handle", "0x99", "fw", "flowid", "1:12"
+            ])
+            .status()
+            .context("Failed to add fwmark filter to root")?;
+
+        if !filter_status.success() {
+            anyhow::bail!("Failed to add fwmark filter on {}", interface);
+        }
+
+        info!("HTB+CAKE+netem egress shaping hierarchy applied successfully on {}", interface);
+        Ok(())
+    }
+
+    /// Dynamically change the rates of the existing HTB classes without deleting/rebuilding the qdisc structure.
+    pub fn change_htb_rates(&self, interface: &str, bandwidth_mbit: u32) -> Result<()> {
+        if !is_tc_available() {
+            return Ok(());
+        }
+
+        let burst_kb = ((bandwidth_mbit as f64 / 100.0) * 15.0).max(15.0).round() as u32;
+        let burst_str = format!("{}k", burst_kb);
+
+        // 1. Change parent class rate
+        let parent_status = Command::new("tc")
+            .args([
+                "class", "change", "dev", interface, "parent", "1:", "classid", "1:1",
+                "htb", "rate", &format!("{}mbit", bandwidth_mbit),
+                "ceil", &format!("{}mbit", bandwidth_mbit),
+                "burst", &burst_str, "cburst", &burst_str
+            ])
+            .status()
+            .context("Failed to change parent htb class rates")?;
+
+        if !parent_status.success() {
+            anyhow::bail!("Failed to change parent htb class rates on {}", interface);
+        }
+
+        // 2. Change primary class rate (85%)
+        let primary_rate = (bandwidth_mbit * 85) / 100;
+        let primary_rate = primary_rate.max(1);
+        let primary_status = Command::new("tc")
+            .args([
+                "class", "change", "dev", interface, "parent", "1:1", "classid", "1:11",
+                "htb", "rate", &format!("{}mbit", primary_rate),
+                "ceil", &format!("{}mbit", bandwidth_mbit),
+                "burst", &burst_str, "cburst", &burst_str, "prio", "1"
+            ])
+            .status()
+            .context("Failed to change primary htb class rates")?;
+
+        if !primary_status.success() {
+            anyhow::bail!("Failed to change primary htb class rates on {}", interface);
+        }
+
+        // 3. Change delayed class rate (15%)
+        let delayed_rate = (bandwidth_mbit * 15) / 100;
+        let delayed_rate = delayed_rate.max(1);
+        let delayed_status = Command::new("tc")
+            .args([
+                "class", "change", "dev", interface, "parent", "1:1", "classid", "1:12",
+                "htb", "rate", &format!("{}mbit", delayed_rate),
+                "ceil", &format!("{}mbit", bandwidth_mbit),
+                "burst", &burst_str, "cburst", &burst_str, "prio", "2"
+            ])
+            .status()
+            .context("Failed to change delayed htb class rates")?;
+
+        if !delayed_status.success() {
+            anyhow::bail!("Failed to change delayed htb class rates on {}", interface);
+        }
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     fn apply_root_cake_fallback(&self, interface: &str, bandwidth_mbit: u32) -> Result<()> {
         let rtt = detect_gateway_rtt();
         let output = Command::new("tc")
@@ -657,6 +829,92 @@ impl TcManager {
 
         info!("Cleaned up ingress redirect for {}", interface);
         Ok(())
+    }
+
+    /// Query statistics for HTB classes 1:11 (primary) and 1:12 (delayed)
+    pub fn query_class_stats(&self, interface: &str) -> Result<(Option<ClassStats>, Option<ClassStats>)> {
+        if !is_tc_available() {
+            return Ok((None, None));
+        }
+
+        let output = Command::new("tc")
+            .args(["-s", "class", "show", "dev", interface])
+            .output()
+            .context("Failed to run tc -s class show")?;
+
+        if !output.status.success() {
+            return Ok((None, None));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(Self::parse_class_stats(&stdout))
+    }
+
+    pub fn parse_class_stats(stdout: &str) -> (Option<ClassStats>, Option<ClassStats>) {
+        let mut primary_stats = None;
+        let mut delayed_stats = None;
+        let mut current_class: Option<&str> = None;
+
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.contains("class htb 1:11") {
+                current_class = Some("1:11");
+            } else if line.contains("class htb 1:12") {
+                current_class = Some("1:12");
+            } else if line.starts_with("class htb") || line.starts_with("class cake") {
+                current_class = None;
+            } else if let Some(class_id) = current_class {
+                if line.contains("Sent") && line.contains("bytes") {
+                    let mut stats = ClassStats::default();
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    
+                    if parts.len() > 1 {
+                        if let Ok(bytes) = parts[1].parse::<u64>() {
+                            stats.bytes = bytes;
+                        }
+                    }
+                    
+                    if let Some(pos) = parts.iter().position(|&p| p == "pkt" || p == "packets") {
+                        if pos > 0 {
+                            if let Ok(pkts) = parts[pos - 1].parse::<u64>() {
+                                stats.packets = pkts;
+                            }
+                        }
+                    }
+
+                    if let Some(pos) = parts.iter().position(|&p| p.contains("dropped")) {
+                        let val_str = if pos + 1 < parts.len() {
+                            parts[pos + 1].trim_matches(|c| c == ',' || c == ')')
+                        } else {
+                            ""
+                        };
+                        if let Ok(dropped) = val_str.parse::<u64>() {
+                            stats.dropped = dropped;
+                        }
+                    }
+
+                    if let Some(pos) = parts.iter().position(|&p| p.contains("overlimits")) {
+                        let val_str = if pos + 1 < parts.len() {
+                            parts[pos + 1].trim_matches(|c| c == ',' || c == ')')
+                        } else {
+                            ""
+                        };
+                        if let Ok(overlimits) = val_str.parse::<u64>() {
+                            stats.overlimits = overlimits;
+                        }
+                    }
+
+                    if class_id == "1:11" {
+                        primary_stats = Some(stats);
+                    } else {
+                        delayed_stats = Some(stats);
+                    }
+                    current_class = None;
+                }
+            }
+        }
+
+        (primary_stats, delayed_stats)
     }
 
     #[cfg(test)]
@@ -804,21 +1062,24 @@ mod tests {
         tc.update_bandwidth(100); // This triggers first application
         tc.set_last_applied(100);
 
-        // Big DROP should trigger fast (1 tick) after meeting threshold
-        // Need to fill window with 50s first
-        tc.update_bandwidth(50);
-        tc.update_bandwidth(50);
-        assert!(tc.update_bandwidth(50)); // Now median is 50, triggers drop!
+        // Big DROP should trigger fast (1 tick of hysteresis, but needs 2 samples to shift median)
+        assert!(!tc.update_bandwidth(50)); // Tick 1 (median remains 100, no change)
+        assert!(tc.update_bandwidth(50));  // Tick 2 (median becomes 85, decrease of 15, approved immediately!)
+        
+        // Manually reset tc to a stable 50 to test the sustained increase
+        tc.sample_window.clear();
+        tc.sample_window.push_back(50);
+        tc.sample_window.push_back(50);
+        tc.sample_window.push_back(50);
+        tc.ema_bandwidth = Some(50.0);
         tc.set_last_applied(50);
 
-        // Big INCREASE should require 3 ticks
-        // Fill window with 100s - need several to shift median and pass hysteresis
-        tc.update_bandwidth(100); // Tick 1 - shifts window
-        tc.update_bandwidth(100); // Tick 2 - median now ~100
-        tc.update_bandwidth(100); // Tick 3
-                                  // May need one more tick since the window needs to stabilize
-        let triggered = tc.update_bandwidth(100);
-        assert!(triggered, "Increase should trigger after 3+ ticks");
+        // Big INCREASE should require 3 ticks of hysteresis
+        assert!(!tc.update_bandwidth(100)); // Tick 1 (median remains 50, no change)
+        assert!(!tc.update_bandwidth(100)); // Tick 2 (median becomes 65, hysteresis tick 1)
+        assert!(!tc.update_bandwidth(100)); // Tick 3 (median becomes 76, hysteresis tick 2)
+        let triggered = tc.update_bandwidth(100); // Tick 4 (median becomes 83, hysteresis tick 3 - approved!)
+        assert!(triggered, "Increase should trigger after 3 ticks of sustained increase");
     }
 
     #[test]
@@ -848,5 +1109,28 @@ mod tests {
         tc.update_bandwidth(50);
         tc.update_bandwidth(50);
         // Would need full hysteresis cycle to trigger
+    }
+
+    #[test]
+    fn test_parse_class_stats() {
+        let sample_output = "class htb 1:11 parent 1:1 leaf 10: prio 1 rate 85000Kbit ceil 100Mbit burst 15Kb cburst 15Kb\n\
+                             Sent 412598042 bytes 283120 pkt (dropped 12, overlimits 45 requeues 0)\n\
+                             lended: 12840 borrowed: 0 giant: 0\n\
+                             class htb 1:12 parent 1:1 leaf 20: prio 2 rate 15000Kbit ceil 100Mbit burst 15Kb cburst 15Kb\n\
+                             Sent 102934 bytes 431 pkt (dropped 1, overlimits 2 requeues 0)\n\
+                             lended: 431 borrowed: 0 giant: 0";
+        let (primary, delayed) = TcManager::parse_class_stats(sample_output);
+        
+        let p = primary.unwrap();
+        assert_eq!(p.bytes, 412598042);
+        assert_eq!(p.packets, 283120);
+        assert_eq!(p.dropped, 12);
+        assert_eq!(p.overlimits, 45);
+
+        let d = delayed.unwrap();
+        assert_eq!(d.bytes, 102934);
+        assert_eq!(d.packets, 431);
+        assert_eq!(d.dropped, 1);
+        assert_eq!(d.overlimits, 2);
     }
 }
