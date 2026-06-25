@@ -869,7 +869,7 @@ The ~2-5% throughput reduction is the cost of flow isolation and queue managemen
 - **cgroup v2 & DSCP Tagging**: Prioritizes gaming/streaming application traffic (e.g. `gamescope.slice`) and ports via `nftables` postrouting rules.
 - **Proactive Roaming Governor**: Triggers active NetworkManager association handovers to target BSSIDs when signal strength drops below `-80 dBm`.
 - **Zero-Copy eBPF Game Bypass**: Intercepts UDP streams (Moonlight, Steam Link) at the kernel driver entry point for sub-millisecond bypass latency.
-- **Predictive Multi-Path Bonding**: Duplicates game traffic across secondary links when packet loss or jitter exceeds threshold.
+- **Temporal Packet Duplication**: Duplicates game traffic on the active interface when packet loss or jitter exceeds threshold to establish packet-level redundancy.
 - **Media-Aware Congestion Switching**: Switches system default congestion control on the fly (BBR baseline, pivoting to Cubic under active CAKE saturation).
 
 ### v3.2.0 - Decky Plugin & QAM Integration
