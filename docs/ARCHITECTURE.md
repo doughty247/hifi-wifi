@@ -862,7 +862,7 @@ The ~2-5% throughput reduction is the cost of flow isolation and queue managemen
 
 ## Future Roadmap
 
-### v3.1.0 - Core Engine & "Lambda Core" (Implemented)
+### v3.1.0 - Core Engine & "Real CAKE" (Implemented)
 
 - **Zero-Overhead Netlink Listener**: Subscribes directly to kernel netlink link multicast groups (`RTMGRP_LINK`) to trigger instant governor ticks on carrier changes.
 - **RTT-Driven CAKE Scaling**: Queries the kernel's `TCP_INFO` struct dynamically to scale CAKE queue capacity during wireless jitter spikes.
