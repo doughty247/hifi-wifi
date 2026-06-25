@@ -10,7 +10,8 @@
 *.flag
 
 # Internal documentation (not for release)
-docs/
+docs/*
+!docs/ARCHITECTURE.md
 
 # Added by cargo
 
