@@ -487,7 +487,7 @@ main() {
         echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
         echo -e "${YELLOW}║              ⚠️  PRE-RELEASE SOFTWARE WARNING  ⚠️              ║${NC}"
         echo -e "${YELLOW}╠══════════════════════════════════════════════════════════════╣${NC}"
-        echo -e "${YELLOW}║  This is a RELEASE CANDIDATE - please report any issues.    ║${NC}"
+        echo -e "${YELLOW}║  This is a BETA RELEASE - please report any issues.          ║${NC}"
         echo -e "${YELLOW}║                                                              ║${NC}"
         echo -e "${YELLOW}║  • NOT recommended for production use                        ║${NC}"
         echo -e "${YELLOW}║  • May contain bugs or unexpected behavior                   ║${NC}"
