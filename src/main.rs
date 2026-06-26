@@ -92,6 +92,9 @@ enum Commands {
         /// Mode: on (allow scans for roaming), off (suppress scans for lowest latency), status (show current)
         mode: String,
     },
+    /// Check system compatibility for advanced networking features
+    #[command(name = "check-compat")]
+    CheckCompat,
 }
 
 #[tokio::main]
@@ -102,12 +105,31 @@ async fn main() -> Result<()> {
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     );
 
+    // Register custom panic hook to revert system configurations on unexpected crash
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        default_hook(panic_info);
+        eprintln!("\n[FATAL] hifi-wifi encountered an unhandled panic!");
+        eprintln!("Executing panic recovery routine to restore default network stack configurations...");
+        let _ = std::process::Command::new("/var/lib/hifi-wifi/hifi-wifi")
+            .arg("revert")
+            .output()
+            .or_else(|_| {
+                if let Ok(current_exe) = std::env::current_exe() {
+                    std::process::Command::new(current_exe).arg("revert").output()
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, "Could not find current exe"))
+                }
+            });
+    }));
+
     utils::logger::init();
 
     let cli = Cli::parse();
 
     // Suppress INFO logs for status-like commands (clean output)
     let is_status_cmd = matches!(cli.command, Some(Commands::Status))
+        || matches!(cli.command, Some(Commands::CheckCompat))
         || matches!(cli.command, Some(Commands::PowerSave { ref mode }) if mode == "status")
         || matches!(cli.command, Some(Commands::Scan { ref mode }) if mode == "status");
     if is_status_cmd {
@@ -160,8 +182,78 @@ async fn main() -> Result<()> {
         Commands::Scan { mode } => {
             run_scan(&mode, &config)?;
         }
+        Commands::CheckCompat => {
+            run_check_compat()?;
+        }
     }
 
+    Ok(())
+}
+
+fn run_check_compat() -> Result<()> {
+    println!("# hifi-wifi System Compatibility Check\n");
+    println!("| Component / Check | Status | Details |");
+    println!("| --- | --- | --- |");
+
+    // 1. Check xt_TEE support
+    let tee_status = std::process::Command::new("modprobe")
+        .args(["--dry-run", "xt_TEE"])
+        .output();
+    let tee_ok = match tee_status {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
+    };
+    if tee_ok {
+        println!("| **xt_TEE (Netfilter)** | :white_check_mark: Supported | Kernel module xt_TEE is available for temporal packet duplication. |");
+    } else {
+        println!("| **xt_TEE (Netfilter)** | :x: Unsupported | Kernel module xt_TEE is missing. Temporal packet duplication will be disabled. |");
+    }
+
+    // 2. Check /sys/fs/bpf
+    let bpf_fs_ok = std::path::Path::new("/sys/fs/bpf").exists();
+    if bpf_fs_ok {
+        println!("| **BPF Filesystem** | :white_check_mark: Mounted | `/sys/fs/bpf` is available for eBPF maps/programs. |");
+    } else {
+        println!("| **BPF Filesystem** | :x: Missing | `/sys/fs/bpf` is not mounted. eBPF features might fail or operate in legacy mode. |");
+    }
+
+    // 3. Check allowed congestion controls
+    let cc_allowed = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_allowed_congestion_control")
+        .unwrap_or_default();
+    let has_bbr = cc_allowed.contains("bbr");
+    let has_cubic = cc_allowed.contains("cubic");
+    if has_bbr {
+        println!("| **TCP BBR** | :white_check_mark: Available | BBR is supported by the kernel for optimal low-latency baseline. |");
+    } else {
+        println!("| **TCP BBR** | :warning: Missing | BBR is not listed in allowed congestion controls. Will fallback to Cubic/Default. |");
+    }
+    if has_cubic {
+        println!("| **TCP Cubic** | :white_check_mark: Available | Cubic is supported by the kernel for saturated CAKE shaper pivots. |");
+    } else {
+        println!("| **TCP Cubic** | :warning: Missing | Cubic is not listed in allowed congestion controls. |");
+    }
+
+    // 4. Check tc capability
+    let tc_status = std::process::Command::new("tc")
+        .arg("-V")
+        .output();
+    if tc_status.is_ok() {
+        println!("| **Traffic Control (tc)** | :white_check_mark: Available | `tc` utility is installed for shaping and eBPF loading. |");
+    } else {
+        println!("| **Traffic Control (tc)** | :x: Missing | `tc` utility is missing from the system. QoS shaper and eBPF will not work. |");
+    }
+
+    // 5. Check iptables capability
+    let iptables_status = std::process::Command::new("iptables")
+        .arg("-V")
+        .output();
+    if iptables_status.is_ok() {
+        println!("| **iptables** | :white_check_mark: Available | `iptables` utility is installed for packet duplication rules. |");
+    } else {
+        println!("| **iptables** | :x: Missing | `iptables` utility is missing. Temporal packet duplication will not work. |");
+    }
+
+    println!("\nCompatibility check finished.");
     Ok(())
 }
 
