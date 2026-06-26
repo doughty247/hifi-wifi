@@ -183,17 +183,19 @@ async fn main() -> Result<()> {
             run_scan(&mode, &config)?;
         }
         Commands::CheckCompat => {
-            run_check_compat()?;
+            let _ = run_check_compat()?;
         }
     }
 
     Ok(())
 }
 
-fn run_check_compat() -> Result<()> {
+fn run_check_compat() -> Result<bool> {
     println!("# hifi-wifi System Compatibility Check\n");
     println!("| Component / Check | Status | Details |");
     println!("| --- | --- | --- |");
+
+    let mut compatible = true;
 
     // 1. Check xt_TEE support
     let tee_status = std::process::Command::new("modprobe")
@@ -206,7 +208,7 @@ fn run_check_compat() -> Result<()> {
     if tee_ok {
         println!("| **xt_TEE (Netfilter)** | :white_check_mark: Supported | Kernel module xt_TEE is available for temporal packet duplication. |");
     } else {
-        println!("| **xt_TEE (Netfilter)** | :x: Unsupported | Kernel module xt_TEE is missing. Temporal packet duplication will be disabled. |");
+        println!("| **xt_TEE (Netfilter)** | :warning: Unsupported | Kernel module xt_TEE is missing. Temporal packet duplication will be disabled. |");
     }
 
     // 2. Check /sys/fs/bpf
@@ -214,7 +216,7 @@ fn run_check_compat() -> Result<()> {
     if bpf_fs_ok {
         println!("| **BPF Filesystem** | :white_check_mark: Mounted | `/sys/fs/bpf` is available for eBPF maps/programs. |");
     } else {
-        println!("| **BPF Filesystem** | :x: Missing | `/sys/fs/bpf` is not mounted. eBPF features might fail or operate in legacy mode. |");
+        println!("| **BPF Filesystem** | :warning: Missing | `/sys/fs/bpf` is not mounted. eBPF features might fail or operate in legacy mode. |");
     }
 
     // 3. Check allowed congestion controls
@@ -233,14 +235,16 @@ fn run_check_compat() -> Result<()> {
         println!("| **TCP Cubic** | :warning: Missing | Cubic is not listed in allowed congestion controls. |");
     }
 
-    // 4. Check tc capability
+    // 4. Check tc capability (MANDATORY)
     let tc_status = std::process::Command::new("tc")
         .arg("-V")
         .output();
-    if tc_status.is_ok() {
+    let tc_ok = tc_status.is_ok();
+    if tc_ok {
         println!("| **Traffic Control (tc)** | :white_check_mark: Available | `tc` utility is installed for shaping and eBPF loading. |");
     } else {
-        println!("| **Traffic Control (tc)** | :x: Missing | `tc` utility is missing from the system. QoS shaper and eBPF will not work. |");
+        println!("| **Traffic Control (tc)** | :x: Missing (Mandatory) | `tc` utility is missing from the system. QoS shaper and eBPF will not work. |");
+        compatible = false;
     }
 
     // 5. Check iptables capability
@@ -250,11 +254,11 @@ fn run_check_compat() -> Result<()> {
     if iptables_status.is_ok() {
         println!("| **iptables** | :white_check_mark: Available | `iptables` utility is installed for packet duplication rules. |");
     } else {
-        println!("| **iptables** | :x: Missing | `iptables` utility is missing. Temporal packet duplication will not work. |");
+        println!("| **iptables** | :warning: Missing | `iptables` utility is missing. Temporal packet duplication will not work. |");
     }
 
     println!("\nCompatibility check finished.");
-    Ok(())
+    Ok(compatible)
 }
 
 fn run_apply(config: &config::structs::Config) -> Result<()> {
@@ -1037,6 +1041,13 @@ fn run_install() -> Result<()> {
     use std::process::Command;
 
     info!("=== Installing hifi-wifi Service ===\n");
+
+    info!("Running system compatibility checks...");
+    let is_compatible = run_check_compat()?;
+    if !is_compatible {
+        anyhow::bail!("Installation aborted: System is missing mandatory dependencies (Traffic Control `tc`). Please install the `iproute2` package containing `tc` and try again.");
+    }
+    info!("System compatibility checks passed! Proceeding with installation...\n");
 
     // Create persistent directory (survives SteamOS A/B updates)
     let var_lib = std::path::Path::new("/var/lib/hifi-wifi");
