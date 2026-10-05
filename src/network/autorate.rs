@@ -361,6 +361,9 @@ pub struct Target {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Status {
+    /// "detect", "busy" or "always"
+    #[serde(default)]
+    pub mode: String,
     pub iface: String,
     pub network: Option<String>,
     pub shaping: bool,
@@ -371,6 +374,9 @@ pub struct Status {
     pub delay_ms: Option<f64>,
     pub reflectors_responding: usize,
     pub bloat_events: u64,
+    /// Worst smoothed latency increase seen while the link was busy (this session)
+    #[serde(default)]
+    pub worst_delay_ms: Option<f64>,
     pub updated_unix: u64,
 }
 
@@ -431,6 +437,7 @@ struct Session {
     pinger_fast: bool,
     /// Link is busy: probe fast and watch for bloat, even before any shaper exists
     watching: bool,
+    worst_delay_ms: Option<f64>,
     pinger_started_at: Option<Instant>,
     last_sample_at: Option<Instant>,
     /// Back off after a failed shaper install instead of retrying every tick
@@ -535,6 +542,7 @@ impl Settings {
             busy_until: None,
             pinger_fast: false,
             watching: false,
+            worst_delay_ms: None,
             pinger_started_at: None,
             last_sample_at: None,
             retry_install_at: None,
@@ -641,7 +649,24 @@ fn step(s: &mut Session, settings: &Settings, sample_tx: &mpsc::Sender<Sample>) 
             }
             update_pinger(s, settings, sample_tx);
             if s.ticks.is_multiple_of(4) {
-                write_status(s);
+                write_status(s, settings);
+            }
+            return;
+        }
+        // Detect: watch and record only. Never shape, and drop any shaper left by another mode.
+        AutorateMode::Detect => {
+            if s.shaper.is_some() {
+                stop_shaping(s, settings);
+            }
+            s.ctrl.tick(dl_kbit, ul_kbit);
+            if busy {
+                if let Some(d) = s.ctrl.delta_ms() {
+                    s.worst_delay_ms = Some(s.worst_delay_ms.map_or(d, |w| w.max(d)));
+                }
+            }
+            update_pinger(s, settings, sample_tx);
+            if s.ticks.is_multiple_of(4) {
+                write_status(s, settings);
             }
             return;
         }
@@ -687,7 +712,7 @@ fn step(s: &mut Session, settings: &Settings, sample_tx: &mpsc::Sender<Sample>) 
     }
 
     if s.ticks.is_multiple_of(4) {
-        write_status(s);
+        write_status(s, settings);
     }
 }
 
@@ -807,9 +832,10 @@ fn persist(s: &mut Session, settings: &Settings) {
     );
 }
 
-fn write_status(s: &Session) {
+fn write_status(s: &Session, settings: &Settings) {
     let (_, live) = s.ctrl.bloat_votes();
     let status = Status {
+        mode: format!("{:?}", settings.cfg.mode).to_lowercase(),
         iface: s.iface.clone(),
         network: s.key.clone(),
         shaping: s.shaper.is_some(),
@@ -820,6 +846,7 @@ fn write_status(s: &Session) {
         delay_ms: s.ctrl.delta_ms(),
         reflectors_responding: live,
         bloat_events: s.ctrl.bloat_events,
+        worst_delay_ms: s.worst_delay_ms,
         updated_unix: now_unix(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&status) {

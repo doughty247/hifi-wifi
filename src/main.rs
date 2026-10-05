@@ -302,18 +302,60 @@ async fn run_doctor(iface: Option<String>) -> Result<()> {
 
     println!();
     match crate::network::autorate::read_status() {
+        Some(st) if st.mode == "detect" => {
+            if st.bloat_events > 0 {
+                println!(
+                    "[warn] Bufferbloat seen {} time(s) under load on {} (latency up to +{:.0} ms)",
+                    st.bloat_events,
+                    st.iface,
+                    st.worst_delay_ms.unwrap_or(0.0)
+                );
+                println!("       Confirm with: sudo hifi-wifi bench --ab   (shaping is off, so this is your line as-is)");
+                println!("       If bench grades B or worse, enable shaping: add [autorate] mode = \"busy\" to /etc/hifi-wifi/config.toml");
+            } else {
+                println!(
+                    "[ ok ] No bufferbloat seen under load on {} this session (watching only; shaping is off)",
+                    st.iface
+                );
+            }
+        }
         Some(st) => println!(
-            "Bufferbloat control: autorate on {}, {} (download {}, upload {} kbit, {} corrections so far)",
+            "Bufferbloat control: autorate ({}) on {}, {} (download {}, upload {} kbit, {} corrections so far)",
+            st.mode,
             st.iface,
             if st.shaping { "shaping now" } else { "not shaping (steps in only if latency rises under load)" },
             st.download_kbit.map(|d| format!("{} kbit", d)).unwrap_or_else(|| "unshaped".into()),
             st.upload_kbit,
             st.bloat_events
         ),
-        None => println!("Bufferbloat control: autorate is not running (is the hifi-wifi service on?)"),
+        None => println!("Bufferbloat watch: not running (is the hifi-wifi service on?)"),
     }
     println!("To measure latency under load: sudo hifi-wifi bench   (A/B: sudo hifi-wifi bench --ab)");
     Ok(())
+}
+
+/// Shaping is opt-in: recommend it only when the unshaped line measurably bloats
+fn advise_shaping(unshaped: &bench::Report) {
+    let Some(b) = unshaped.bloat_ms() else { return };
+    let mode = load_config().autorate.mode;
+    let shaping_on = matches!(
+        mode,
+        config::structs::AutorateMode::Busy | config::structs::AutorateMode::Always
+    );
+    if b >= 30.0 && !shaping_on {
+        println!(
+            "\n  Your connection bloats (+{:.0} ms under load). Bufferbloat shaping could help:",
+            b
+        );
+        println!("    add  [autorate] mode = \"busy\"  to /etc/hifi-wifi/config.toml, restart the service,");
+        println!("    then run 'sudo hifi-wifi bench --ab' again to confirm it improves latency without costing speed.");
+    } else if b < 30.0 && shaping_on {
+        println!(
+            "\n  Your connection barely bloats (+{:.0} ms). Shaping is unlikely to help and can cost speed;",
+            b
+        );
+        println!("  consider [autorate] mode = \"detect\" (the default).");
+    }
 }
 
 async fn run_bench(opts: &mut bench::Options, ab: bool) -> Result<()> {
@@ -328,6 +370,7 @@ async fn run_bench(opts: &mut bench::Options, ab: bool) -> Result<()> {
         if let Some(path) = bench::save(&report) {
             println!("  Saved: {}", path);
         }
+        advise_shaping(&report);
         return Ok(());
     }
 
@@ -354,6 +397,7 @@ async fn run_bench(opts: &mut bench::Options, ab: bool) -> Result<()> {
     bench::print(&off);
     bench::print(&on);
     bench::print_comparison(&off, &on);
+    advise_shaping(&off);
     for r in [&off, &on] {
         if let Some(path) = bench::save(r) {
             println!("  Saved: {}", path);
@@ -386,6 +430,9 @@ async fn run_autorate(
     let mut cfg = config.autorate.clone();
     if always {
         cfg.mode = config::structs::AutorateMode::Always;
+    } else if cfg.mode == config::structs::AutorateMode::Detect {
+        // This command exists to watch shaping work; shape on detected bloat
+        cfg.mode = config::structs::AutorateMode::Busy;
     }
     if !reflectors.is_empty() {
         cfg.reflectors = reflectors;
@@ -1075,6 +1122,10 @@ async fn run_status_async() -> Result<()> {
                 st.iface,
                 st.download_kbit.map(|d| format!("{} kbit", d)).unwrap_or_else(|| "unshaped".into()),
                 st.upload_kbit
+            ),
+            Some(st) if st.mode == "detect" => format!(
+                "Watching for bufferbloat (shaping off; seen {} time(s))",
+                st.bloat_events
             ),
             Some(_) => "Autorate (not shaping; steps in only if latency rises under load)".to_string(),
             None if config.autorate.mode != config::structs::AutorateMode::Off => {

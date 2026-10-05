@@ -298,9 +298,11 @@ Fallbacks: kernels without `sch_cake` get HTB + fq_codel; without fq_codel, TBF 
 4. Do not cut again while the queue is draining (raw delay falling from its peak).
 5. While the shaper is saturated and latency is clean: +8% per 0.5 s tick below the
    rate the last bloat episode settled on, +3% above it.
-6. Mode `busy` (default) installs the shaper only while the link carries traffic and
+6. Mode `detect` (default) only measures and reports; it never shapes, because shaping
+   costs throughput and only helps lines that bloat. Mode `busy` (opt-in) installs the
+   shaper only after bloat is detected while the link carries traffic, and
    removes it after 60 s idle. Learned rates and baselines are saved per SSID in
-   `/var/lib/hifi-wifi/autorate-learned.json`.
+   `/var/lib/hifi-wifi/autorate-learned-v2.json`.
 
 The governor points autorate at the interface carrying the default route and supplies the
 link rate as the upper bound. When autorate runs, breathing CAKE does not shape.
@@ -790,7 +792,7 @@ game_priority_enabled = true
 game_priority_udp_ports = ["27000-27100", "47998-48010"]
 
 [autorate]
-mode = "busy"            # "busy" | "always" | "off"
+mode = "detect"          # "detect" (default) | "busy" | "always" | "off"
 reflectors = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
 delay_threshold_ms = 15.0
 ```

@@ -208,7 +208,11 @@ impl Governor {
         }
 
         // Autorate owns bufferbloat shaping when enabled and tc is present
-        if self.autorate_config.mode != AutorateMode::Off && crate::network::tc::is_tc_available() {
+        // Detect mode only pings; shaping modes also need tc
+        let shaping_mode = !matches!(self.autorate_config.mode, AutorateMode::Off | AutorateMode::Detect);
+        if self.autorate_config.mode == AutorateMode::Detect
+            || (shaping_mode && crate::network::tc::is_tc_available())
+        {
             info!(
                 "Autorate enabled (mode: {:?}, reflectors: {:?})",
                 self.autorate_config.mode, self.autorate_config.reflectors

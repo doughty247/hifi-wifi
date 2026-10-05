@@ -8,7 +8,7 @@ hifi-wifi automatically optimizes your network for low latency, eliminating buff
 
 ## Key Features
 
-* **Autorate Bufferbloat Control**: Measures latency while your link is busy and keeps the CAKE shaper just under the real bottleneck (your ISP line or the Wi-Fi link), so downloads and uploads stop wrecking game and stream latency. No speeds to configure; learned rates are remembered per network.
+* **Bufferbloat Watch and Opt-in Autorate**: Measures latency while your link is busy and tells you if your connection suffers from bufferbloat. If it does, opt in to autorate, which keeps the CAKE shaper just under the real bottleneck. Off by default, because hifi-wifi must never make your connection slower.
 * **Game Traffic Priority**: Steam, Remote Play and Moonlight/Sunshine UDP is marked DSCP EF, so it uses the Wi-Fi voice/video queue and CAKE's latency tin ahead of bulk uploads.
 * **Proof, Not Promises**: `hifi-wifi bench --ab` measures latency under load with hifi-wifi off and on, back to back. `hifi-wifi doctor` tells you what limits your connection (signal, band, retries, channel congestion) and how to fix it.
 * **Low-Overhead Daemon**: Written in native Rust, running as a systemd service with a minimal CPU and memory footprint (<5MB RAM).
@@ -158,7 +158,7 @@ Then install normally.
 
 ## How It Works
 
-Latency spikes under load ("bufferbloat") happen when a queue somewhere fills up, usually in your modem or router. hifi-wifi moves that queue onto your device, where CAKE keeps it short and fair. **Autorate** decides the shaper rate: it pings a few public resolvers, and when latency rises while this device is saturating the link, it lowers the rate to just under the bottleneck; while latency stays clean it raises it again. It only shapes while the link is busy, so idle use costs nothing.
+Latency spikes under load ("bufferbloat") happen when a queue somewhere fills up, usually in your modem or router. By default hifi-wifi only measures this: while the link is busy it pings a few public resolvers and records whether latency rises, and `hifi-wifi doctor` reports it. If your line does bloat, opt in to **autorate** (`[autorate] mode = "busy"`): it then moves that queue onto your device, where CAKE keeps it short and fair, at a rate just under the bottleneck. `hifi-wifi bench --ab` shows whether it helps on your line.
 
 It also disables Wi-Fi power save when it hurts latency, suppresses background scans during play, steers to 5/6 GHz, and marks game traffic for the Wi-Fi voice/video queue. It detects reconnections, roaming and power changes to keep this current.
 

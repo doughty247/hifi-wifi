@@ -83,7 +83,9 @@ game_priority_enabled = true
 game_priority_udp_ports = ["27000-27100", "47998-48010"]  # Steam, Moonlight/Sunshine
 
 # CPU Governor (coalescing)
-cpu_coalescing_enabled = true
+# Off by default: dropping interrupt coalescing (an interrupt per packet) can cut gigabit
+# throughput on NICs that honor it. Only worth trying on slow links with very spiky latency.
+cpu_coalescing_enabled = false
 cpu_coalescing_threshold = 0.7
 cpu_avg_window_size = 5
 
@@ -98,13 +100,15 @@ band_steering_min_improvement = 10
 scan_suppress = false
 
 [autorate]
-# Latency-driven bufferbloat control. Pings the reflectors, and when latency rises while
-# this device is saturating the link, lowers the shaper to just under the real bottleneck
-# (ISP line or Wi-Fi). Raises it again while latency stays clean.
-#   "busy"   - shape only while the link carries traffic (default; no cost when idle)
+# Bufferbloat watch and (opt-in) control. hifi-wifi must never make a connection slower,
+# so the default only measures: it pings the reflectors while the link is busy and reports
+# bufferbloat in `hifi-wifi doctor`. Shaping costs throughput and only pays off on lines
+# that actually bloat; enable it if `sudo hifi-wifi bench --ab` grades your line B or worse.
+#   "detect" - watch and report only, never shape (default)
+#   "busy"   - when bloat is detected under load, shape just below the bottleneck
 #   "always" - keep the shaper installed whenever connected
-#   "off"    - disable (falls back to breathing_cake_enabled)
-mode = "busy"
+#   "off"    - no latency probes at all (falls back to breathing_cake_enabled)
+mode = "detect"
 reflectors = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]   # IP addresses; half must agree on bloat
 ping_interval_ms = 300          # per reflector, while shaping
 idle_ping_interval_ms = 2000    # while idle, keeps the latency baseline clean (0 = off)

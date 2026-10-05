@@ -291,7 +291,8 @@ impl Default for GovernorConfig {
             band_steering_enabled: true,
             roam_hysteresis_ticks: 3,
 
-            cpu_coalescing_enabled: true,
+            // Off: interrupt-per-packet can cut gigabit throughput on NICs that honor it
+            cpu_coalescing_enabled: false,
             cpu_coalescing_threshold: 0.90,
 
             cpu_avg_window_size: 3,
@@ -308,7 +309,10 @@ impl Default for GovernorConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AutorateMode {
-    /// Shape only while the link carries real traffic (default; no cost when idle)
+    /// Watch latency under load and report bufferbloat, never shape (default).
+    /// hifi-wifi must never make a connection slower; shaping is opt-in.
+    Detect,
+    /// Shape only when bufferbloat is detected while the link is busy
     Busy,
     /// Keep the shaper installed whenever connected
     Always,
@@ -342,7 +346,7 @@ pub struct AutorateConfig {
 impl Default for AutorateConfig {
     fn default() -> Self {
         Self {
-            mode: AutorateMode::Busy,
+            mode: AutorateMode::Detect,
             reflectors: vec!["1.1.1.1".into(), "8.8.8.8".into(), "9.9.9.9".into()],
             ping_interval_ms: 300,
             idle_ping_interval_ms: 2000,
@@ -396,13 +400,13 @@ mod tests {
         // Removed v3.1.0-beta.1 keys must not break parsing of old config files
         let old = "[governor]\nebpf_bypass_enabled = true\n[multipath]\nenabled = true\n";
         let c: Config = toml::from_str(old).unwrap();
-        assert_eq!(c.autorate.mode, AutorateMode::Busy);
+        assert_eq!(c.autorate.mode, AutorateMode::Detect);
     }
 
     #[test]
     fn test_example_config_parses() {
         let c: Config = toml::from_str(include_str!("../../config.example.toml")).unwrap();
-        assert_eq!(c.autorate.mode, AutorateMode::Busy);
+        assert_eq!(c.autorate.mode, AutorateMode::Detect);
         assert_eq!(c.autorate.reflectors.len(), 3);
         assert!(c.governor.game_priority_enabled);
         assert_eq!(c.governor.game_priority_udp_ports.len(), 2);
