@@ -229,13 +229,16 @@ The governor is the central decision-making component that coordinates all optim
 **Responsibilities:**
 - Main event loop (async Tokio runtime)
 - Periodic health checks (default: 2 second tick rate, configurable via `tick_rate_secs`)
-- CAKE bandwidth adjustment ("breathing" algorithm)
+- Pointing autorate at the default-route interface and supplying the link rate
+- CAKE bandwidth adjustment ("breathing" algorithm, only when autorate is off)
+- Keeping game traffic DSCP rules in place
 - Connection event handling
 - Band steering decisions
 
-**Breathing CAKE Algorithm:**
+**Breathing CAKE Algorithm** (legacy, used only with `autorate.mode = "off"`):
 
-Rather than setting a static bandwidth limit, the governor continuously adjusts CAKE's bandwidth parameter dynamically using a 4-stage pipeline based on the current Wi-Fi PHY rate:
+The PHY rate says how fast the radio signals, not where the bottleneck is (usually the ISP
+line), so this rarely engages on its own. Autorate measures latency instead. Rather than setting a static bandwidth limit, the governor continuously adjusts CAKE's bandwidth parameter dynamically using a 4-stage pipeline based on the current Wi-Fi PHY rate:
 
 1. **Rate Gathering & Averaging:** Checks the current PHY rate from both NetworkManager D-Bus API and local `iw` tools. If both are valid (>= 20 Mbit), it averages them to prevent outlier readings.
 2. **Outlier Filtering (Median):** Pushes the samples to a rolling window (default size 3) and extracts the median to smooth out transient spikes or probe frame drops.
@@ -250,9 +253,6 @@ where:
   overhead_factor = 0.85 (configurable via cake_overhead_factor)
 ```
 
-This ensures CAKE always knows the true available bandwidth, preventing both:
-- Under-utilization (bandwidth set too low)
-- Bufferbloat (bandwidth set higher than actual capacity)
 
 **Connection Event Handling:**
 
@@ -262,44 +262,63 @@ When a connection change is detected:
 3. Re-query interface state from NetworkManager
 4. Reapply optimizations with fresh data
 
-### CAKE Traffic Shaper
+### Bufferbloat Control: Shaper + Autorate
 
-CAKE (Common Applications Kept Enhanced) is a modern qdisc that combines:
-- Bandwidth shaping
-- Flow isolation (fairness between connections)
-- ECN (Explicit Congestion Notification)
-- Per-flow queuing with smart hash
+Latency under load comes from a full queue at the bottleneck, usually the modem/router
+uplink or downlink, sometimes the Wi-Fi link itself. hifi-wifi shapes slightly below that
+bottleneck so the queue forms on the device instead, where CAKE keeps it short and
+flow-fair.
 
-**Location:** `src/network/wifi.rs`
-
-**Application:**
+**Shaper** (`src/network/shaper.rs`) owns every qdisc hifi-wifi installs:
 
 ```bash
-# What hifi-wifi executes:
-tc qdisc replace dev wlan0 root cake bandwidth 520mbit
-
-# For egress (upload) traffic shaping
-# Ingress is harder - we can't control what the AP sends
+# Upload: on the interface root. Keeps DSCP marks so the AP can honor them.
+tc qdisc replace dev wlan0 root cake bandwidth 18000kbit diffserv4 dual-srchost ack-filter
+# Download: ingress redirected to a per-interface IFB device and shaped there
+tc qdisc replace dev wlan0 handle ffff: ingress
+tc filter replace dev wlan0 parent ffff: protocol all prio 10 matchall action mirred egress redirect dev ifb4wlan0
+tc qdisc replace dev ifb4wlan0 root cake bandwidth 90000kbit diffserv4 dual-dsthost wash ingress
+# Rate changes are in place, no rebuild:
+tc qdisc change dev wlan0 root cake bandwidth 17000kbit
 ```
 
-**Why CAKE over alternatives:**
+Fallbacks: kernels without `sch_cake` get HTB + fq_codel; without fq_codel, TBF with a
+5 ms queue bound. Ingress redirect uses `matchall`, else `u32 match u32 0 0`.
 
-| Qdisc | Pros | Cons |
-|-------|------|------|
-| pfifo_fast | Default, simple | No flow isolation, no shaping |
-| fq_codel | Good latency | Doesn't handle WiFi rate changes |
-| htb | Flexible | Complex, requires manual class setup |
-| **CAKE** | All-in-one, WiFi-aware | Slightly higher CPU (negligible) |
+**Autorate** (`src/network/autorate.rs`) picks the rate, following cake-autorate (OpenWrt):
 
-**Bandwidth Calculation:**
+1. `ping` 3 reflectors (default 1.1.1.1, 8.8.8.8, 9.9.9.9) every 300 ms while shaping,
+   every 2 s while idle. Each reflector keeps a baseline RTT that drops immediately on
+   lower samples and rises only very slowly, and never while bloated.
+2. Bloat = at least half of the responsive reflectors show smoothed RTT more than 15 ms
+   above baseline. One reflector deprioritizing ICMP cannot trigger a cut.
+3. On bloat, cut only a direction that is ours: carrying real traffic near its own
+   recent peak. Cut to 90% of what it actually achieved. Bloat caused by other devices
+   (our traffic far below our peak) never cuts our rate.
+4. Do not cut again while the queue is draining (raw delay falling from its peak).
+5. While the shaper is saturated and latency is clean: +8% per 0.5 s tick below the
+   rate the last bloat episode settled on, +3% above it.
+6. Mode `busy` (default) installs the shaper only while the link carries traffic and
+   removes it after 60 s idle. Learned rates and baselines are saved per SSID in
+   `/var/lib/hifi-wifi/autorate-learned.json`.
 
-```rust
-// The CAKE breathing logic runs in the governor's async loop
-// and calculates scaled bandwidth as:
-let bitrate_mbit = effective_bitrate / 1000;
-let scaled_mbit = (bitrate_mbit as f64 * self.config.cake_overhead_factor) as u32;
-let bandwidth = scaled_mbit.max(10); // Capped to 10 Mbit minimum to prevent connection stalls
-```
+The governor points autorate at the interface carrying the default route and supplies the
+link rate as the upper bound. When autorate runs, breathing CAKE does not shape.
+
+**Simulation results** (`scripts/sim-bufferbloat.sh`, network namespaces, 20 Mbit bottleneck
+with a 400 ms buffer). The development VM had no CAKE or fq_codel, so these use the TBF
+fallback; CAKE is expected to do at least as well. Real-hardware numbers come from
+`hifi-wifi bench --ab` on beta testers' devices.
+
+| Upload test (iperf3, 4 flows) | idle p50 | loaded p50 | loaded p95 | throughput |
+|---|---|---|---|---|
+| No shaping | 0.1 ms | 49.9 ms | 61.2 ms | 19.0 Mbit |
+| Autorate (TBF fallback) | 0.1 ms | 4.7 ms | 22.8 ms | 17.6 Mbit |
+
+`hifi-wifi bench` against the same link: latency increase under load +40 to +55 ms
+without shaping, +7 to +24 ms with autorate (run to run variation). The download
+direction gains less than upload with TBF, because tail-drop ingress shaping lacks the AQM
+that CAKE's ingress mode provides.
 
 ### Band Steering
 
@@ -768,6 +787,13 @@ cpu_coalescing_enabled = true
 cpu_coalescing_threshold = 0.90
 cpu_avg_window_size = 3
 scan_suppress = "adaptive"
+game_priority_enabled = true
+game_priority_udp_ports = ["27000-27100", "47998-48010"]
+
+[autorate]
+mode = "busy"            # "busy" | "always" | "off"
+reflectors = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
+delay_threshold_ms = 15.0
 ```
 
 ### Runtime Configuration
@@ -825,52 +851,39 @@ For desktop integration (planned Decky plugin), a Polkit policy allows the `deck
 | CPU (idle) | <0.1% | Sleeping between checks |
 | CPU (active) | <1% | During optimization |
 | Disk | 8 MB | Binary size |
-| Network | 0 | No telemetry or external calls |
+| Network | ~3 pings/s while busy | Autorate latency probes; see Network Usage |
 
-### Latency Impact
+### Network Usage
 
-**Before hifi-wifi (typical home network with bufferbloat):**
-```
-PING router (192.168.1.1):
-  min/avg/max/stddev = 2.1/45.3/287.4/52.1 ms
-```
+- Autorate pings its reflectors (about 3 small ICMP packets per second while the link is
+  busy, one every 2 s per reflector while idle). Set `autorate.mode = "off"` to disable.
+- `hifi-wifi bench` downloads and uploads from `speed.cloudflare.com` by default
+  (configurable with `--download-url` / `--upload-url`). It only runs when you start it.
+- No telemetry. Nothing else contacts the internet.
 
-**After hifi-wifi:**
-```
-PING router (192.168.1.1):
-  min/avg/max/stddev = 1.8/3.2/12.4/2.1 ms
-```
+### Measured Impact
 
-**Key improvements:**
-- Average latency: 45ms → 3ms (93% reduction)
-- Jitter (stddev): 52ms → 2ms (96% reduction)
-- Max latency: 287ms → 12ms (96% reduction)
-
-### Throughput Impact
-
-CAKE does not significantly reduce throughput when properly configured:
-
-| Scenario | Without hifi-wifi | With hifi-wifi |
-|----------|-------------------|----------------|
-| Download (idle) | 940 Mbps | 920 Mbps |
-| Download (gaming) | 940 Mbps | 900 Mbps |
-| Upload (idle) | 94 Mbps | 92 Mbps |
-
-The ~2-5% throughput reduction is the cost of flow isolation and queue management. For gaming, this tradeoff is extremely favorable.
+Measure on your own network with `sudo hifi-wifi bench --ab`, which runs the same test with
+hifi-wifi off and on back to back. Results are saved in `/var/lib/hifi-wifi/bench/`.
+The simulation numbers above show the mechanism working; they are not a claim about any
+particular home network.
 
 ---
 
 ## Future Roadmap
 
-### v3.1.0 - Core Engine & "Real CAKE" (Implemented)
+### v3.1.0 - Measured Bufferbloat Control (Implemented)
 
-- **Zero-Overhead Netlink Listener**: Subscribes directly to kernel netlink link multicast groups (`RTMGRP_LINK`) to trigger instant governor ticks on carrier changes.
-- **RTT-Driven CAKE Scaling**: Queries the kernel's `TCP_INFO` struct dynamically to scale CAKE queue capacity during wireless jitter spikes.
-- **cgroup v2 & DSCP Tagging**: Prioritizes gaming/streaming application traffic (e.g. `gamescope.slice`) and ports via `nftables` postrouting rules.
-- **Proactive Roaming Governor**: Triggers active NetworkManager association handovers to target BSSIDs when signal strength drops below `-80 dBm`.
-- **Zero-Copy eBPF Game Bypass**: Intercepts UDP streams (Moonlight, Steam Link) at the kernel driver entry point for sub-millisecond bypass latency.
-- **Temporal Packet Duplication**: Duplicates game traffic on the active interface when packet loss or jitter exceeds threshold to establish packet-level redundancy.
-- **Media-Aware Congestion Switching**: Switches system default congestion control on the fly (BBR baseline, pivoting to Cubic under active CAKE saturation).
+- **Autorate**: latency-driven shaper rate control (see Bufferbloat Control above).
+- **Shaper module**: CAKE with HTB+fq_codel and TBF fallbacks, per-interface IFB ingress.
+- **Game traffic priority**: DSCP EF for Steam / Moonlight / Sunshine UDP and `gamescope.slice`.
+- **`bench`** (latency under load, A/B) and **`doctor`** (Wi-Fi diagnosis).
+- **Zero-Overhead Netlink Listener**: instant governor ticks on carrier changes.
+- **Media-Aware Congestion Switching**: BBR baseline, Cubic under active shaper saturation.
+- Removed from the 3.1 development branch after review: the "eBPF game bypass" (an ingress
+  classifier cannot reduce latency on the receiving host), "temporal packet duplication"
+  (same-radio duplicates share the same losses and double airtime) and `TCP_INFO`
+  telemetry (sockets cannot be opened through `/proc/<pid>/fd`, so it never returned data).
 
 ### v3.2.0 - Decky Plugin & QAM Integration
 
