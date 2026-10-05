@@ -41,10 +41,17 @@ pub fn is_valid_iface(name: &str) -> bool {
 fn tbf_params(kbit: u32) -> Vec<String> {
     let kbit = kbit.max(1);
     let burst = (kbit as u64 * 1000 / 8 / 1000).max(3_028);
-    ["rate", &format!("{}kbit", kbit), "burst", &burst.to_string(), "latency", "5ms"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    [
+        "rate",
+        &format!("{}kbit", kbit),
+        "burst",
+        &burst.to_string(),
+        "latency",
+        "5ms",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 fn root_args(kind: Kind, dev: &str, kbit: u32, ingress: bool) -> Vec<Vec<String>> {
@@ -54,7 +61,17 @@ fn root_args(kind: Kind, dev: &str, kbit: u32, ingress: bool) -> Vec<Vec<String>
         Kind::Cake => {
             // Upload: isolate per source host, keep DSCP marks so the AP can honor them.
             // Download: isolate per destination host, wash ISP-set DSCP, count drops (ingress).
-            let mut a = v(&["qdisc", "replace", "dev", dev, "root", "cake", "bandwidth", &rate, "diffserv4"]);
+            let mut a = v(&[
+                "qdisc",
+                "replace",
+                "dev",
+                dev,
+                "root",
+                "cake",
+                "bandwidth",
+                &rate,
+                "diffserv4",
+            ]);
             if ingress {
                 a.extend(v(&["dual-dsthost", "wash", "ingress"]));
             } else {
@@ -63,12 +80,21 @@ fn root_args(kind: Kind, dev: &str, kbit: u32, ingress: bool) -> Vec<Vec<String>
             vec![a]
         }
         Kind::HtbFqCodel => vec![
-            v(&["qdisc", "replace", "dev", dev, "root", "handle", "1:", "htb", "default", "10"]),
-            v(&["class", "replace", "dev", dev, "parent", "1:", "classid", "1:10", "htb", "rate", &rate, "ceil", &rate]),
-            v(&["qdisc", "replace", "dev", dev, "parent", "1:10", "handle", "10:", "fq_codel"]),
+            v(&[
+                "qdisc", "replace", "dev", dev, "root", "handle", "1:", "htb", "default", "10",
+            ]),
+            v(&[
+                "class", "replace", "dev", dev, "parent", "1:", "classid", "1:10", "htb", "rate",
+                &rate, "ceil", &rate,
+            ]),
+            v(&[
+                "qdisc", "replace", "dev", dev, "parent", "1:10", "handle", "10:", "fq_codel",
+            ]),
         ],
         Kind::Tbf => {
-            let mut a = v(&["qdisc", "replace", "dev", dev, "root", "handle", "1:", "tbf"]);
+            let mut a = v(&[
+                "qdisc", "replace", "dev", dev, "root", "handle", "1:", "tbf",
+            ]);
             a.extend(tbf_params(kbit));
             vec![a]
         }
@@ -78,9 +104,19 @@ fn root_args(kind: Kind, dev: &str, kbit: u32, ingress: bool) -> Vec<Vec<String>
 fn change_args(kind: Kind, dev: &str, kbit: u32) -> Vec<String> {
     let rate = format!("{}kbit", kbit.max(1));
     let a: Vec<&str> = match kind {
-        Kind::Cake => vec!["qdisc", "change", "dev", dev, "root", "cake", "bandwidth", &rate],
+        Kind::Cake => vec![
+            "qdisc",
+            "change",
+            "dev",
+            dev,
+            "root",
+            "cake",
+            "bandwidth",
+            &rate,
+        ],
         Kind::HtbFqCodel => vec![
-            "class", "change", "dev", dev, "parent", "1:", "classid", "1:10", "htb", "rate", &rate, "ceil", &rate,
+            "class", "change", "dev", dev, "parent", "1:", "classid", "1:10", "htb", "rate", &rate,
+            "ceil", &rate,
         ],
         Kind::Tbf => {
             let mut a: Vec<String> = ["qdisc", "change", "dev", dev, "root", "handle", "1:", "tbf"]
@@ -111,7 +147,10 @@ fn run(cmd: &str, args: &[String]) -> Result<()> {
 }
 
 fn tc(args: &[&str]) -> Result<()> {
-    run("tc", &args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    run(
+        "tc",
+        &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+    )
 }
 
 fn install_root(dev: &str, kbit: u32, ingress: bool) -> Result<Kind> {
@@ -201,7 +240,10 @@ impl Shaper {
 
     /// Whether our qdisc is still on the interface (NetworkManager or a reconnect can reset it).
     pub fn is_present(&self) -> bool {
-        let Ok(out) = Command::new("tc").args(["qdisc", "show", "dev", &self.iface, "root"]).output() else {
+        let Ok(out) = Command::new("tc")
+            .args(["qdisc", "show", "dev", &self.iface, "root"])
+            .output()
+        else {
             return false;
         };
         let s = String::from_utf8_lossy(&out.stdout);
@@ -215,13 +257,31 @@ impl Shaper {
 
 fn install_ingress(iface: &str, down_kbit: u32) -> Result<String> {
     let ifb = ifb_name(iface);
-    let _ = Command::new("modprobe").arg("ifb").arg("numifbs=0").output();
-    let _ = Command::new("ip").args(["link", "add", "name", &ifb, "type", "ifb"]).output();
-    run("ip", &["link".into(), "set".into(), "dev".into(), ifb.clone(), "up".into()])?;
-    tc(&["qdisc", "replace", "dev", iface, "handle", "ffff:", "ingress"])?;
+    let _ = Command::new("modprobe")
+        .arg("ifb")
+        .arg("numifbs=0")
+        .output();
+    let _ = Command::new("ip")
+        .args(["link", "add", "name", &ifb, "type", "ifb"])
+        .output();
+    run(
+        "ip",
+        &[
+            "link".into(),
+            "set".into(),
+            "dev".into(),
+            ifb.clone(),
+            "up".into(),
+        ],
+    )?;
+    tc(&[
+        "qdisc", "replace", "dev", iface, "handle", "ffff:", "ingress",
+    ])?;
     // matchall is cheapest; u32 "match everything" is the classic sqm-scripts fallback
     let redirect = ["action", "mirred", "egress", "redirect", "dev", &ifb];
-    let base = ["filter", "replace", "dev", iface, "parent", "ffff:", "protocol", "all", "prio", "10"];
+    let base = [
+        "filter", "replace", "dev", iface, "parent", "ffff:", "protocol", "all", "prio", "10",
+    ];
     let matchall = [&base[..], &["matchall"], &redirect[..]].concat();
     let u32_all = [&base[..], &["u32", "match", "u32", "0", "0"], &redirect[..]].concat();
     if let Err(e) = tc(&matchall).or_else(|_| tc(&u32_all)) {
@@ -247,7 +307,9 @@ pub fn remove(iface: &str) {
         let _ = tc(&["qdisc", "del", "dev", iface, "root"]);
     }
     let _ = tc(&["qdisc", "del", "dev", iface, "ingress"]);
-    let _ = Command::new("ip").args(["link", "del", &ifb_name(iface)]).output();
+    let _ = Command::new("ip")
+        .args(["link", "del", &ifb_name(iface)])
+        .output();
     // Pre-3.1 releases shaped downloads on a shared ifb0 with CAKE.
     if has_shaper("ifb0") {
         let _ = tc(&["qdisc", "del", "dev", "ifb0", "root"]);
@@ -279,10 +341,14 @@ mod tests {
 
     #[test]
     fn cake_egress_keeps_dscp_and_ingress_washes() {
-        let up = root_args(Kind::Cake, "wlan0", 20_000, false).concat().join(" ");
+        let up = root_args(Kind::Cake, "wlan0", 20_000, false)
+            .concat()
+            .join(" ");
         assert!(up.contains("bandwidth 20000kbit diffserv4 dual-srchost ack-filter"));
         assert!(!up.contains("wash"));
-        let down = root_args(Kind::Cake, "ifb4wlan0", 90_000, true).concat().join(" ");
+        let down = root_args(Kind::Cake, "ifb4wlan0", 90_000, true)
+            .concat()
+            .join(" ");
         assert!(down.contains("dual-dsthost wash ingress"));
     }
 
@@ -300,7 +366,9 @@ mod tests {
     #[test]
     fn tbf_bucket_is_one_millisecond() {
         assert!(tbf_params(1_000).join(" ").contains("burst 3028"));
-        assert!(tbf_params(1_000_000).join(" ").contains("burst 125000 latency 5ms"));
+        assert!(tbf_params(1_000_000)
+            .join(" ")
+            .contains("burst 125000 latency 5ms"));
     }
 
     #[test]

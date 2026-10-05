@@ -69,7 +69,14 @@ impl Pinger {
                     let mut lines = BufReader::new(stdout).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
                         if let Some(rtt_ms) = parse_rtt(&line) {
-                            if tx.send(Sample { reflector: idx, rtt_ms }).await.is_err() {
+                            if tx
+                                .send(Sample {
+                                    reflector: idx,
+                                    rtt_ms,
+                                })
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -79,7 +86,9 @@ impl Pinger {
             children.push(child);
         }
 
-        Self { _children: children }
+        Self {
+            _children: children,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -101,8 +110,17 @@ mod tests {
             parse_rtt("64 bytes from 9.9.9.9: seq=0 ttl=60 time=8.012 ms"),
             Some(8.012)
         );
-        assert_eq!(parse_rtt("64 bytes from ::1: icmp_seq=1 ttl=64 time=0.040 ms"), Some(0.04));
-        assert_eq!(parse_rtt("From 192.168.1.1 icmp_seq=4 Destination Host Unreachable"), None);
-        assert_eq!(parse_rtt("PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data."), None);
+        assert_eq!(
+            parse_rtt("64 bytes from ::1: icmp_seq=1 ttl=64 time=0.040 ms"),
+            Some(0.04)
+        );
+        assert_eq!(
+            parse_rtt("From 192.168.1.1 icmp_seq=4 Destination Host Unreachable"),
+            None
+        );
+        assert_eq!(
+            parse_rtt("PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data."),
+            None
+        );
     }
 }

@@ -803,11 +803,10 @@ impl Governor {
                             nm_bitrate, iw_bitrate, kbit, calculated_mbit, sf_adjusted, rssi
                         );
 
-                        if state.tc_manager.update_bandwidth(calculated_mbit) {
-                            if should_apply_cake {
+                        if state.tc_manager.update_bandwidth(calculated_mbit)
+                            && should_apply_cake {
                                 let _ = state.tc_manager.apply_cake(&interface);
                             }
-                        }
                         state.bandwidth_valid = true;
                     } else {
                         // No current OR historical valid bitrate
@@ -820,11 +819,10 @@ impl Governor {
                                   nm_bitrate, iw_bitrate, default_mbit, interface);
                         }
 
-                        if state.tc_manager.update_bandwidth(calculated_mbit) {
-                            if should_apply_cake {
+                        if state.tc_manager.update_bandwidth(calculated_mbit)
+                            && should_apply_cake {
                                 let _ = state.tc_manager.apply_cake(&interface);
                             }
-                        }
                         state.bandwidth_valid = true;
                     }
                 }
@@ -912,7 +910,7 @@ impl Governor {
                                 if let Some(wifi_ifc) =
                                     wifi_interfaces.iter().find(|i| i.name == interface)
                                 {
-                                    if let Ok(_) = self.wifi_manager.disable_power_save(wifi_ifc) {
+                                    if self.wifi_manager.disable_power_save(wifi_ifc).is_ok() {
                                         info!(
                                             "Power save forced OFF on {} (config override)",
                                             interface
@@ -931,7 +929,7 @@ impl Governor {
                                 if let Some(wifi_ifc) =
                                     wifi_interfaces.iter().find(|i| i.name == interface)
                                 {
-                                    if let Ok(_) = self.wifi_manager.enable_power_save(wifi_ifc) {
+                                    if self.wifi_manager.enable_power_save(wifi_ifc).is_ok() {
                                         info!(
                                             "Power save forced ON on {} (config override)",
                                             interface
@@ -984,9 +982,7 @@ impl Governor {
                                         wifi_interfaces.iter().find(|i| i.name == interface)
                                     {
                                         if should_enable {
-                                            if let Ok(_) =
-                                                self.wifi_manager.enable_power_save(wifi_ifc)
-                                            {
+                                            if self.wifi_manager.enable_power_save(wifi_ifc).is_ok() {
                                                 let reason = if is_critical_battery {
                                                     format!(
                                                         "critical battery {}%",
@@ -1002,9 +998,7 @@ impl Governor {
                                                 state.power_save_enabled = Some(true);
                                             }
                                         } else {
-                                            if let Ok(_) =
-                                                self.wifi_manager.disable_power_save(wifi_ifc)
-                                            {
+                                            if self.wifi_manager.disable_power_save(wifi_ifc).is_ok() {
                                                 let reason = if !base_should_enable {
                                                     "AC power"
                                                 } else if in_game {
@@ -1073,7 +1067,7 @@ impl Governor {
                                 let target_ticks = if should_enable { 5 } else { 1 };
                                 if state.eee_stable_ticks >= target_ticks {
                                     if should_enable {
-                                        if let Ok(_) = EthtoolManager::enable_eee(&interface) {
+                                        if EthtoolManager::enable_eee(&interface).is_ok() {
                                             let reason = if is_critical_battery {
                                                 format!(
                                                     "critical battery {}%",
@@ -1086,7 +1080,7 @@ impl Governor {
                                             state.eee_enabled = Some(true);
                                         }
                                     } else {
-                                        if let Ok(_) = EthtoolManager::disable_eee(&interface) {
+                                        if EthtoolManager::disable_eee(&interface).is_ok() {
                                             let reason = if !base_should_enable {
                                                 "AC power"
                                             } else if in_game {
@@ -1222,8 +1216,7 @@ impl Governor {
                                 "Band steering: About to list {} APs...",
                                 access_points.len()
                             );
-                            for i in 0..access_points.len() {
-                                let ap = &access_points[i];
+                            for (i, ap) in access_points.iter().enumerate() {
                                 info!(
                                     "  [{}] AP: {} ({}), band={:?}, signal={}dBm, rate={}Mbps",
                                     i,

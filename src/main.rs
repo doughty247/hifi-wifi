@@ -158,16 +158,24 @@ async fn main() -> Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         default_hook(panic_info);
+        // A panic inside the recovery `revert` itself must not spawn another revert
+        if std::env::var_os("HIFI_WIFI_PANIC_RECOVERY").is_some() {
+            return;
+        }
         eprintln!("\n[FATAL] hifi-wifi encountered an unhandled panic!");
         eprintln!("Executing panic recovery routine to restore default network stack configurations...");
         let _ = std::process::Command::new("/var/lib/hifi-wifi/hifi-wifi")
             .arg("revert")
+            .env("HIFI_WIFI_PANIC_RECOVERY", "1")
             .output()
             .or_else(|_| {
                 if let Ok(current_exe) = std::env::current_exe() {
-                    std::process::Command::new(current_exe).arg("revert").output()
+                    std::process::Command::new(current_exe)
+                        .arg("revert")
+                        .env("HIFI_WIFI_PANIC_RECOVERY", "1")
+                        .output()
                 } else {
-                    Err(std::io::Error::new(std::io::ErrorKind::Other, "Could not find current exe"))
+                    Err(std::io::Error::other("Could not find current exe"))
                 }
             });
     }));
@@ -659,7 +667,7 @@ fn run_revert() -> Result<()> {
     // Remove shaping qdiscs (egress + ingress redirect) and restore defaults on all interfaces
     for ifc in wifi_mgr.interfaces() {
         info!("Reverting optimizations on {}", ifc.name);
-        let _ = crate::network::shaper::remove(&ifc.name);
+        crate::network::shaper::remove(&ifc.name);
         let _ = std::process::Command::new("tc")
             .args(["qdisc", "del", "dev", &ifc.name, "ingress"])
             .output();
@@ -840,9 +848,9 @@ fn freq_to_channel(freq: u32) -> u32 {
         6315 => 73,
         6335 => 77,
         // Fallback: calculate from frequency
-        f if f >= 2400 && f <= 2500 => (f - 2407) / 5,
-        f if f >= 5150 && f <= 5900 => (f - 5000) / 5,
-        f if f >= 5925 && f <= 7125 => (f - 5950) / 5,
+        f if (2400..=2500).contains(&f) => (f - 2407) / 5,
+        f if (5150..=5900).contains(&f) => (f - 5000) / 5,
+        f if (5925..=7125).contains(&f) => (f - 5950) / 5,
         _ => 0,
     }
 }
@@ -864,13 +872,13 @@ async fn run_status_async() -> Result<()> {
 
     println!();
     println!(
-        "{}{}{}",
-        BOLD, CYAN, "══════════════════════════════════════"
+        "{}{}══════════════════════════════════════",
+        BOLD, CYAN
     );
     println!("       hifi-wifi Status");
     println!(
-        "{}{}{}",
-        BOLD, CYAN, "══════════════════════════════════════"
+        "{}{}══════════════════════════════════════",
+        BOLD, CYAN
     );
     println!();
 
@@ -1073,10 +1081,19 @@ async fn run_status_async() -> Result<()> {
         "{}│{}    ├─ QoS Mode:   {}",
         BLUE,
         NC,
-        if config.governor.breathing_cake_enabled {
-            "Breathing CAKE (Dynamic)"
-        } else {
-            "Static CAKE"
+        match crate::network::autorate::read_status() {
+            Some(st) if st.shaping => format!(
+                "Autorate shaping {} (down {}, up {} kbit)",
+                st.iface,
+                st.download_kbit.map(|d| format!("{} kbit", d)).unwrap_or_else(|| "unshaped".into()),
+                st.upload_kbit
+            ),
+            Some(_) => "Autorate (idle; shapes when the link is busy)".to_string(),
+            None if config.autorate.mode != config::structs::AutorateMode::Off => {
+                "Autorate (not running)".to_string()
+            }
+            None if config.governor.breathing_cake_enabled => "Breathing CAKE (Dynamic)".to_string(),
+            None => "Off".to_string(),
         }
     );
     println!(
@@ -1448,12 +1465,10 @@ fn setup_user_path() -> Result<()> {
     // Check if already present
     if let Ok(file) = fs::File::open(&bashrc_path) {
         let reader = BufReader::new(file);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                if line.contains("/var/lib/hifi-wifi") {
-                    info!("PATH already configured in .bashrc");
-                    return Ok(());
-                }
+        for line in reader.lines().map_while(Result::ok) {
+            if line.contains("/var/lib/hifi-wifi") {
+                info!("PATH already configured in .bashrc");
+                return Ok(());
             }
         }
     }
@@ -1733,7 +1748,7 @@ fn remove_user_path() {
 
     if let Ok(file) = std::fs::File::open(&bashrc_path) {
         let reader = BufReader::new(file);
-        let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+        let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
 
         // Filter out hifi-wifi PATH lines
         let filtered: Vec<&String> = lines

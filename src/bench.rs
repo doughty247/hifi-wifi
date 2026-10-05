@@ -94,7 +94,11 @@ pub fn jitter(in_order: &[f64]) -> f64 {
     if in_order.len() < 2 {
         return 0.0;
     }
-    in_order.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f64>() / (in_order.len() - 1) as f64
+    in_order
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .sum::<f64>()
+        / (in_order.len() - 1) as f64
 }
 
 fn summarize(name: &str, rtts: &[f64], secs: f64, down_mbit: f64, up_mbit: f64) -> Phase {
@@ -146,7 +150,11 @@ async fn run_load(o: &Options, load: Load, deadline: Instant) {
             if !wanted {
                 continue;
             }
-            let url = if upload { o.upload_url.clone() } else { o.download_url.clone() };
+            let url = if upload {
+                o.upload_url.clone()
+            } else {
+                o.download_url.clone()
+            };
             let iface = o.iface.clone();
             tasks.push(tokio::spawn(async move {
                 while let Some(left) = deadline.checked_duration_since(Instant::now()) {
@@ -161,9 +169,18 @@ async fn run_load(o: &Options, load: Load, deadline: Instant) {
                         .kill_on_drop(true);
                     if upload {
                         // Stream zeros from stdin: unbounded upload without buffering in memory
-                        let Ok(zero) = std::fs::File::open("/dev/zero") else { break };
-                        cmd.args(["-X", "POST", "-H", "Content-Type: application/octet-stream", "-T", "-"])
-                            .stdin(Stdio::from(zero));
+                        let Ok(zero) = std::fs::File::open("/dev/zero") else {
+                            break;
+                        };
+                        cmd.args([
+                            "-X",
+                            "POST",
+                            "-H",
+                            "Content-Type: application/octet-stream",
+                            "-T",
+                            "-",
+                        ])
+                        .stdin(Stdio::from(zero));
                     } else {
                         cmd.stdin(Stdio::null());
                     }
@@ -184,7 +201,13 @@ async fn run_load(o: &Options, load: Load, deadline: Instant) {
     }
 }
 
-async fn phase(o: &Options, name: &str, load: Load, secs: u64, rx: &mut mpsc::Receiver<Sample>) -> Phase {
+async fn phase(
+    o: &Options,
+    name: &str,
+    load: Load,
+    secs: u64,
+    rx: &mut mpsc::Receiver<Sample>,
+) -> Phase {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(secs);
     while rx.try_recv().is_ok() {}
@@ -211,7 +234,12 @@ pub async fn run(o: &Options) -> Result<Report> {
         bail!("need at least 1 stream and 5 s per phase");
     }
     let (tx, mut rx) = mpsc::channel(4096);
-    let pinger = Pinger::start(std::slice::from_ref(&o.reflector), Some(&o.iface), PING_INTERVAL_MS, tx);
+    let pinger = Pinger::start(
+        std::slice::from_ref(&o.reflector),
+        Some(&o.iface),
+        PING_INTERVAL_MS,
+        tx,
+    );
     if pinger.is_empty() {
         bail!("could not start ping to {}", o.reflector);
     }
@@ -251,7 +279,11 @@ pub async fn run(o: &Options) -> Result<Report> {
 pub fn print(r: &Report) {
     println!(
         "\n{} ({} via {}):",
-        if r.label.is_empty() { "Result" } else { &r.label },
+        if r.label.is_empty() {
+            "Result"
+        } else {
+            &r.label
+        },
         r.reflector,
         r.iface
     );
@@ -266,7 +298,11 @@ pub fn print(r: &Report) {
         );
     }
     if let Some(b) = r.bloat_ms() {
-        println!("  Latency increase under load: +{:.1} ms (grade {})", b, grade(b));
+        println!(
+            "  Latency increase under load: +{:.1} ms (grade {})",
+            b,
+            grade(b)
+        );
     }
 }
 
@@ -293,7 +329,9 @@ pub fn print_comparison(off: &Report, on: &Report) {
             grade(b)
         );
     }
-    println!("  Network conditions change between runs; repeat a few times before drawing conclusions.");
+    println!(
+        "  Network conditions change between runs; repeat a few times before drawing conclusions."
+    );
 }
 
 pub fn save(r: &Report) -> Option<String> {
@@ -301,7 +339,13 @@ pub fn save(r: &Report) -> Option<String> {
     let safe: String = r
         .label
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let path = Path::new(RESULTS_DIR).join(format!("{}-{}.json", r.unix_time, safe));
     std::fs::write(&path, serde_json::to_string_pretty(r).ok()?).ok()?;
@@ -327,14 +371,19 @@ mod tests {
         let v: Vec<f64> = (1..=100).map(|x| x as f64).collect();
         assert_eq!(percentile(&v, 0.5), 51.0);
         assert_eq!(percentile(&v, 0.99), 99.0);
-        assert_eq!(percentile(&[], 0.5).is_nan(), true);
+        assert!(percentile(&[], 0.5).is_nan());
         assert_eq!(jitter(&[10.0, 12.0, 10.0, 10.0]), 4.0 / 3.0);
         assert_eq!(jitter(&[5.0]), 0.0);
     }
 
     #[test]
     fn bloat_is_worst_direction_median_increase() {
-        let p = |n: &str, p50: f64| Phase { name: n.into(), samples: 10, p50_ms: p50, ..Default::default() };
+        let p = |n: &str, p50: f64| Phase {
+            name: n.into(),
+            samples: 10,
+            p50_ms: p50,
+            ..Default::default()
+        };
         let r = Report {
             label: String::new(),
             iface: "wlan0".into(),

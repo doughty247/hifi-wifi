@@ -88,6 +88,7 @@ pub struct TcManager {
 }
 
 impl TcManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         window_size: usize,
         threshold_mbit: u32,
@@ -128,7 +129,7 @@ impl TcManager {
         let mut sorted: Vec<u32> = self.sample_window.iter().copied().collect();
         sorted.sort();
         let mid = sorted.len() / 2;
-        if sorted.len() % 2 == 0 && sorted.len() > 1 {
+        if sorted.len().is_multiple_of(2) && sorted.len() > 1 {
             Some((sorted[mid - 1] + sorted[mid]) / 2)
         } else {
             Some(sorted[mid])

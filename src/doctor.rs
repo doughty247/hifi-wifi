@@ -21,7 +21,12 @@ pub struct Finding {
     pub fix: Option<String>,
 }
 
-fn finding(severity: Severity, title: impl Into<String>, detail: impl Into<String>, fix: Option<&str>) -> Finding {
+fn finding(
+    severity: Severity,
+    title: impl Into<String>,
+    detail: impl Into<String>,
+    fix: Option<&str>,
+) -> Finding {
     Finding {
         severity,
         title: title.into(),
@@ -134,7 +139,11 @@ pub fn parse_scan(out: &str) -> Vec<Bss> {
     let mut cur: Option<(Option<String>, Option<f64>, Option<f64>)> = None;
     let flush = |c: Option<(Option<String>, Option<f64>, Option<f64>)>, list: &mut Vec<Bss>| {
         if let Some((Some(ssid), Some(freq_mhz), Some(signal_dbm))) = c {
-            list.push(Bss { ssid, freq_mhz, signal_dbm });
+            list.push(Bss {
+                ssid,
+                freq_mhz,
+                signal_dbm,
+            });
         }
     };
     for line in out.lines() {
@@ -172,7 +181,11 @@ fn retry_ratio(before: &Station, after: &Station) -> (f64, f64, bool) {
         (dr as f64 / dp as f64, df as f64 / dp as f64, true)
     } else {
         let p = after.tx_packets.max(1) as f64;
-        (after.tx_retries as f64 / p, after.tx_failed as f64 / p, false)
+        (
+            after.tx_retries as f64 / p,
+            after.tx_failed as f64 / p,
+            false,
+        )
     }
 }
 
@@ -209,7 +222,11 @@ pub fn analyze(i: &Inputs) -> Vec<Finding> {
             let better = i
                 .scan
                 .iter()
-                .filter(|b| Some(&b.ssid) == i.link.ssid.as_ref() && b.freq_mhz > 2500.0 && b.signal_dbm >= -72.0)
+                .filter(|b| {
+                    Some(&b.ssid) == i.link.ssid.as_ref()
+                        && b.freq_mhz > 2500.0
+                        && b.signal_dbm >= -72.0
+                })
                 .max_by(|a, b| a.signal_dbm.total_cmp(&b.signal_dbm));
             match better {
                 Some(b) => f.push(finding(
@@ -226,7 +243,12 @@ pub fn analyze(i: &Inputs) -> Vec<Finding> {
                 )),
             }
         } else {
-            f.push(finding(Severity::Good, format!("Band {}", band(freq)), "", None));
+            f.push(finding(
+                Severity::Good,
+                format!("Band {}", band(freq)),
+                "",
+                None,
+            ));
         }
     }
 
@@ -243,7 +265,11 @@ pub fn analyze(i: &Inputs) -> Vec<Finding> {
 
     if let Some((before, after)) = &i.station {
         let (retry, failed, live) = retry_ratio(before, after);
-        let when = if live { "over the last 3 s" } else { "since connecting" };
+        let when = if live {
+            "over the last 3 s"
+        } else {
+            "since connecting"
+        };
         let sev = match retry {
             r if r < 0.10 => Severity::Good,
             r if r < 0.25 => Severity::Warn,
@@ -319,7 +345,9 @@ pub async fn collect(iface: &str) -> Option<Inputs> {
         station: before.zip(after),
         survey: iw(&["dev", iface, "survey", "dump"]).and_then(|o| parse_survey(&o)),
         power_save_on: iw(&["dev", iface, "get", "power_save"]).map(|o| o.contains(": on")),
-        scan: iw(&["dev", iface, "scan", "dump"]).map(|o| parse_scan(&o)).unwrap_or_default(),
+        scan: iw(&["dev", iface, "scan", "dump"])
+            .map(|o| parse_scan(&o))
+            .unwrap_or_default(),
     })
 }
 
@@ -331,7 +359,7 @@ pub fn print(iface: &str, link: &Link, findings: &[Finding]) {
         link.freq_mhz.map(band).unwrap_or("?")
     );
     let mut sorted: Vec<&Finding> = findings.iter().collect();
-    sorted.sort_by(|a, b| b.severity.cmp(&a.severity));
+    sorted.sort_by_key(|f| std::cmp::Reverse(f.severity));
     for x in sorted {
         let tag = match x.severity {
             Severity::Good => "[ ok ]",
@@ -369,14 +397,24 @@ mod tests {
         assert_eq!(parse_link("Not connected.\n"), None);
 
         let s = parse_station(STATION).unwrap();
-        assert_eq!((s.tx_packets, s.tx_retries, s.tx_failed, s.beacon_loss), (1000, 300, 20, 2));
+        assert_eq!(
+            (s.tx_packets, s.tx_retries, s.tx_failed, s.beacon_loss),
+            (1000, 300, 20, 2)
+        );
 
         let v = parse_survey(SURVEY).unwrap();
         assert_eq!((v.active_ms, v.busy_ms), (10000, 7500));
 
         let b = parse_scan(SCAN);
         assert_eq!(b.len(), 3);
-        assert_eq!(b[1], Bss { ssid: "Home".into(), freq_mhz: 5180.0, signal_dbm: -66.0 });
+        assert_eq!(
+            b[1],
+            Bss {
+                ssid: "Home".into(),
+                freq_mhz: 5180.0,
+                signal_dbm: -66.0
+            }
+        );
     }
 
     #[test]
@@ -391,19 +429,42 @@ mod tests {
         });
         let titles: Vec<&str> = f.iter().map(|x| x.title.as_str()).collect();
         assert!(titles.iter().any(|t| t.contains("weak")), "{:?}", titles);
-        assert!(titles.iter().any(|t| t.contains("5 GHz is available (-66 dBm)")), "{:?}", titles);
+        assert!(
+            titles
+                .iter()
+                .any(|t| t.contains("5 GHz is available (-66 dBm)")),
+            "{:?}",
+            titles
+        );
         assert!(titles.iter().any(|t| t.starts_with("Low link rate")));
-        assert!(titles.iter().any(|t| t.starts_with("Retransmissions 30% since connecting")));
-        assert!(titles.iter().any(|t| t.contains("failed after all retries")));
+        assert!(titles
+            .iter()
+            .any(|t| t.starts_with("Retransmissions 30% since connecting")));
+        assert!(titles
+            .iter()
+            .any(|t| t.contains("failed after all retries")));
         assert!(titles.iter().any(|t| t.starts_with("Channel busy 75%")));
         assert!(titles.iter().any(|t| t.contains("power save is on")));
-        assert!(f.iter().filter(|x| x.severity != Severity::Good).all(|x| x.fix.is_some()));
+        assert!(f
+            .iter()
+            .filter(|x| x.severity != Severity::Good)
+            .all(|x| x.fix.is_some()));
     }
 
     #[test]
     fn live_window_used_when_traffic_flows() {
-        let a = Station { tx_packets: 1000, tx_retries: 500, tx_failed: 0, beacon_loss: 0 };
-        let b = Station { tx_packets: 2000, tx_retries: 550, tx_failed: 0, beacon_loss: 0 };
+        let a = Station {
+            tx_packets: 1000,
+            tx_retries: 500,
+            tx_failed: 0,
+            beacon_loss: 0,
+        };
+        let b = Station {
+            tx_packets: 2000,
+            tx_retries: 550,
+            tx_failed: 0,
+            beacon_loss: 0,
+        };
         let (r, _, live) = retry_ratio(&a, &b);
         assert!(live);
         assert!((r - 0.05).abs() < 1e-9);
@@ -411,11 +472,25 @@ mod tests {
 
     #[test]
     fn healthy_link_is_all_good() {
-        let s = Station { tx_packets: 5000, tx_retries: 100, tx_failed: 0, beacon_loss: 0 };
+        let s = Station {
+            tx_packets: 5000,
+            tx_retries: 100,
+            tx_failed: 0,
+            beacon_loss: 0,
+        };
         let f = analyze(&Inputs {
-            link: Link { ssid: Some("Home".into()), freq_mhz: Some(5180.0), signal_dbm: Some(-52), tx_mbit: Some(866.7), rx_mbit: Some(866.7) },
+            link: Link {
+                ssid: Some("Home".into()),
+                freq_mhz: Some(5180.0),
+                signal_dbm: Some(-52),
+                tx_mbit: Some(866.7),
+                rx_mbit: Some(866.7),
+            },
             station: Some((s, s)),
-            survey: Some(Survey { active_ms: 1000, busy_ms: 150 }),
+            survey: Some(Survey {
+                active_ms: 1000,
+                busy_ms: 150,
+            }),
             power_save_on: Some(false),
             scan: vec![],
         });

@@ -148,15 +148,18 @@ impl Controller {
 
     fn live(&self) -> impl Iterator<Item = &Reflector> {
         let tick = self.tick;
-        self.reflectors
-            .iter()
-            .filter(move |r| r.baseline_ms.is_some() && tick.saturating_sub(r.last_tick) <= STALE_TICKS)
+        self.reflectors.iter().filter(move |r| {
+            r.baseline_ms.is_some() && tick.saturating_sub(r.last_tick) <= STALE_TICKS
+        })
     }
 
     /// (bloated reflectors, responsive reflectors)
     pub fn bloat_votes(&self) -> (usize, usize) {
         let live: Vec<_> = self.live().collect();
-        let bloated = live.iter().filter(|r| r.delta_ms > self.threshold_ms).count();
+        let bloated = live
+            .iter()
+            .filter(|r| r.delta_ms > self.threshold_ms)
+            .count();
         (bloated, live.len())
     }
 
@@ -242,7 +245,11 @@ impl Controller {
             for (dir, achieved) in [(&mut self.dl, dl_kbit), (&mut self.ul, ul_kbit)] {
                 if dir.enabled && achieved / dir.rate_kbit > SATURATED {
                     let below_bottleneck = dir.bottleneck_kbit.is_none_or(|b| dir.rate_kbit < b);
-                    let factor = if below_bottleneck { INCREASE_FACTOR } else { PROBE_FACTOR };
+                    let factor = if below_bottleneck {
+                        INCREASE_FACTOR
+                    } else {
+                        PROBE_FACTOR
+                    };
                     dir.rate_kbit = dir.clamp(dir.rate_kbit * factor);
                 }
             }
@@ -418,7 +425,10 @@ impl Settings {
             .unwrap_or_default();
         let (dl, ul) = match learned.rates_kbit {
             Some((d, u)) => {
-                info!("Autorate: using remembered rates for this network ({} / {} kbit)", d, u);
+                info!(
+                    "Autorate: using remembered rates for this network ({} / {} kbit)",
+                    d, u
+                );
                 (d as f64, u as f64)
             }
             None => (max_dl, max_ul),
@@ -498,7 +508,10 @@ async fn run(settings: Settings, mut target_rx: watch::Receiver<Target>) {
 fn step(s: &mut Session, settings: &Settings, sample_tx: &mpsc::Sender<Sample>) {
     s.ticks += 1;
     let now = Instant::now();
-    let (Some(rx), Some(tx)) = (read_counter(&s.iface, "rx_bytes"), read_counter(&s.iface, "tx_bytes")) else {
+    let (Some(rx), Some(tx)) = (
+        read_counter(&s.iface, "rx_bytes"),
+        read_counter(&s.iface, "tx_bytes"),
+    ) else {
         return;
     };
     let (dl_kbit, ul_kbit) = match s.last_counters {
@@ -547,11 +560,11 @@ fn step(s: &mut Session, settings: &Settings, sample_tx: &mpsc::Sender<Sample>) 
             s.rates_learned |= s.ctrl.bloat_events > 0;
         }
         // NetworkManager or a reconnect can wipe qdiscs; check every 10s
-        if s.ticks % 20 == 0 && s.shaper.as_ref().is_some_and(|sh| !sh.is_present()) {
+        if s.ticks.is_multiple_of(20) && s.shaper.as_ref().is_some_and(|sh| !sh.is_present()) {
             info!("Autorate: shaper on {} disappeared, reinstalling", s.iface);
             s.shaper = None;
         }
-        if s.ticks % 60 == 0 && s.rates_learned {
+        if s.ticks.is_multiple_of(60) && s.rates_learned {
             persist(s, settings);
         }
     } else {
@@ -559,11 +572,11 @@ fn step(s: &mut Session, settings: &Settings, sample_tx: &mpsc::Sender<Sample>) 
         s.ctrl.tick(0.0, 0.0);
     }
     // Baselines are cheap to keep current; save them every 10 minutes
-    if s.ticks % 1200 == 0 {
+    if s.ticks.is_multiple_of(1200) {
         persist(s, settings);
     }
 
-    if s.ticks % 4 == 0 {
+    if s.ticks.is_multiple_of(4) {
         write_status(s);
     }
 }
@@ -595,7 +608,12 @@ fn update_pinger(s: &mut Session, settings: &Settings, sample_tx: &mpsc::Sender<
     if s.pinger.is_some() && s.pinger_fast == fast {
         return;
     }
-    let p = Pinger::start(&settings.cfg.reflectors, Some(&s.iface), interval, sample_tx.clone());
+    let p = Pinger::start(
+        &settings.cfg.reflectors,
+        Some(&s.iface),
+        interval,
+        sample_tx.clone(),
+    );
     if p.is_empty() {
         warn!("Autorate: no latency probes running; the shaper will hold its rate");
     }
@@ -637,7 +655,13 @@ fn persist(s: &mut Session, settings: &Settings) {
     } else {
         previous.baselines_ms
     };
-    save_learned(key, Learned { rates_kbit, baselines_ms });
+    save_learned(
+        key,
+        Learned {
+            rates_kbit,
+            baselines_ms,
+        },
+    );
 }
 
 fn write_status(s: &Session) {

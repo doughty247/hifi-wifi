@@ -1,6 +1,7 @@
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[derive(Default)]
 pub struct Config {
     #[serde(default)]
     pub global: GlobalConfig,
@@ -18,19 +19,6 @@ pub struct Config {
     pub autorate: AutorateConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            global: GlobalConfig::default(),
-            wifi: WifiConfig::default(),
-            power: PowerConfig::default(),
-            system: SystemConfig::default(),
-            backend: BackendConfig::default(),
-            governor: GovernorConfig::default(),
-            autorate: AutorateConfig::default(),
-        }
-    }
-}
 
 #[derive(Debug, Deserialize)]
 pub struct GlobalConfig {

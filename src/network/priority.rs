@@ -23,7 +23,14 @@ const GAME_CGROUPS: &[&str] = &["gamescope.slice"];
 /// Port ranges ("27000-27100" or "3478") are passed into the nft script, so only digits and one dash.
 pub fn is_valid_port_range(s: &str) -> bool {
     let mut parts = s.split('-');
-    let valid = |p: Option<&str>| p.is_some_and(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u32>().is_ok_and(|n| n <= 65535));
+    let valid = |p: Option<&str>| {
+        p.is_some_and(|p| {
+            !p.is_empty()
+                && p.len() <= 5
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && p.parse::<u32>().is_ok_and(|n| n <= 65535)
+        })
+    };
     match (parts.next(), parts.next(), parts.next()) {
         (a, None, None) => valid(a),
         (a, b, None) => valid(a) && valid(b),
@@ -144,7 +151,10 @@ impl GamePriority {
 
 /// Remove our table (also cleans up tables left by older versions). Idempotent.
 pub fn remove() {
-    match nft_load(&format!("table inet {t}\ndelete table inet {t}\n", t = TABLE)) {
+    match nft_load(&format!(
+        "table inet {t}\ndelete table inet {t}\n",
+        t = TABLE
+    )) {
         Ok(()) => debug!("Removed nft table {}", TABLE),
         Err(e) => debug!("nft cleanup skipped: {}", e),
     }
