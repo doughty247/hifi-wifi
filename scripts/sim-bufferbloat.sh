@@ -9,6 +9,7 @@
 #   2) with `hifi-wifi autorate` -> latency under load should stay near idle
 #
 # Usage: sudo scripts/sim-bufferbloat.sh [path/to/hifi-wifi]
+#   MODE=iperf|bench (bench: run `hifi-wifi bench` against a local HTTP server)
 #   DIRECTION=upload|download (default upload; download needs IFB + a tc classifier)
 #   RATE=20mbit BUFFER=400ms DELAY=10ms LOAD_SECS=30
 # Needs iproute2, iperf3, ping, python3. Uses netem for base delay if the kernel has it.
@@ -60,6 +61,20 @@ done
 
 ip netns exec isp iperf3 -s -D -B 10.9.9.9 >/dev/null
 sleep 0.5
+
+if [[ "${MODE:-iperf}" == bench ]]; then
+    ip netns exec isp python3 "$(dirname "$0")/sim-speedtest-server.py" 10.9.9.9 8080 &
+    sleep 1
+    args=(bench --iface cli0 --reflector 10.9.9.9 --secs 12 --warmup 8 --streams 4
+          --download-url http://10.9.9.9:8080/down --upload-url http://10.9.9.9:8080/up)
+    echo "=== without hifi-wifi ==="
+    ip netns exec client "$BIN" "${args[@]}" --label sim-off 2>&1 | grep -v '^\[' || true
+    ip netns exec client "$BIN" autorate cli0 --always --reflector 10.9.9.9 > "$OUT/autorate.log" 2>&1 &
+    sleep 8
+    echo "=== with hifi-wifi autorate ==="
+    ip netns exec client "$BIN" "${args[@]}" --label sim-on 2>&1 | grep -v '^\[' || true
+    exit 0
+fi
 
 # Prints "idle_p50 load_p50 load_p95 mbit"
 measure() {

@@ -1,3 +1,4 @@
+mod bench;
 mod config;
 mod network;
 mod system;
@@ -95,6 +96,36 @@ enum Commands {
     /// Check system compatibility for advanced networking features
     #[command(name = "check-compat")]
     CheckCompat,
+    /// Measure latency under load (bufferbloat): idle, download, upload
+    Bench {
+        /// A/B test: measure with hifi-wifi off, then on (stops and restarts the service)
+        #[arg(long)]
+        ab: bool,
+        /// Interface to test (default: the one carrying the default route)
+        #[arg(long)]
+        iface: Option<String>,
+        /// Ping target (IP address)
+        #[arg(long)]
+        reflector: Option<String>,
+        /// Seconds per loaded phase
+        #[arg(long, default_value_t = 15)]
+        secs: u64,
+        /// Seconds of untimed load before measuring (lets autorate find the bottleneck)
+        #[arg(long, default_value_t = 10)]
+        warmup: u64,
+        /// Parallel transfers per direction
+        #[arg(long, default_value_t = 4)]
+        streams: usize,
+        /// URL to download from (must serve a large file)
+        #[arg(long, default_value = "https://speed.cloudflare.com/__down?bytes=500000000")]
+        download_url: String,
+        /// URL that accepts a streamed POST upload
+        #[arg(long, default_value = "https://speed.cloudflare.com/__up")]
+        upload_url: String,
+        /// Label stored with the result
+        #[arg(long, default_value = "")]
+        label: String,
+    },
     /// Run autorate in the foreground on one interface and print what it does
     /// (stop the service first: sudo hifi-wifi off)
     Autorate {
@@ -197,11 +228,69 @@ async fn main() -> Result<()> {
         Commands::CheckCompat => {
             let _ = run_check_compat()?;
         }
+        Commands::Bench { ab, iface, reflector, secs, warmup, streams, download_url, upload_url, label } => {
+            let iface = iface
+                .or_else(crate::network::governor::default_route_iface)
+                .filter(|i| crate::network::shaper::is_valid_iface(i))
+                .ok_or_else(|| anyhow::anyhow!("No interface given and no default route found"))?;
+            let reflector = reflector
+                .or_else(|| config.autorate.reflectors.first().cloned())
+                .unwrap_or_else(|| "1.1.1.1".into());
+            let mut opts = bench::Options {
+                iface, reflector, secs, warmup_secs: warmup, streams, download_url, upload_url, label,
+            };
+            run_bench(&mut opts, ab).await?;
+        }
         Commands::Autorate { iface, always, reflectors } => {
             run_autorate(&config, iface, always, reflectors).await?;
         }
     }
 
+    Ok(())
+}
+
+async fn run_bench(opts: &mut bench::Options, ab: bool) -> Result<()> {
+    println!(
+        "hifi-wifi bench: {} -> {}, {} s per phase, {} streams",
+        opts.iface, opts.reflector, opts.secs, opts.streams
+    );
+    println!("Uses your connection at full speed for about {} s per run.", 10 + opts.warmup_secs + 2 * opts.secs + 10);
+    if !ab {
+        let report = bench::run(opts).await?;
+        bench::print(&report);
+        if let Some(path) = bench::save(&report) {
+            println!("  Saved: {}", path);
+        }
+        return Ok(());
+    }
+
+    if !Path::new("/etc/systemd/system/hifi-wifi.service").exists() {
+        anyhow::bail!("--ab needs the hifi-wifi service installed (sudo hifi-wifi install)");
+    }
+    let base_label = opts.label.clone();
+
+    println!("\n[1/2] hifi-wifi OFF");
+    run_off()?;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    opts.label = format!("{}off", if base_label.is_empty() { String::new() } else { format!("{}-", base_label) });
+    let off = bench::run(opts).await;
+
+    println!("\n[2/2] hifi-wifi ON");
+    run_on()?;
+    // Daemon startup plus idle probing so autorate has a clean latency baseline
+    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    opts.label = format!("{}on", if base_label.is_empty() { String::new() } else { format!("{}-", base_label) });
+    let on = bench::run(opts).await?;
+    let off = off?;
+
+    bench::print(&off);
+    bench::print(&on);
+    bench::print_comparison(&off, &on);
+    for r in [&off, &on] {
+        if let Some(path) = bench::save(r) {
+            println!("  Saved: {}", path);
+        }
+    }
     Ok(())
 }
 

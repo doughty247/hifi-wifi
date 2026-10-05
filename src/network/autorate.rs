@@ -31,14 +31,19 @@ const ALPHA_BASE_UP: f64 = 0.001;
 const ALPHA_BASE_DOWN: f64 = 0.9;
 const STALE_TICKS: u64 = 6;
 const DECREASE_FACTOR: f64 = 0.9;
-/// Below the throughput last seen at the bottleneck: recover quickly
-const INCREASE_FACTOR: f64 = 1.05;
+/// Below the rate the last bloat episode settled on: recover quickly
+const INCREASE_FACTOR: f64 = 1.08;
 /// Above it: probe gently, since that is where the queue starts building
-const PROBE_FACTOR: f64 = 1.015;
+const PROBE_FACTOR: f64 = 1.03;
 const SATURATED: f64 = 0.75;
 const BUSY_VS_PEAK: f64 = 0.5;
 const PEAK_DECAY: f64 = 0.995;
 const DECREASE_REFRACTORY_TICKS: u64 = 4;
+/// A deep upstream buffer takes seconds to drain after a cut. While delay is falling the cut
+/// is working, so only cut again if it is not, or after this long.
+const DRAIN_WAIT_TICKS: u64 = 12;
+/// Cuts closer together than this belong to the same bloat episode
+const EPISODE_TICKS: u64 = 20;
 const INCREASE_REFRACTORY_TICKS: u64 = 2;
 /// Traffic that counts as "busy" for `mode = "busy"` (kbit/s, either direction)
 const BUSY_DL_KBIT: f64 = 2_000.0;
@@ -51,7 +56,7 @@ pub struct Direction {
     pub min_kbit: f64,
     pub max_kbit: f64,
     peak_kbit: f64,
-    /// Rate set by the last bloat cut: known to be just under the bottleneck
+    /// Rate set by the first cut of the last bloat episode: just under the bottleneck
     bottleneck_kbit: Option<f64>,
     pub enabled: bool,
 }
@@ -82,7 +87,10 @@ impl Direction {
 #[derive(Debug, Clone, Default)]
 struct Reflector {
     baseline_ms: Option<f64>,
+    /// Smoothed delay over baseline (bloat vote)
     delta_ms: f64,
+    /// Latest raw delay over baseline (queue trend, no smoothing lag)
+    raw_delta_ms: f64,
     last_tick: u64,
 }
 
@@ -95,6 +103,8 @@ pub struct Controller {
     reflectors: Vec<Reflector>,
     tick: u64,
     last_decrease_tick: Option<u64>,
+    /// Highest median delay since the last cut, to tell a draining queue from a growing one
+    delay_peak_since_cut_ms: f64,
     pub bloat_events: u64,
 }
 
@@ -107,6 +117,7 @@ impl Controller {
             reflectors: Vec::new(),
             tick: 0,
             last_decrease_tick: None,
+            delay_peak_since_cut_ms: 0.0,
             bloat_events: 0,
         }
     }
@@ -131,7 +142,8 @@ impl Controller {
             base
         };
         r.baseline_ms = Some(base);
-        r.delta_ms = ALPHA_DELTA * (rtt_ms - base) + (1.0 - ALPHA_DELTA) * r.delta_ms;
+        r.raw_delta_ms = rtt_ms - base;
+        r.delta_ms = ALPHA_DELTA * r.raw_delta_ms + (1.0 - ALPHA_DELTA) * r.delta_ms;
     }
 
     fn live(&self) -> impl Iterator<Item = &Reflector> {
@@ -163,8 +175,7 @@ impl Controller {
             .iter()
             .map(|b| Reflector {
                 baseline_ms: *b,
-                delta_ms: 0.0,
-                last_tick: 0,
+                ..Default::default()
             })
             .collect();
     }
@@ -192,9 +203,16 @@ impl Controller {
             dir.peak_kbit = achieved.max(dir.peak_kbit * PEAK_DECAY);
         }
 
+        let delay = median(self.live().map(|r| r.raw_delta_ms).collect()).unwrap_or(0.0);
+        self.delay_peak_since_cut_ms = self.delay_peak_since_cut_ms.max(delay);
+        let draining = delay < self.delay_peak_since_cut_ms * 0.9;
+        let new_episode = since_decrease > EPISODE_TICKS;
+
         let mut cut = false;
         if bloated {
-            if since_decrease >= DECREASE_REFRACTORY_TICKS {
+            if since_decrease >= DECREASE_REFRACTORY_TICKS
+                && (!draining || since_decrease >= DRAIN_WAIT_TICKS)
+            {
                 // Directions carrying real traffic near their own recent peak are suspects.
                 // Cut those loading their shaper heavily, else only the most loaded one.
                 let load = |d: &Direction, a: f64| {
@@ -213,7 +231,9 @@ impl Controller {
                     let Some(l) = l else { continue };
                     if (heavy && l >= BUSY_VS_PEAK) || (!heavy && l == top) {
                         dir.rate_kbit = dir.clamp(dir.rate_kbit.min(achieved) * DECREASE_FACTOR);
-                        dir.bottleneck_kbit = Some(dir.rate_kbit);
+                        if new_episode || dir.bottleneck_kbit.is_none() {
+                            dir.bottleneck_kbit = Some(dir.rate_kbit);
+                        }
                         cut = true;
                     }
                 }
@@ -229,6 +249,7 @@ impl Controller {
         }
         if cut {
             self.last_decrease_tick = Some(self.tick);
+            self.delay_peak_since_cut_ms = delay;
             self.bloat_events += 1;
         }
         before != (self.dl.rate_kbit, self.ul.rate_kbit)
@@ -832,6 +853,26 @@ mod tests {
             c.tick(100_000.0, 500.0);
         }
         assert_eq!(c.bloat_events, 0);
+    }
+
+    #[test]
+    fn draining_queue_is_not_cut_again() {
+        let mut c = ctrl(500_000.0, 20_000.0);
+        c.seed_baselines(&[Some(20.0), Some(21.0), Some(22.0)]);
+        // Deep buffer: 300 ms of extra delay, draining 40 ms per tick after the cut
+        let mut extra = 300.0;
+        for _ in 0..4 {
+            pings(&mut c, 20.0, extra);
+            c.tick(20_000.0, 500.0);
+        }
+        assert_eq!(c.bloat_events, 1);
+        let after_first = c.dl.rate_kbit;
+        for _ in 0..8 {
+            extra = (extra - 40.0f64).max(0.5);
+            pings(&mut c, 20.0, extra);
+            c.tick(after_first, 500.0);
+        }
+        assert_eq!(c.bloat_events, 1, "cut again while the queue was draining");
     }
 
     #[test]
