@@ -47,8 +47,15 @@ const DECREASE_REFRACTORY_TICKS: u64 = 4;
 const DRAIN_WAIT_TICKS: u64 = 12;
 /// Cuts closer together than this belong to the same bloat episode
 const EPISODE_TICKS: u64 = 20;
-/// A cut "helped" if smoothed delay later fell below this fraction of its value at the cut
+/// A cut "helped" if the delay, averaged since the cut, fell below this fraction of its value
+/// at the cut. An average, not the minimum: on Wi-Fi random dips would otherwise "prove" every
+/// cut helped and the rate would ratchet down.
 const HELPED_RATIO: f64 = 0.7;
+/// Per-tick weight of the post-cut delay average (~2.5 s time constant)
+const ALPHA_AFTER_CUT: f64 = 0.2;
+/// One bloat episode may remove at most this share of the traffic that was flowing when it
+/// began. Deeper cuts trade too much throughput for latency the shaper may not even own.
+const MAX_EPISODE_CUT: f64 = 0.5;
 /// After a cut that did not help, ignore bloat for this long (60 s) and restore the rate:
 /// the delay is not coming from a queue we control (e.g. Wi-Fi contention or retries)
 const FUTILE_HOLD_TICKS: u64 = 120;
@@ -66,6 +73,8 @@ pub struct Direction {
     peak_kbit: f64,
     /// Rate set by the first cut of the last bloat episode: just under the bottleneck
     bottleneck_kbit: Option<f64>,
+    /// Lowest rate the current episode may cut to
+    episode_floor_kbit: f64,
     pub enabled: bool,
 }
 
@@ -78,6 +87,7 @@ impl Direction {
             max_kbit,
             peak_kbit: 0.0,
             bottleneck_kbit: None,
+            episode_floor_kbit: 0.0,
             enabled: true,
         }
     }
@@ -115,9 +125,9 @@ pub struct Controller {
     last_decrease_tick: Option<u64>,
     /// Highest median delay since the last cut, to tell a draining queue from a growing one
     delay_peak_since_cut_ms: f64,
-    /// Smoothed delay at the last cut, and the lowest since: did the cut help?
+    /// Smoothed delay at the last cut, and its running average since: did the cut help?
     delay_at_cut_ms: f64,
-    delay_min_since_cut_ms: f64,
+    delay_avg_since_cut_ms: f64,
     /// Rates before the first cut of the current episode, restored if cutting proves futile
     episode_start_kbit: Option<(f64, f64)>,
     /// Bloat is ignored until this tick (cutting did not reduce it)
@@ -138,7 +148,7 @@ impl Controller {
             last_decrease_tick: None,
             delay_peak_since_cut_ms: 0.0,
             delay_at_cut_ms: 0.0,
-            delay_min_since_cut_ms: 0.0,
+            delay_avg_since_cut_ms: 0.0,
             episode_start_kbit: None,
             futile_until_tick: 0,
             futile_episodes: 0,
@@ -235,9 +245,10 @@ impl Controller {
             .map(|t| self.tick - t)
             .unwrap_or(u64::MAX);
         let smooth = self.delta_ms().unwrap_or(0.0);
-        self.delay_min_since_cut_ms = self.delay_min_since_cut_ms.min(smooth);
+        self.delay_avg_since_cut_ms =
+            ALPHA_AFTER_CUT * smooth + (1.0 - ALPHA_AFTER_CUT) * self.delay_avg_since_cut_ms;
         let in_episode = self.last_decrease_tick.is_some() && since_decrease <= EPISODE_TICKS;
-        let helped = self.delay_min_since_cut_ms < self.delay_at_cut_ms * HELPED_RATIO;
+        let helped = self.delay_avg_since_cut_ms < self.delay_at_cut_ms * HELPED_RATIO;
 
         // A cut that had time to act but left the delay where it was: the delay is not in a
         // queue we control. Stop cutting for a while and give the bandwidth back.
@@ -289,7 +300,12 @@ impl Controller {
                 {
                     let Some(l) = l else { continue };
                     if (heavy && l >= BUSY_VS_PEAK) || (!heavy && l == top) {
-                        dir.rate_kbit = dir.clamp(dir.rate_kbit.min(achieved) * DECREASE_FACTOR);
+                        if new_episode || dir.episode_floor_kbit == 0.0 {
+                            dir.episode_floor_kbit = achieved * MAX_EPISODE_CUT;
+                        }
+                        let target = (dir.rate_kbit.min(achieved) * DECREASE_FACTOR)
+                            .max(dir.episode_floor_kbit);
+                        dir.rate_kbit = dir.clamp(target);
                         if new_episode || dir.bottleneck_kbit.is_none() {
                             dir.bottleneck_kbit = Some(dir.rate_kbit);
                         }
@@ -317,7 +333,7 @@ impl Controller {
             self.last_decrease_tick = Some(self.tick);
             self.delay_peak_since_cut_ms = delay;
             self.delay_at_cut_ms = smooth;
-            self.delay_min_since_cut_ms = smooth;
+            self.delay_avg_since_cut_ms = smooth;
             self.bloat_events += 1;
         }
         before != (self.dl.rate_kbit, self.ul.rate_kbit)
@@ -1057,6 +1073,26 @@ mod tests {
         assert!(c.futile_episodes >= 1);
         assert!(min_rate > 120_000.0, "cut too deep: {}", min_rate);
         assert!(c.dl.rate_kbit >= 135_000.0, "not restored: {}", c.dl.rate_kbit);
+    }
+
+    /// Same desktop on Wi-Fi, later run: delay does fall as the rate drops, but noisily.
+    /// v3 ratcheted 116 -> 39 Mbit. An episode may now take at most half of the traffic.
+    #[test]
+    fn noisy_link_is_never_cut_below_half() {
+        let mut c = ctrl(940_000.0, 300_000.0);
+        idle_baseline(&mut c, 18.0);
+        let mut min_rate = f64::MAX;
+        for i in 0..200 {
+            let achieved = c.dl.rate_kbit.min(116_000.0);
+            c.tick(achieved, 1_300.0);
+            // Delay grows with how hard we push, plus Wi-Fi noise
+            let load = achieved / 116_000.0;
+            let noise = [0.0, 25.0, 5.0, 40.0, 10.0][i % 5];
+            pings(&mut c, 18.0, 25.0 * load + noise * load);
+            min_rate = min_rate.min(c.dl.rate_kbit);
+        }
+        assert!(c.bloat_events >= 1);
+        assert!(min_rate >= 58_000.0 - 1.0, "cut below half: {}", min_rate);
     }
 
     #[test]
