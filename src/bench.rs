@@ -40,6 +40,28 @@ pub struct Phase {
     pub loss_pct: f64,
     pub down_mbit: f64,
     pub up_mbit: f64,
+    /// False when a loaded phase did not actually saturate its direction (server throttled,
+    /// URL unreachable...). Such a phase measures an idle line and is excluded from the grade.
+    #[serde(default = "default_true")]
+    pub load_ok: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// A loaded direction must carry at least this much to count as "under load"
+const MIN_LOAD_MBIT: f64 = 5.0;
+
+/// Mark loaded phases whose own direction carried too little traffic.
+/// `reference_mbit` is what that direction reached during the warm-up (0 if none).
+fn check_load(p: &mut Phase, reference_mbit: f64) {
+    let carried = match p.name.as_str() {
+        "download" => p.down_mbit,
+        "upload" => p.up_mbit,
+        _ => return,
+    };
+    p.load_ok = carried >= MIN_LOAD_MBIT && carried >= reference_mbit * 0.25;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +85,7 @@ impl Report {
         ["download", "upload"]
             .iter()
             .filter_map(|n| self.phase(n))
-            .filter(|p| p.samples > 0)
+            .filter(|p| p.samples > 0 && p.load_ok)
             .map(|p| (p.p50_ms - idle).max(0.0))
             .reduce(f64::max)
     }
@@ -115,6 +137,7 @@ fn summarize(name: &str, rtts: &[f64], secs: f64, down_mbit: f64, up_mbit: f64) 
         loss_pct: ((1.0 - rtts.len() as f64 / expected) * 100.0).clamp(0.0, 100.0),
         down_mbit,
         up_mbit,
+        load_ok: true,
     }
 }
 
@@ -250,15 +273,22 @@ pub async fn run(o: &Options) -> Result<Report> {
     if phases[0].samples == 0 {
         bail!("no ping replies from {} via {}", o.reflector, o.iface);
     }
+    let mut warm: Option<Phase> = None;
     if o.warmup_secs > 0 {
         eprintln!("  warm-up ({} s, not counted)...", o.warmup_secs);
-        phase(o, "warmup", Load::Both, o.warmup_secs, &mut rx).await;
+        warm = Some(phase(o, "warmup", Load::Both, o.warmup_secs, &mut rx).await);
         // Let queues drain
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
     for (name, load) in [("download", Load::Download), ("upload", Load::Upload)] {
         eprintln!("  {} ({} s)...", name, o.secs);
-        phases.push(phase(o, name, load, o.secs, &mut rx).await);
+        let mut p = phase(o, name, load, o.secs, &mut rx).await;
+        let reference = warm
+            .as_ref()
+            .map(|w| if name == "download" { w.down_mbit } else { w.up_mbit })
+            .unwrap_or(0.0);
+        check_load(&mut p, reference);
+        phases.push(p);
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     drop(pinger);
@@ -293,9 +323,21 @@ pub fn print(r: &Report) {
     );
     for p in &r.phases {
         println!(
-            "  {:<9} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>5.0}% {:>10.1} {:>10.1}",
-            p.name, p.p50_ms, p.p90_ms, p.p99_ms, p.jitter_ms, p.loss_pct, p.down_mbit, p.up_mbit
+            "  {:<9} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>5.0}% {:>10.1} {:>10.1}{}",
+            p.name,
+            p.p50_ms,
+            p.p90_ms,
+            p.p99_ms,
+            p.jitter_ms,
+            p.loss_pct,
+            p.down_mbit,
+            p.up_mbit,
+            if p.load_ok { "" } else { "  <- load failed, not graded" }
         );
+    }
+    if r.phases.iter().any(|p| !p.load_ok) {
+        println!("  Warning: a loaded phase did not saturate the link (the test server may be throttling).");
+        println!("  Its latency is that of an idle line. Re-run later or pass --download-url / --upload-url.");
     }
     if let Some(b) = r.bloat_ms() {
         println!(
@@ -336,8 +378,8 @@ pub fn print_comparison(off: &Report, on: &Report) {
 
 pub fn save(r: &Report) -> Option<String> {
     std::fs::create_dir_all(RESULTS_DIR).ok()?;
-    let safe: String = r
-        .label
+    let label = if r.label.is_empty() { "run" } else { r.label.as_str() };
+    let safe: String = label
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' {
@@ -382,6 +424,7 @@ mod tests {
             name: n.into(),
             samples: 10,
             p50_ms: p50,
+            load_ok: true,
             ..Default::default()
         };
         let r = Report {
@@ -393,6 +436,31 @@ mod tests {
             phases: vec![p("idle", 20.0), p("download", 85.0), p("upload", 40.0)],
         };
         assert_eq!(r.bloat_ms(), Some(65.0));
+    }
+
+    #[test]
+    fn failed_load_is_not_graded() {
+        // The real-hardware case: download load got 0.6 Mbit, so it measured an idle line
+        let mut dl = summarize("download", &[19.0; 50], 10.0, 0.6, 0.3);
+        check_load(&mut dl, 35.0);
+        assert!(!dl.load_ok);
+        let mut ul = summarize("upload", &[11.0; 50], 10.0, 4.8, 191.7);
+        check_load(&mut ul, 150.0);
+        assert!(ul.load_ok);
+        // Carried traffic far below what the warm-up reached: also not a real load
+        let mut weak = summarize("download", &[20.0; 50], 10.0, 8.0, 0.5);
+        check_load(&mut weak, 200.0);
+        assert!(!weak.load_ok);
+        let idle = summarize("idle", &[18.0; 50], 10.0, 0.0, 0.0);
+        let r = Report {
+            label: String::new(),
+            iface: "enp42s0".into(),
+            reflector: "1.1.1.1".into(),
+            version: String::new(),
+            unix_time: 0,
+            phases: vec![idle, dl, ul],
+        };
+        assert_eq!(r.bloat_ms(), Some(0.0)); // only upload graded (11 - 18 clamps to 0)
     }
 
     #[test]

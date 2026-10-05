@@ -123,7 +123,7 @@ enum Commands {
         #[arg(long, default_value_t = 4)]
         streams: usize,
         /// URL to download from (must serve a large file)
-        #[arg(long, default_value = "https://speed.cloudflare.com/__down?bytes=500000000")]
+        #[arg(long, default_value = "https://speed.cloudflare.com/__down?bytes=25000000")]
         download_url: String,
         /// URL that accepts a streamed POST upload
         #[arg(long, default_value = "https://speed.cloudflare.com/__up")]
@@ -327,7 +327,8 @@ async fn run_bench(opts: &mut bench::Options, ab: bool) -> Result<()> {
 
     println!("\n[1/2] hifi-wifi OFF");
     run_off()?;
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // Reverting can renegotiate the link (EEE on some Ethernet NICs); let it settle
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     opts.label = format!("{}off", if base_label.is_empty() { String::new() } else { format!("{}-", base_label) });
     let off = bench::run(opts).await;
 
