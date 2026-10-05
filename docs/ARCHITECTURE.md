@@ -305,20 +305,19 @@ Fallbacks: kernels without `sch_cake` get HTB + fq_codel; without fq_codel, TBF 
 The governor points autorate at the interface carrying the default route and supplies the
 link rate as the upper bound. When autorate runs, breathing CAKE does not shape.
 
-**Simulation results** (`scripts/sim-bufferbloat.sh`, network namespaces, 20 Mbit bottleneck
-with a 400 ms buffer). The development VM had no CAKE or fq_codel, so these use the TBF
-fallback; CAKE is expected to do at least as well. Real-hardware numbers come from
-`hifi-wifi bench --ab` on beta testers' devices.
+**Simulation results** (`scripts/sim-bufferbloat.sh`, network namespaces on a GitHub Actions
+runner with CAKE; 20 Mbit bottleneck, 400 ms buffer, 20 ms base RTT, 4 TCP flows). The CI
+`simulation` job reruns this on every push.
 
-| Upload test (iperf3, 4 flows) | idle p50 | loaded p50 | loaded p95 | throughput |
+| Direction | loaded p50, no shaping | loaded p50, autorate | loaded p95, autorate | throughput off -> on |
 |---|---|---|---|---|
-| No shaping | 0.1 ms | 49.9 ms | 61.2 ms | 19.0 Mbit |
-| Autorate (TBF fallback) | 0.1 ms | 4.7 ms | 22.8 ms | 17.6 Mbit |
+| Download | 366 ms | 21.8 ms | 73.8 ms | 19.1 -> 17.9 Mbit |
+| Upload | 364 ms | 42.4 ms | 81.6 ms | 19.0 -> 18.7 Mbit |
 
-`hifi-wifi bench` against the same link: latency increase under load +40 to +55 ms
-without shaping, +7 to +24 ms with autorate (run to run variation). The download
-direction gains less than upload with TBF, because tail-drop ingress shaping lacks the AQM
-that CAKE's ingress mode provides.
+`hifi-wifi bench` on the same link: +306 ms (D) without, +2.9 ms (A+) with autorate (idle 20 ms).
+On a kernel without CAKE or fq_codel (TBF fallback, no base delay) upload went from
++50 ms to +5 ms median at 93% throughput. Real-hardware numbers come from
+`hifi-wifi bench --ab` on beta testers' devices.
 
 ### Band Steering
 
