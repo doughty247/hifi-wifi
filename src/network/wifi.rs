@@ -152,6 +152,18 @@ impl WifiManager {
     }
 
     /// Disable power saving on an interface using `iw`
+    /// Current power save state as the driver reports it (None if unknown / not Wi-Fi)
+    pub fn get_power_save(&self, ifc: &WifiInterface) -> Option<bool> {
+        if ifc.interface_type != InterfaceType::Wifi {
+            return None;
+        }
+        let out = Command::new("iw")
+            .args(["dev", &ifc.name, "get", "power_save"])
+            .output()
+            .ok()?;
+        parse_power_save(&String::from_utf8_lossy(&out.stdout))
+    }
+
     pub fn disable_power_save(&self, ifc: &WifiInterface) -> Result<()> {
         // Power save only applies to WiFi
         if ifc.interface_type != InterfaceType::Wifi {
@@ -229,5 +241,28 @@ impl Default for WifiManager {
         Self::new().unwrap_or(Self {
             interfaces: Vec::new(),
         })
+    }
+}
+
+/// Parse `iw dev X get power_save` ("Power save: on")
+pub fn parse_power_save(out: &str) -> Option<bool> {
+    let v = out.split(':').nth(1)?.trim();
+    match v {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod power_save_tests {
+    use super::parse_power_save;
+
+    #[test]
+    fn parses_iw_power_save() {
+        assert_eq!(parse_power_save("Power save: on\n"), Some(true));
+        assert_eq!(parse_power_save("Power save: off\n"), Some(false));
+        assert_eq!(parse_power_save("command failed: No such device (-19)\n"), None);
+        assert_eq!(parse_power_save(""), None);
     }
 }

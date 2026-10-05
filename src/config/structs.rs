@@ -91,8 +91,10 @@ fn default_adaptive() -> String {
 fn default_critical_battery() -> u32 {
     15
 }
+/// Off by default: switching PCIe link power states on a live Wi-Fi card (on every AC
+/// plug/unplug) can stall some chips until Wi-Fi is toggled (issue #23).
 fn default_dynamic_aspm() -> bool {
-    true
+    false
 }
 
 impl Default for PowerConfig {
@@ -101,7 +103,7 @@ impl Default for PowerConfig {
             enabled: true,
             wlan_power_save: "adaptive".to_string(),
             critical_battery_pct: 15,
-            dynamic_aspm: true,
+            dynamic_aspm: false,
         }
     }
 }

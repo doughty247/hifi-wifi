@@ -18,10 +18,11 @@ wlan_power_save = "adaptive"
 # Set to 0 to disable critical battery override.
 critical_battery_pct = 15
 
-# Automatically toggles PCIe Active State Power Management (ASPM) at runtime:
-#   true (default) - Disable ASPM for 0ms wakeup latency during Game Mode, restore to auto when idle
-#   false - Keep initial static system ASPM configuration
-dynamic_aspm = true
+# Toggle PCIe Active State Power Management (ASPM) at runtime with power source / game mode:
+#   false (default) - Set the PCIe link once at startup (low-latency) and leave it alone
+#   true - Switch it on every AC plug/unplug and game mode change. Some Wi-Fi chips stall
+#          until Wi-Fi is toggled when the link state changes under them (issue #23).
+dynamic_aspm = false
 
 [wifi]
 enabled = true

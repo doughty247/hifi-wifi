@@ -65,6 +65,19 @@ impl SystemOptimizer {
         Ok(())
     }
 
+    /// Re-apply only what a resume or link re-init can reset: PCIe link power and IRQ pinning.
+    /// Deliberately no ethtool calls: offload/EEE settings survive carrier changes, and setting
+    /// EEE can renegotiate an Ethernet link, which would bounce the carrier and re-trigger this.
+    pub fn reapply_link_baseline(&self, ifc: &WifiInterface) -> Result<()> {
+        if self.driver_tweaks_enabled && ifc.interface_type == InterfaceType::Wifi {
+            Self::apply_pcie_aspm_sysfs(&ifc.name, true)?;
+        }
+        if self.irq_affinity_enabled {
+            self.optimize_irq_affinity(ifc)?;
+        }
+        Ok(())
+    }
+
     /// Apply optimizations to a single interface (used for hot-plugged/newly connected interfaces)
     pub fn apply_single_interface(&self, ifc: &WifiInterface) -> Result<()> {
         if self.driver_tweaks_enabled {
@@ -299,64 +312,62 @@ options mwifiex disable_auto_ds=1
         Ok(())
     }
 
-    /// Optimize IRQ affinity for Wi-Fi adapter
+    /// Pin the Wi-Fi adapter's interrupts to CPU 1 and record the outcome for `status`
     fn optimize_irq_affinity(&self, ifc: &WifiInterface) -> Result<()> {
-        info!("Optimizing IRQ affinity for {}", ifc.name);
-
-        // Check for irqbalance
-        if Command::new("pgrep")
-            .arg("irqbalance")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            warn!("'irqbalance' daemon detected! It may undo Wi-Fi IRQ pinning.");
-            // We proceed anyway, but the warning is crucial for debugging
-        }
-
+        let cpus = fs::read_to_string("/sys/devices/system/cpu/online")
+            .ok()
+            .map(|s| s.trim() != "0")
+            .unwrap_or(false);
         let irqs = find_wifi_irqs(ifc)?;
+        let mut outcome = IrqOutcome {
+            irqs: irqs.clone(),
+            ..Default::default()
+        };
 
-        if irqs.is_empty() {
+        if !cpus {
+            debug!("Single CPU system, skipping IRQ pinning for {}", ifc.name);
+        } else if irqs.is_empty() {
             debug!(
-                "Could not find IRQ for {} (driver: {})",
+                "No PCI interrupts for {} (driver: {}); USB/SDIO devices have none to pin",
                 ifc.name, ifc.driver
             );
         } else {
-            // Pin ALL matching IRQs to CPU 1
-            let mut pinned = 0;
-            let mut managed = 0;
-            for irq_num in &irqs {
-                let affinity_path = format!("/proc/irq/{}/smp_affinity", irq_num);
-
-                // Bind to CPU 1 (affinity mask 0x2)
-                if let Err(e) = fs::write(&affinity_path, "2") {
-                    if e.raw_os_error() == Some(5) {
-                        // OS Error 5 (EIO) means the interrupt is managed by the kernel
-                        debug!(
-                            "IRQ {} is managed by the kernel (affinity cannot be modified)",
-                            irq_num
-                        );
-                        managed += 1;
-                    } else {
-                        warn!("Failed to set IRQ affinity for {}: {}", irq_num, e);
+            if Command::new("pgrep")
+                .arg("irqbalance")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                warn!("'irqbalance' is running and may undo Wi-Fi IRQ pinning.");
+            }
+            for irq in &irqs {
+                let path = format!("/proc/irq/{}/smp_affinity", irq);
+                // Already pinned: skip the write
+                if fs::read_to_string(&path).ok().as_deref().is_some_and(mask_is_cpu1) {
+                    outcome.pinned.push(irq.clone());
+                    continue;
+                }
+                match fs::write(&path, "2") {
+                    Ok(()) => outcome.pinned.push(irq.clone()),
+                    // EIO: kernel-managed MSI-X vector, affinity is fixed by the kernel
+                    Err(e) if e.raw_os_error() == Some(5) => outcome.managed.push(irq.clone()),
+                    Err(e) => {
+                        debug!("Cannot set affinity of IRQ {}: {}", irq, e);
+                        outcome.failed.push(irq.clone());
                     }
-                } else {
-                    pinned += 1;
                 }
             }
-
-            if irqs.len() > 1 {
-                info!("Wi-Fi IRQs optimization completed: {} bound to CPU 1, {} managed by kernel ({} total vectors)", pinned, managed, irqs.len());
-            } else if pinned > 0 {
-                info!("Wi-Fi IRQ {} bound to CPU 1", irqs[0]);
-            } else {
-                info!(
-                    "Wi-Fi IRQ {} is kernel-managed (affinity not modified)",
-                    irqs[0]
-                );
-            }
+            info!(
+                "Wi-Fi IRQs for {}: {} pinned to CPU 1, {} kernel-managed, {} failed ({} total)",
+                ifc.name,
+                outcome.pinned.len(),
+                outcome.managed.len(),
+                outcome.failed.len(),
+                irqs.len()
+            );
         }
 
+        outcome.save(&ifc.name);
         Ok(())
     }
 
@@ -386,25 +397,14 @@ options mwifiex disable_auto_ds=1
         if ifc.interface_type == InterfaceType::Ethernet {
             info!("Applying ethernet streaming optimizations for {}", ifc.name);
 
-            // Disable Energy Efficient Ethernet (EEE) - causes micro-stutters in streaming
-            // EEE puts the link into low-power state between packets, causing 50-200us wakeup latency
-            let eee_result = Command::new("ethtool")
-                .args(["--set-eee", &ifc.name, "eee", "off"])
-                .output();
-
-            match eee_result {
-                Ok(output) if output.status.success() => {
-                    info!(
-                        "Disabled EEE (Energy Efficient Ethernet) on {} for low latency",
-                        ifc.name
-                    );
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if !stderr.contains("not supported") {
-                        debug!("EEE disable returned: {}", stderr.trim());
-                    }
-                }
+            // Disable Energy Efficient Ethernet (EEE) - causes micro-stutters in streaming.
+            // Only when it is on: some drivers renegotiate the link on every --set-eee.
+            match crate::network::tc::EthtoolManager::set_eee(&ifc.name, false) {
+                Ok(true) => info!(
+                    "Disabled EEE (Energy Efficient Ethernet) on {} for low latency",
+                    ifc.name
+                ),
+                Ok(false) => debug!("EEE already off or unsupported on {}", ifc.name),
                 Err(e) => debug!("EEE command failed: {}", e),
             }
         }
@@ -486,6 +486,12 @@ options mwifiex disable_auto_ds=1
             ];
             for filename in &aspm_files {
                 let filepath = link_dir.join(filename);
+                // Writing a link state, even an unchanged one, can retrain the PCIe link and
+                // briefly stall the Wi-Fi card. Only write when it actually differs.
+                let current = fs::read_to_string(&filepath).ok();
+                if current.as_deref().map(str::trim) == Some(val) {
+                    continue;
+                }
                 if filepath.exists() {
                     match fs::write(&filepath, val) {
                         Ok(_) => debug!("Set ASPM state in {} to {}", filepath.display(), val),
@@ -500,8 +506,9 @@ options mwifiex disable_auto_ds=1
         }
 
         let power_control = device_path.join("power").join("control");
-        if power_control.exists() {
-            let val = if enable { "on" } else { "auto" };
+        let val = if enable { "on" } else { "auto" };
+        let current = fs::read_to_string(&power_control).ok();
+        if power_control.exists() && current.as_deref().map(str::trim) != Some(val) {
             match fs::write(&power_control, val) {
                 Ok(_) => info!(
                     "Set runtime PCI power control to '{}' for {}",
@@ -579,29 +586,139 @@ impl Default for SystemOptimizer {
 
 /// Helper to find all IRQs associated with a Wi-Fi interface in /proc/interrupts.
 /// Returns a list of IRQ numbers.
+/// Result of the last IRQ pinning attempt, saved for `hifi-wifi status`
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IrqOutcome {
+    pub irqs: Vec<String>,
+    pub pinned: Vec<String>,
+    pub managed: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+impl IrqOutcome {
+    fn path(iface: &str) -> String {
+        format!("/run/hifi-wifi/irq-{}.json", iface)
+    }
+
+    fn save(&self, iface: &str) {
+        let _ = fs::create_dir_all("/run/hifi-wifi");
+        if let Ok(json) = serde_json::to_string(self) {
+            let _ = fs::write(Self::path(iface), json);
+        }
+    }
+
+    pub fn load(iface: &str) -> Option<Self> {
+        serde_json::from_str(&fs::read_to_string(Self::path(iface)).ok()?).ok()
+    }
+}
+
+/// smp_affinity is a hex mask, possibly comma-grouped ("00000000,00000002")
+pub fn mask_is_cpu1(mask: &str) -> bool {
+    let hex: String = mask.trim().chars().filter(|c| *c != ',').collect();
+    !hex.is_empty() && hex.trim_start_matches('0') == "2"
+}
+
+/// Interrupt numbers of the device behind `ifc`.
+/// sysfs is authoritative (MSI/MSI-X vectors, else the legacy line); matching driver names in
+/// /proc/interrupts is a fallback, since many drivers label their vectors differently.
 pub fn find_wifi_irqs(ifc: &WifiInterface) -> Result<Vec<String>> {
+    // The net device's "device" is usually the PCI function itself; for some buses (virtio,
+    // SDIO bridges) the PCI function is its parent
+    let dev = format!("/sys/class/net/{}/device", ifc.name);
+    for d in [dev.clone(), format!("{}/..", dev)] {
+        if let Ok(entries) = fs::read_dir(format!("{}/msi_irqs", d)) {
+            let mut irqs: Vec<String> = entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.parse::<u32>().is_ok())
+                .collect();
+            if !irqs.is_empty() {
+                irqs.sort_by_key(|n| n.parse::<u32>().unwrap_or(0));
+                return Ok(irqs);
+            }
+        }
+        if let Some(irq) = fs::read_to_string(format!("{}/irq", d))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| s.parse::<u32>().is_ok_and(|n| n > 0))
+        {
+            if Path::new(&format!("/proc/irq/{}", irq)).exists() {
+                return Ok(vec![irq]);
+            }
+        }
+    }
+
     let interrupts =
         fs::read_to_string("/proc/interrupts").context("Failed to read /proc/interrupts")?;
-
     let search_terms: Vec<&str> = match ifc.driver.as_str() {
         "rtl8192ee" => vec!["rtl_pci"],
         "rtw88_8822ce" | "rtw88_pci" | "rtw_pci" => vec!["rtw88", "rtw_pci", &ifc.name],
-        "ath11k_pci" | "ath11k" => vec!["ath11k", "wcn", "mhi", "bhi", &ifc.name], // WCN6855 variants
+        "ath11k_pci" | "ath11k" => vec!["ath11k", "wcn", "mhi", "bhi", &ifc.name],
         _ => vec![ifc.driver.as_str(), &ifc.name],
     };
+    Ok(parse_proc_interrupts(&interrupts, &search_terms))
+}
 
-    let irqs: Vec<String> = interrupts
+fn parse_proc_interrupts(interrupts: &str, terms: &[&str]) -> Vec<String> {
+    interrupts
         .lines()
         .filter(|line| {
             let lower = line.to_lowercase();
-            search_terms
+            terms
                 .iter()
-                .any(|term| lower.contains(&term.to_lowercase()))
-                || lower.contains(&ifc.name.to_lowercase())
+                .filter(|t| !t.is_empty())
+                .any(|t| lower.contains(&t.to_lowercase()))
         })
         .filter_map(|line| line.trim().split(':').next())
         .map(|s| s.trim().to_string())
-        .collect();
+        .filter(|s| s.parse::<u32>().is_ok())
+        .collect()
+}
 
-    Ok(irqs)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn affinity_masks() {
+        assert!(mask_is_cpu1("2\n"));
+        assert!(mask_is_cpu1("02"));
+        assert!(mask_is_cpu1("00000000,00000002"));
+        assert!(!mask_is_cpu1("ff"));
+        assert!(!mask_is_cpu1("20"));
+        assert!(!mask_is_cpu1(""));
+    }
+
+    #[test]
+    fn proc_interrupts_fallback_matches_only_numbered_lines() {
+        let table = "           CPU0       CPU1\n  58:          0       1234  PCI-MSI 1048576-edge      rtw88_pci\n  61:         10          0  PCI-MSI 524288-edge      nvme0q0\nNMI:          0          0   Non-maskable interrupts\n";
+        assert_eq!(parse_proc_interrupts(table, &["rtw88", ""]), vec!["58".to_string()]);
+        assert!(parse_proc_interrupts(table, &["iwlwifi"]).is_empty());
+    }
+
+    /// Needs root and a PCI NIC: `cargo test -- --ignored irq_real_device`
+    #[test]
+    #[ignore]
+    fn irq_real_device() {
+        let name = fs::read_dir("/sys/class/net")
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| Path::new(&format!("/sys/class/net/{}/device", n)).exists())
+            .expect("no device-backed interface");
+        let ifc = WifiInterface {
+            name: name.clone(),
+            driver: "unknown".into(),
+            category: DriverCategory::Generic,
+            interface_type: InterfaceType::Ethernet,
+            is_active: true,
+        };
+        let irqs = find_wifi_irqs(&ifc).unwrap();
+        assert!(!irqs.is_empty(), "no IRQs found for {}", name);
+        SystemOptimizer::new(false, true, false, "bbr".into()).optimize_irq_affinity(&ifc).unwrap();
+        let o = IrqOutcome::load(&name).unwrap();
+        assert_eq!(o.irqs, irqs);
+        assert_eq!(o.pinned.len() + o.managed.len() + o.failed.len(), irqs.len());
+        println!("{}: {:?}", name, o);
+    }
 }

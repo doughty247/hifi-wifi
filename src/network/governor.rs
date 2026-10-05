@@ -132,6 +132,10 @@ pub struct Governor {
     /// Running autorate controller (owns shaping when present)
     autorate: Option<AutorateHandle>,
     game_priority: crate::network::priority::GamePriority,
+    /// Last known carrier state per ifindex (netlink), to act only on down -> up
+    link_carrier: std::collections::HashMap<u32, bool>,
+    /// Ticks since start, for periodic checks
+    ticks: u64,
 }
 
 impl Governor {
@@ -178,6 +182,8 @@ impl Governor {
             autorate_config,
             autorate: None,
             game_priority,
+            link_carrier: std::collections::HashMap::new(),
+            ticks: 0,
         })
     }
 
@@ -268,11 +274,14 @@ impl Governor {
                     _ = interval.tick() => {
                         debug!("Periodic tick timer expired");
                     }
-                    event_res = nl.next_event() => {
+                    event_res = nl.next_events() => {
                         match event_res {
-                            Ok(_) => {
-                                info!("Netlink event detected - running immediate tick");
-                                self.reapply_irq_affinity();
+                            Ok(events) => {
+                                let came_up = self.carrier_came_up(&events);
+                                if !came_up.is_empty() {
+                                    info!("Carrier up on {:?} - re-applying hardware baseline", came_up);
+                                    self.reapply_hardware_baseline(Some(&came_up));
+                                }
                             }
                             Err(e) => {
                                 warn!("Netlink listener error: {}", e);
@@ -295,8 +304,12 @@ impl Governor {
             }
 
             if elapsed.as_secs() > tick_rate_secs * 3 {
-                info!("System resume from suspend detected (elapsed: {}s)! Temporarily allowing background scans.", elapsed.as_secs());
+                info!("System resume from suspend detected (elapsed: {}s)! Re-applying settings and temporarily allowing background scans.", elapsed.as_secs());
                 self.last_resume_at = Some(now);
+                // Drivers reset power save (and PCIe link state) on resume; our cache says
+                // "already applied", so forget it and re-apply (issue #23)
+                self.forget_applied_state();
+                self.reapply_hardware_baseline(None);
             }
             self.last_tick_at = now;
 
@@ -355,7 +368,7 @@ impl Governor {
         info!("Waiting 1s for link to stabilize...");
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        self.reapply_irq_affinity();
+        self.reapply_hardware_baseline(None);
 
         // FIX for Issue #15: Force immediate CAKE application after reconnection
         // Don't wait for warmup samples - apply with conservative 100Mbit default.
@@ -386,30 +399,91 @@ impl Governor {
         info!("Post-reconnect optimization complete");
     }
 
-    /// Re-evaluate and re-apply sysfs IRQ affinity paths after link events
-    fn reapply_irq_affinity(&self) {
-        if self.system_config.irq_affinity_enabled {
-            info!("Re-evaluating and applying sysfs IRQ paths after link/connection event...");
-            let interfaces = self.wifi_manager.interfaces();
-            let sys_opt = crate::system::optimizer::SystemOptimizer::new(
-                self.system_config.sysctl_enabled,
-                self.system_config.irq_affinity_enabled,
-                self.system_config.driver_tweaks_enabled,
-                self.system_config.tcp_congestion_control.clone(),
-            );
-            let active_interfaces: Vec<crate::network::wifi::WifiInterface> = interfaces
-                .iter()
-                .filter(|ifc| self.wifi_manager.is_interface_connected(ifc))
-                .cloned()
-                .collect();
-            if !active_interfaces.is_empty() {
-                if let Err(e) = sys_opt.apply(&active_interfaces) {
-                    warn!(
-                        "Failed to re-apply system optimizations after link event: {}",
-                        e
+    /// Managed physical interfaces whose carrier went from down (or never seen) to up.
+    /// Our own IFB devices and other virtual links are ignored, so shaping changes never
+    /// touch the Wi-Fi card.
+    fn carrier_came_up(&mut self, events: &[crate::network::netlink::LinkEvent]) -> Vec<String> {
+        let mut up = Vec::new();
+        for ev in events {
+            if ev.removed {
+                self.link_carrier.remove(&ev.ifindex);
+                continue;
+            }
+            let was = self.link_carrier.insert(ev.ifindex, ev.carrier);
+            if !ev.carrier || was == Some(true) {
+                continue;
+            }
+            let Some(name) = crate::network::netlink::ifindex_name(ev.ifindex) else {
+                continue;
+            };
+            let managed = self.wifi_manager.interfaces().iter().any(|i| i.name == name);
+            // A first sighting with carrier up is a real transition only if not yet initialized
+            if managed && (was == Some(false) || !self.initialized_interfaces.contains(&name)) {
+                up.push(name);
+            }
+        }
+        up
+    }
+
+    /// Clear the cached power save state where the driver disagrees with it
+    fn verify_power_save(&mut self) {
+        for ifc in self.wifi_manager.interfaces() {
+            let Some(state) = self.interface_states.get_mut(&ifc.name) else {
+                continue;
+            };
+            let Some(expected) = state.power_save_enabled else {
+                continue;
+            };
+            if let Some(actual) = self.wifi_manager.get_power_save(ifc) {
+                if actual != expected {
+                    info!(
+                        "Power save on {} was changed outside hifi-wifi (now {}), re-applying",
+                        ifc.name,
+                        if actual { "on" } else { "off" }
                     );
-                } else {
-                    info!("Successfully re-applied system optimizations.");
+                    state.power_save_enabled = None;
+                    state.pending_power_save = None;
+                    state.power_save_stable_ticks = 0;
+                }
+            }
+        }
+    }
+
+    /// Forget which settings we believe are applied, so the next tick re-applies them
+    fn forget_applied_state(&mut self) {
+        for state in self.interface_states.values_mut() {
+            state.power_save_enabled = None;
+            state.pending_power_save = None;
+            state.power_save_stable_ticks = 0;
+            state.aspm_performance = None;
+            state.pending_aspm = None;
+            state.aspm_stable_ticks = 0;
+            state.eee_enabled = None;
+            state.pending_eee = None;
+            state.eee_stable_ticks = 0;
+        }
+    }
+
+    /// Re-apply PCIe link power and IRQ pinning to the given interfaces, or to all connected
+    /// ones. Both are idempotent and never bounce the link.
+    fn reapply_hardware_baseline(&self, only: Option<&[String]>) {
+        if !(self.system_config.irq_affinity_enabled || self.system_config.driver_tweaks_enabled) {
+            return;
+        }
+        let sys_opt = crate::system::optimizer::SystemOptimizer::new(
+            self.system_config.sysctl_enabled,
+            self.system_config.irq_affinity_enabled,
+            self.system_config.driver_tweaks_enabled,
+            self.system_config.tcp_congestion_control.clone(),
+        );
+        for ifc in self.wifi_manager.interfaces() {
+            let selected = match only {
+                Some(names) => names.contains(&ifc.name),
+                None => self.wifi_manager.is_interface_connected(ifc),
+            };
+            if selected {
+                if let Err(e) = sys_opt.reapply_link_baseline(ifc) {
+                    warn!("Failed to re-apply hardware baseline on {}: {}", ifc.name, e);
                 }
             }
         }
@@ -542,6 +616,13 @@ impl Governor {
     async fn tick(&mut self) -> Result<()> {
         // Game traffic DSCP marking (re-applied when gamescope's cgroup appears)
         self.game_priority.ensure();
+
+        // Every 30 s, check power save against what we applied. Drivers and the network
+        // backend can turn it back on (resume, reconnect, roam) without us noticing (issue #23).
+        self.ticks += 1;
+        if self.ticks.is_multiple_of(15) {
+            self.verify_power_save();
+        }
 
         // Run hot-plug interface check and optimize newly activated interfaces
         self.check_and_initialize_hotplug_interfaces();

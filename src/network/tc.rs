@@ -423,22 +423,46 @@ impl EthtoolManager {
         Ok(())
     }
 
+    /// Current EEE setting (None if unsupported or unknown)
+    pub fn eee_enabled(interface: &str) -> Option<bool> {
+        let out = Command::new("ethtool").args(["--show-eee", interface]).output().ok()?;
+        parse_eee_status(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// Set EEE only if it differs: some drivers renegotiate the link on every --set-eee,
+    /// which bounces the carrier.
+    pub fn set_eee(interface: &str, on: bool) -> Result<bool> {
+        if Self::eee_enabled(interface) != Some(!on) {
+            return Ok(false);
+        }
+        debug!("Setting EEE {} on {}", if on { "on" } else { "off" }, interface);
+        let out = Command::new("ethtool")
+            .args(["--set-eee", interface, "eee", if on { "on" } else { "off" }])
+            .output()?;
+        Ok(out.status.success())
+    }
+
     /// Enable Energy Efficient Ethernet (for battery/power saving)
     pub fn enable_eee(interface: &str) -> Result<()> {
-        debug!("Enabling EEE on {}", interface);
-        let _ = Command::new("ethtool")
-            .args(["--set-eee", interface, "eee", "on"])
-            .output();
-        Ok(())
+        Self::set_eee(interface, true).map(|_| ())
     }
 
     /// Disable Energy Efficient Ethernet (for streaming/gaming)
     pub fn disable_eee(interface: &str) -> Result<()> {
-        debug!("Disabling EEE on {}", interface);
-        let _ = Command::new("ethtool")
-            .args(["--set-eee", interface, "eee", "off"])
-            .output();
-        Ok(())
+        Self::set_eee(interface, false).map(|_| ())
+    }
+}
+
+/// Parse `ethtool --show-eee` ("EEE status: enabled - active" / "disabled" / "not supported")
+pub fn parse_eee_status(out: &str) -> Option<bool> {
+    let line = out.lines().find(|l| l.trim_start().starts_with("EEE status:"))?;
+    let v = line.split(':').nth(1)?.trim();
+    if v.starts_with("enabled") {
+        Some(true)
+    } else if v.starts_with("disabled") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -452,6 +476,14 @@ impl Default for TcManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_eee_status() {
+        assert_eq!(parse_eee_status("EEE settings for enp3s0:\n\tEEE status: enabled - active\n"), Some(true));
+        assert_eq!(parse_eee_status("EEE settings for enp3s0:\n\tEEE status: disabled\n"), Some(false));
+        assert_eq!(parse_eee_status("EEE settings for enp3s0:\n\tEEE status: not supported\n"), None);
+        assert_eq!(parse_eee_status(""), None);
+    }
 
     #[test]
     fn test_median_filtering() {

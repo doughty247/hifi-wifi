@@ -1002,63 +1002,32 @@ async fn run_status_async() -> Result<()> {
             println!("{}│{}    ├─ EEE:        {}", BLUE, NC, eee_status);
         }
 
-        // IRQ Affinity
-        let is_usb = ifc.driver.contains("usb")
-            || ifc.name.contains("usb")
-            || ifc.driver.starts_with("rt2800usb");
-
-        let irq_status = if is_usb {
-            format!("{}[N/A]{} (USB Device)", DIM, NC)
-        } else {
-            match crate::system::optimizer::find_wifi_irqs(ifc) {
-                Ok(irqs) if !irqs.is_empty() => {
-                    // Check if IRQs are pinned to CPU1
-                    let mut all_optimized = true;
-                    let mut all_found = true;
-                    let mut total = 0;
-                    let mut optimized = 0;
-
-                    for irq_num in &irqs {
-                        if let Ok(affinity) =
-                            std::fs::read_to_string(format!("/proc/irq/{}/smp_affinity", irq_num))
-                        {
-                            total += 1;
-                            let aff = affinity.trim();
-                            // Check if pinned to CPU1 (mask 0x2 in various formats)
-                            let is_cpu1 =
-                                aff == "2" || aff == "02" || aff == "00000002" || aff == "000002";
-                            if is_cpu1 {
-                                optimized += 1;
-                            } else {
-                                all_optimized = false;
-                            }
-                        } else {
-                            all_found = false;
-                        }
-                    }
-
-                    if total == 0 || !all_found {
-                        format!("{}[UNKNOWN]{}", DIM, NC)
-                    } else if all_optimized {
-                        if total > 1 {
-                            format!("{}[OPTIMIZED]{} (CPU 1, {} vectors)", GREEN, NC, total)
-                        } else {
-                            format!("{}[OPTIMIZED]{} (CPU 1)", GREEN, NC)
-                        }
-                    } else if optimized == 0 {
-                        // No IRQs pinned
-                        format!("{}[DEFAULT]{} (System Managed)", DIM, NC)
-                    } else {
-                        // Some IRQs pinned
-                        format!(
-                            "{}[OPTIMIZED]{} (CPU 1, {}/{} vectors)",
-                            GREEN, NC, optimized, total
-                        )
-                    }
-                }
-                Ok(_) => format!("{}[NOT FOUND]{}", DIM, NC),
-                Err(_) => format!("{}[UNKNOWN]{}", DIM, NC),
+        // IRQ Affinity: report what the daemon actually managed to do
+        let irq_status = match crate::system::optimizer::IrqOutcome::load(&ifc.name) {
+            None if !load_config().system.irq_affinity_enabled => format!("{}[DISABLED]{}", DIM, NC),
+            None => format!("{}[PENDING]{} (applied when the service optimizes this interface)", DIM, NC),
+            Some(o) if o.irqs.is_empty() => {
+                format!("{}[N/A]{} (no PCI interrupts: USB/SDIO adapter)", DIM, NC)
             }
+            Some(o) if !o.pinned.is_empty() => format!(
+                "{}[OPTIMIZED]{} (CPU 1, {}/{} vectors{})",
+                GREEN,
+                NC,
+                o.pinned.len(),
+                o.irqs.len(),
+                if o.managed.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} kernel-managed", o.managed.len())
+                }
+            ),
+            Some(o) if o.managed.len() == o.irqs.len() => format!(
+                "{}[KERNEL-MANAGED]{} (the driver's {} vector(s) are placed by the kernel; nothing to do)",
+                DIM,
+                NC,
+                o.irqs.len()
+            ),
+            Some(o) => format!("{}[DEFAULT]{} ({} vector(s) could not be pinned)", YELLOW, NC, o.failed.len()),
         };
         println!("{}│{}    └─ IRQ Pin:    {}", BLUE, NC, irq_status);
         println!("{}│{}", BLUE, NC);
