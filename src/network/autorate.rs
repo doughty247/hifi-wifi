@@ -23,11 +23,14 @@ use crate::network::pinger::{Pinger, Sample};
 use crate::network::shaper::{self, Shaper};
 
 pub const STATUS_PATH: &str = "/run/hifi-wifi/autorate.json";
-const LEARNED_PATH: &str = "/var/lib/hifi-wifi/autorate-learned.json";
+/// v2: baselines learned only while idle. Rates learned by v1 could be far too low (a
+/// baseline taken under load on lines that are faster when busy), so they are not reused.
+const LEARNED_PATH: &str = "/var/lib/hifi-wifi/autorate-learned-v2.json";
 
 const TICK: Duration = Duration::from_millis(500);
 const ALPHA_DELTA: f64 = 0.3;
-const ALPHA_BASE_UP: f64 = 0.001;
+/// Idle samples are trustworthy, so the idle baseline can follow slow path changes
+const ALPHA_BASE_UP: f64 = 0.01;
 const ALPHA_BASE_DOWN: f64 = 0.9;
 const STALE_TICKS: u64 = 6;
 const DECREASE_FACTOR: f64 = 0.9;
@@ -102,6 +105,8 @@ pub struct Controller {
     pub ul: Direction,
     reflectors: Vec<Reflector>,
     tick: u64,
+    /// Whether the last tick saw an idle link (baseline samples are taken only then)
+    link_idle: bool,
     last_decrease_tick: Option<u64>,
     /// Highest median delay since the last cut, to tell a draining queue from a growing one
     delay_peak_since_cut_ms: f64,
@@ -116,27 +121,36 @@ impl Controller {
             ul,
             reflectors: Vec::new(),
             tick: 0,
+            link_idle: false,
             last_decrease_tick: None,
             delay_peak_since_cut_ms: 0.0,
             bloat_events: 0,
         }
     }
 
+    /// Bloat is latency under load compared with latency at idle, so the baseline is learned
+    /// only while the link is idle. Some lines (DOCSIS cable, for one) answer *faster* while
+    /// busy; a baseline taken then makes every normal idle-like RTT look like bloat.
     pub fn on_sample(&mut self, reflector: usize, rtt_ms: f64) {
         if self.reflectors.len() <= reflector {
             self.reflectors.resize(reflector + 1, Reflector::default());
         }
         let threshold = self.threshold_ms;
+        let idle = self.link_idle;
         let r = &mut self.reflectors[reflector];
         r.last_tick = self.tick;
         let Some(base) = r.baseline_ms else {
-            r.baseline_ms = Some(rtt_ms);
+            if idle {
+                r.baseline_ms = Some(rtt_ms);
+            }
             return;
         };
-        let base = if rtt_ms < base {
+        let base = if !idle {
+            base
+        } else if rtt_ms < base {
             ALPHA_BASE_DOWN * rtt_ms + (1.0 - ALPHA_BASE_DOWN) * base
         } else if rtt_ms - base < threshold {
-            // Track slow path changes, but never learn bloat as the new normal
+            // Follow slow path changes, but never learn a spike as the new normal
             ALPHA_BASE_UP * rtt_ms + (1.0 - ALPHA_BASE_UP) * base
         } else {
             base
@@ -195,6 +209,8 @@ impl Controller {
     /// Returns true when a rate changed.
     pub fn tick(&mut self, dl_kbit: f64, ul_kbit: f64) -> bool {
         self.tick += 1;
+        // Applies to the RTT samples that arrive until the next tick
+        self.link_idle = dl_kbit < BUSY_DL_KBIT && ul_kbit < BUSY_UL_KBIT;
         let before = (self.dl.rate_kbit, self.ul.rate_kbit);
         let since_decrease = self
             .last_decrease_tick
@@ -578,8 +594,8 @@ fn step(s: &mut Session, settings: &Settings, sample_tx: &mpsc::Sender<Sample>) 
             persist(s, settings);
         }
     } else {
-        // Keep the controller's view of time moving so idle samples refresh baselines
-        s.ctrl.tick(0.0, 0.0);
+        // Keep time and the idle/busy state current so idle samples refresh baselines
+        s.ctrl.tick(dl_kbit, ul_kbit);
     }
     // Baselines are cheap to keep current; save them every 10 minutes
     if s.ticks.is_multiple_of(1200) {
@@ -741,6 +757,14 @@ mod tests {
         )
     }
 
+    /// An idle period with clean pings: how a real session learns its baseline
+    fn idle_baseline(c: &mut Controller, base: f64) {
+        for _ in 0..3 {
+            c.tick(0.0, 0.0);
+            pings(c, base, 0.0);
+        }
+    }
+
     /// Feed one tick of pings from 3 reflectors with the given extra delay.
     fn pings(c: &mut Controller, base: f64, extra: f64) {
         for r in 0..3 {
@@ -763,7 +787,7 @@ mod tests {
     fn cuts_to_achieved_when_we_saturate_a_slower_bottleneck() {
         // Shaper starts at the 500 Mbit link rate, ISP delivers 100 Mbit and bloats.
         let mut c = ctrl(500_000.0, 50_000.0);
-        pings(&mut c, 20.0, 0.0);
+        idle_baseline(&mut c, 20.0);
         c.tick(100_000.0, 2_000.0);
         for _ in 0..5 {
             pings(&mut c, 20.0, 80.0);
@@ -826,7 +850,7 @@ mod tests {
     #[test]
     fn stale_reflectors_stop_voting() {
         let mut c = ctrl(100_000.0, 20_000.0);
-        pings(&mut c, 20.0, 0.0);
+        idle_baseline(&mut c, 20.0);
         for _ in 0..3 {
             pings(&mut c, 20.0, 90.0);
             c.tick(1.0, 1.0);
@@ -842,9 +866,15 @@ mod tests {
     #[test]
     fn baseline_does_not_learn_bloat() {
         let mut c = ctrl(100_000.0, 20_000.0);
+        c.tick(0.0, 0.0);
         c.on_sample(0, 20.0);
         for _ in 0..1000 {
-            c.on_sample(0, 120.0);
+            c.on_sample(0, 120.0); // idle spikes are not learned
+        }
+        assert!(c.reflectors[0].baseline_ms.unwrap() < 21.0);
+        c.tick(90_000.0, 0.0);
+        for _ in 0..1000 {
+            c.on_sample(0, 5.0); // nor is anything seen under load, even lower RTTs
         }
         assert!(c.reflectors[0].baseline_ms.unwrap() < 21.0);
     }
@@ -942,11 +972,33 @@ mod tests {
         assert_eq!(c.bloat_events, 1, "cut again while the queue was draining");
     }
 
+    /// Real-hardware regression (Bazzite desktop, cable-like line): idle RTT ~18 ms, *lower*
+    /// (~11 ms) while uploading, ~24 ms with jitter while downloading 245 Mbit. v1 learned the
+    /// 11 ms baseline during upload and cut the download from 245 to 39 Mbit.
+    #[test]
+    fn line_faster_when_busy_is_not_cut() {
+        let mut c = ctrl(1_000_000.0, 1_000_000.0);
+        idle_baseline(&mut c, 18.0);
+        // Upload saturated: RTT drops to 11 ms
+        for _ in 0..30 {
+            c.tick(4_500.0, 191_000.0);
+            pings(&mut c, 11.0, 0.0);
+        }
+        // Download saturated: ~24 ms with jitter spikes to ~40
+        for i in 0..60 {
+            c.tick(245_000.0, 1_500.0);
+            let jitter = if i % 5 == 0 { 18.0 } else { 4.0 };
+            pings(&mut c, 18.0, jitter);
+        }
+        assert_eq!(c.bloat_events, 0, "dl={} ul={}", c.dl.rate_kbit, c.ul.rate_kbit);
+        assert!(c.dl.rate_kbit >= 245_000.0);
+    }
+
     #[test]
     fn disabled_direction_is_untouched() {
         let mut c = ctrl(500_000.0, 50_000.0);
         c.dl.enabled = false;
-        pings(&mut c, 20.0, 0.0);
+        idle_baseline(&mut c, 20.0);
         for _ in 0..6 {
             pings(&mut c, 20.0, 80.0);
             c.tick(100_000.0, 45_000.0);
