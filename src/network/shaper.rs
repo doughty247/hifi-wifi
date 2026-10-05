@@ -148,7 +148,7 @@ fn run(cmd: &str, args: &[String]) -> Result<()> {
 
 fn tc(args: &[&str]) -> Result<()> {
     run(
-        "tc",
+        crate::network::tc::tc_bin(),
         &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
     )
 }
@@ -158,7 +158,7 @@ fn install_root(dev: &str, kbit: u32, ingress: bool) -> Result<Kind> {
     for kind in [Kind::Cake, Kind::HtbFqCodel, Kind::Tbf] {
         match root_args(kind, dev, kbit, ingress)
             .iter()
-            .try_for_each(|args| run("tc", args))
+            .try_for_each(|args| run(crate::network::tc::tc_bin(), args))
         {
             Ok(()) => return Ok(kind),
             Err(e) => {
@@ -226,12 +226,12 @@ impl Shaper {
     /// Change rates in place (no qdisc rebuild, no packet loss).
     pub fn set_rates(&mut self, up_kbit: u32, down_kbit: Option<u32>) -> Result<()> {
         if up_kbit != self.up_kbit {
-            run("tc", &change_args(self.kind, &self.iface, up_kbit))?;
+            run(crate::network::tc::tc_bin(), &change_args(self.kind, &self.iface, up_kbit))?;
             self.up_kbit = up_kbit;
         }
         if let (Some(ifb), Some(down)) = (&self.ifb, down_kbit) {
             if Some(down) != self.down_kbit {
-                run("tc", &change_args(self.kind, ifb, down))?;
+                run(crate::network::tc::tc_bin(), &change_args(self.kind, ifb, down))?;
                 self.down_kbit = Some(down);
             }
         }
@@ -240,7 +240,7 @@ impl Shaper {
 
     /// Whether our qdisc is still on the interface (NetworkManager or a reconnect can reset it).
     pub fn is_present(&self) -> bool {
-        let Ok(out) = Command::new("tc")
+        let Ok(out) = Command::new(crate::network::tc::tc_bin())
             .args(["qdisc", "show", "dev", &self.iface, "root"])
             .output()
         else {
@@ -318,7 +318,7 @@ pub fn remove(iface: &str) {
 
 /// True if hifi-wifi (or anyone) put CAKE or our HTB on the root of `iface`.
 pub fn has_shaper(iface: &str) -> bool {
-    Command::new("tc")
+    Command::new(crate::network::tc::tc_bin())
         .args(["qdisc", "show", "dev", iface, "root"])
         .output()
         .map(|o| {

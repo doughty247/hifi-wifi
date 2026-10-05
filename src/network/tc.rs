@@ -12,11 +12,31 @@ use std::sync::OnceLock;
 use crate::network::shaper::{self, Shaper};
 
 static TC_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static TC_BIN: OnceLock<String> = OnceLock::new();
+
+/// Where SteamOS installs get `tc` (iproute2 via Homebrew; /usr is read-only there)
+const HOMEBREW_TC: &str = "/home/linuxbrew/.linuxbrew/sbin/tc";
+
+/// The `tc` binary to run: from the (sanitized) system PATH if present, else Homebrew's.
+/// Only `tc` gets this fallback; PATH itself stays restricted to system directories.
+pub fn tc_bin() -> &'static str {
+    TC_BIN.get_or_init(|| {
+        let in_path = std::env::var("PATH")
+            .unwrap_or_default()
+            .split(':')
+            .any(|d| std::path::Path::new(d).join("tc").is_file());
+        if !in_path && std::path::Path::new(HOMEBREW_TC).is_file() {
+            HOMEBREW_TC.to_string()
+        } else {
+            "tc".to_string()
+        }
+    })
+}
 
 /// Check if the `tc` command is available on the system
 pub fn is_tc_available() -> bool {
     *TC_AVAILABLE.get_or_init(|| {
-        match Command::new("tc").arg("-Version").output() {
+        match Command::new(tc_bin()).arg("-Version").output() {
             Ok(output) => {
                 if output.status.success() {
                     true

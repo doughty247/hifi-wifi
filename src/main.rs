@@ -452,10 +452,10 @@ fn run_check_compat() -> Result<bool> {
         println!("| **{}** | {} | {} |", name, status, if ok { good } else { bad });
     };
 
-    let tc_ok = has_bin("tc");
-    row("Traffic Control (tc)", tc_ok, true,
+    let tc_ok = has_bin(crate::network::tc::tc_bin());
+    row("Traffic Control (tc)", tc_ok, false,
         "`tc` is installed for shaping.",
-        "`tc` (iproute2) is missing. Bufferbloat control cannot work.");
+        "`tc` (iproute2) is missing. Bufferbloat control is disabled; everything else works.");
     let cake_ok = has_module("sch_cake");
     row("CAKE qdisc (sch_cake)", cake_ok, false,
         "CAKE is available (preferred shaper).",
@@ -668,7 +668,7 @@ fn run_revert() -> Result<()> {
     for ifc in wifi_mgr.interfaces() {
         info!("Reverting optimizations on {}", ifc.name);
         crate::network::shaper::remove(&ifc.name);
-        let _ = std::process::Command::new("tc")
+        let _ = std::process::Command::new(crate::network::tc::tc_bin())
             .args(["qdisc", "del", "dev", &ifc.name, "ingress"])
             .output();
 
@@ -937,7 +937,7 @@ async fn run_status_async() -> Result<()> {
         );
 
         // CAKE Status (tc)
-        let qdisc_out = Command::new("tc")
+        let qdisc_out = Command::new(crate::network::tc::tc_bin())
             .args(["qdisc", "show", "dev", &ifc.name])
             .output()
             .ok()
@@ -1233,11 +1233,10 @@ fn run_install() -> Result<()> {
     info!("=== Installing hifi-wifi Service ===\n");
 
     info!("Running system compatibility checks...");
-    let is_compatible = run_check_compat()?;
-    if !is_compatible {
-        anyhow::bail!("Installation aborted: System is missing mandatory dependencies (Traffic Control `tc`). Please install the `iproute2` package containing `tc` and try again.");
+    // Nothing is mandatory: without tc only bufferbloat control is unavailable
+    if !run_check_compat()? {
+        warn!("`tc` (iproute2) not found: installing without bufferbloat control. Install iproute2 and restart the service to enable it.");
     }
-    info!("System compatibility checks passed! Proceeding with installation...\n");
 
     // Create persistent directory (survives SteamOS A/B updates)
     let var_lib = std::path::Path::new("/var/lib/hifi-wifi");

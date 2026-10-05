@@ -1524,7 +1524,7 @@ impl Governor {
         if !crate::network::tc::is_tc_available() {
             return true; // Pretend it has cake so we don't try to apply it
         }
-        let output = Command::new("tc")
+        let output = Command::new(crate::network::tc::tc_bin())
             .args(["qdisc", "show", "dev", interface])
             .output();
 

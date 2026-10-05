@@ -314,6 +314,15 @@ install_service() {
         $run_as_root systemctl stop hifi-wifi
     fi
     
+    # Link Homebrew-installed tc into the system path before the binary checks for it.
+    # (The binary also falls back to Homebrew's tc if this link cannot be created.)
+    if ! command -v tc &>/dev/null && [[ -x "/home/linuxbrew/.linuxbrew/sbin/tc" ]]; then
+        echo -e "${BLUE}Linking Homebrew tc to system path...${NC}"
+        $run_as_root mkdir -p /usr/local/sbin 2>/dev/null || true
+        $run_as_root ln -sf /home/linuxbrew/.linuxbrew/sbin/tc /usr/local/sbin/tc 2>/dev/null \
+            || echo -e "${YELLOW}Could not link tc (read-only /usr?); hifi-wifi will use Homebrew's tc directly.${NC}"
+    fi
+
     # Run the binary's install command
     $run_as_root ./target/release/hifi-wifi install
     
@@ -323,12 +332,6 @@ install_service() {
         $run_as_root chcon -t bin_t /var/lib/hifi-wifi/hifi-wifi 2>/dev/null || true
     fi
 
-    # Link Homebrew-installed tc to /usr/local/sbin/tc if not present in system PATH
-    if ! command -v tc &>/dev/null && [[ -x "/home/linuxbrew/.linuxbrew/sbin/tc" ]]; then
-        echo -e "${BLUE}Linking Homebrew tc to system path...${NC}"
-        $run_as_root ln -sf /home/linuxbrew/.linuxbrew/sbin/tc /usr/local/sbin/tc
-    fi
-    
     echo -e "${GREEN}Service installed${NC}\n"
 }
 
