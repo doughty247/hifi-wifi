@@ -3,7 +3,7 @@
 //! Handles detection, monitoring, and configuration of Wi-Fi interfaces.
 
 use anyhow::{Context, Result};
-use log::{debug, info, warn};
+use log::{info, warn};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -197,67 +197,6 @@ impl WifiManager {
         Ok(())
     }
 
-    /// Get link statistics for an interface
-    pub fn get_link_stats(&self, ifc: &WifiInterface) -> Result<LinkStats> {
-        let mut stats = LinkStats::default();
-
-        match ifc.interface_type {
-            InterfaceType::Wifi => {
-                let output = Command::new("iw")
-                    .args(["dev", &ifc.name, "link"])
-                    .output()
-                    .context("Failed to get WiFi link stats")?;
-
-                let stdout = String::from_utf8_lossy(&output.stdout);
-
-                for line in stdout.lines() {
-                    let line = line.trim();
-                    if line.starts_with("signal:") {
-                        if let Some(val) = line.split_whitespace().nth(1) {
-                            stats.signal_dbm = val.parse().unwrap_or(-100);
-                        }
-                    } else if line.starts_with("tx bitrate:") {
-                        if let Some(val) = line.split_whitespace().nth(2) {
-                            stats.tx_bitrate_mbps = val.parse().unwrap_or(0.0);
-                        }
-                    } else if line.starts_with("rx bitrate:") {
-                        if let Some(val) = line.split_whitespace().nth(2) {
-                            stats.rx_bitrate_mbps = val.parse().unwrap_or(0.0);
-                        }
-                    }
-                }
-            }
-            InterfaceType::Ethernet => {
-                // Use ethtool to get ethernet speed
-                let output = Command::new("ethtool")
-                    .arg(&ifc.name)
-                    .output()
-                    .context("Failed to get ethernet link stats")?;
-
-                let stdout = String::from_utf8_lossy(&output.stdout);
-
-                for line in stdout.lines() {
-                    let line = line.trim();
-                    if line.contains("Speed:") {
-                        // Parse "Speed: 1000Mb/s" or "Speed: 10000Mb/s"
-                        if let Some(speed_str) = line.split(':').nth(1) {
-                            let speed_str = speed_str.trim().replace("Mb/s", "");
-                            if let Ok(speed) = speed_str.parse::<f64>() {
-                                stats.tx_bitrate_mbps = speed;
-                                stats.rx_bitrate_mbps = speed; // Symmetric for ethernet
-                                stats.signal_dbm = 0; // N/A for ethernet
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        debug!("Link stats for {}: {:?}", ifc.name, stats);
-        Ok(stats)
-    }
-
     /// Check if interface is connected and active
     pub fn is_interface_connected(&self, ifc: &WifiInterface) -> bool {
         match ifc.interface_type {
@@ -283,14 +222,6 @@ impl WifiManager {
             }
         }
     }
-}
-
-/// Link statistics for an interface
-#[derive(Debug, Default)]
-pub struct LinkStats {
-    pub signal_dbm: i32,
-    pub tx_bitrate_mbps: f64,
-    pub rx_bitrate_mbps: f64,
 }
 
 impl Default for WifiManager {

@@ -1,5 +1,6 @@
 mod bench;
 mod config;
+mod doctor;
 mod network;
 mod system;
 mod utils;
@@ -96,6 +97,11 @@ enum Commands {
     /// Check system compatibility for advanced networking features
     #[command(name = "check-compat")]
     CheckCompat,
+    /// Diagnose what limits this Wi-Fi connection (signal, band, retries, channel load)
+    Doctor {
+        /// Wi-Fi interface (default: the connected one)
+        iface: Option<String>,
+    },
     /// Measure latency under load (bufferbloat): idle, download, upload
     Bench {
         /// A/B test: measure with hifi-wifi off, then on (stops and restarts the service)
@@ -172,6 +178,7 @@ async fn main() -> Result<()> {
 
     // Suppress INFO logs for status-like commands (clean output)
     let is_status_cmd = matches!(cli.command, Some(Commands::Status))
+        || matches!(cli.command, Some(Commands::Doctor { .. }))
         || matches!(cli.command, Some(Commands::CheckCompat))
         || matches!(cli.command, Some(Commands::PowerSave { ref mode }) if mode == "status")
         || matches!(cli.command, Some(Commands::Scan { ref mode }) if mode == "status");
@@ -228,6 +235,9 @@ async fn main() -> Result<()> {
         Commands::CheckCompat => {
             let _ = run_check_compat()?;
         }
+        Commands::Doctor { iface } => {
+            run_doctor(iface).await?;
+        }
         Commands::Bench { ab, iface, reflector, secs, warmup, streams, download_url, upload_url, label } => {
             let iface = iface
                 .or_else(crate::network::governor::default_route_iface)
@@ -246,6 +256,44 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn run_doctor(iface: Option<String>) -> Result<()> {
+    let is_wifi = |i: &str| Path::new(&format!("/sys/class/net/{}/wireless", i)).exists();
+    let iface = iface
+        .or_else(|| crate::network::governor::default_route_iface().filter(|i| is_wifi(i)))
+        .or_else(|| {
+            WifiManager::new_quiet().ok().and_then(|m| {
+                m.interfaces()
+                    .iter()
+                    .find(|i| i.interface_type == crate::network::wifi::InterfaceType::Wifi && m.is_interface_connected(i))
+                    .map(|i| i.name.clone())
+            })
+        })
+        .filter(|i| crate::network::shaper::is_valid_iface(i))
+        .ok_or_else(|| anyhow::anyhow!("No connected Wi-Fi interface found"))?;
+
+    println!("Sampling {} for 3 s...", iface);
+    let Some(inputs) = doctor::collect(&iface).await else {
+        anyhow::bail!("{} is not connected (or `iw` is missing)", iface);
+    };
+    let findings = doctor::analyze(&inputs);
+    doctor::print(&iface, &inputs.link, &findings);
+
+    println!();
+    match crate::network::autorate::read_status() {
+        Some(st) => println!(
+            "Bufferbloat control: autorate on {}, {} (download {}, upload {} kbit, {} corrections so far)",
+            st.iface,
+            if st.shaping { "shaping now" } else { "idle (shapes when the link gets busy)" },
+            st.download_kbit.map(|d| format!("{} kbit", d)).unwrap_or_else(|| "unshaped".into()),
+            st.upload_kbit,
+            st.bloat_events
+        ),
+        None => println!("Bufferbloat control: autorate is not running (is the hifi-wifi service on?)"),
+    }
+    println!("To measure latency under load: sudo hifi-wifi bench   (A/B: sudo hifi-wifi bench --ab)");
     Ok(())
 }
 
