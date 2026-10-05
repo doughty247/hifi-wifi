@@ -1009,6 +1009,12 @@ async fn run_status_async() -> Result<()> {
             Some(o) if o.irqs.is_empty() => {
                 format!("{}[N/A]{} (no PCI interrupts: USB/SDIO adapter)", DIM, NC)
             }
+            Some(o) if o.multiqueue => format!(
+                "{}[KERNEL]{} ({} queues spread across cores by the kernel; not pinned)",
+                DIM,
+                NC,
+                o.irqs.len()
+            ),
             Some(o) if !o.pinned.is_empty() => format!(
                 "{}[OPTIMIZED]{} (CPU 1, {}/{} vectors{})",
                 GREEN,

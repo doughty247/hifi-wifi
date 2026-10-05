@@ -331,6 +331,15 @@ options mwifiex disable_auto_ds=1
                 "No PCI interrupts for {} (driver: {}); USB/SDIO devices have none to pin",
                 ifc.name, ifc.driver
             );
+        } else if irqs.len() > MAX_PINNED_VECTORS {
+            // Multi-queue device: the kernel spreads its RX queues over cores on purpose.
+            // Pinning them all to one core would serialize that work.
+            outcome.multiqueue = true;
+            info!(
+                "{} uses {} interrupt vectors (multi-queue); leaving their placement to the kernel",
+                ifc.name,
+                irqs.len()
+            );
         } else {
             if Command::new("pgrep")
                 .arg("irqbalance")
@@ -586,10 +595,17 @@ impl Default for SystemOptimizer {
 
 /// Helper to find all IRQs associated with a Wi-Fi interface in /proc/interrupts.
 /// Returns a list of IRQ numbers.
+/// Devices with more vectors than this are multi-queue (RSS); pinning stops at this size.
+/// Typical single-queue Wi-Fi/Ethernet uses 1-2 (data + misc/config).
+const MAX_PINNED_VECTORS: usize = 2;
+
 /// Result of the last IRQ pinning attempt, saved for `hifi-wifi status`
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IrqOutcome {
     pub irqs: Vec<String>,
+    /// Too many vectors to pin sensibly; left to the kernel
+    #[serde(default)]
+    pub multiqueue: bool,
     pub pinned: Vec<String>,
     pub managed: Vec<String>,
     pub failed: Vec<String>,
@@ -718,7 +734,11 @@ mod tests {
         SystemOptimizer::new(false, true, false, "bbr".into()).optimize_irq_affinity(&ifc).unwrap();
         let o = IrqOutcome::load(&name).unwrap();
         assert_eq!(o.irqs, irqs);
-        assert_eq!(o.pinned.len() + o.managed.len() + o.failed.len(), irqs.len());
+        if o.multiqueue {
+            assert!(irqs.len() > MAX_PINNED_VECTORS && o.pinned.is_empty());
+        } else {
+            assert_eq!(o.pinned.len() + o.managed.len() + o.failed.len(), irqs.len());
+        }
         println!("{}: {:?}", name, o);
     }
 }
