@@ -352,6 +352,10 @@ struct Session {
     busy_until: Option<Instant>,
     /// Whether the running pinger uses the fast (shaping) interval
     pinger_fast: bool,
+    pinger_started_at: Option<Instant>,
+    last_sample_at: Option<Instant>,
+    /// Back off after a failed shaper install instead of retrying every tick
+    retry_install_at: Option<Instant>,
     ticks: u64,
     /// Rates changed after a bloat correction and are worth remembering
     rates_learned: bool,
@@ -451,6 +455,9 @@ impl Settings {
             last_counters: None,
             busy_until: None,
             pinger_fast: false,
+            pinger_started_at: None,
+            last_sample_at: None,
+            retry_install_at: None,
             ticks: 0,
             rates_learned: false,
         })
@@ -490,6 +497,7 @@ async fn run(settings: Settings, mut target_rx: watch::Receiver<Target>) {
             Some(sample) = sample_rx.recv() => {
                 if let Some(s) = session.as_mut() {
                     s.ctrl.on_sample(sample.reflector, sample.rtt_ms);
+                    s.last_sample_at = Some(Instant::now());
                 }
             }
             changed = target_rx.changed() => {
@@ -538,7 +546,7 @@ fn step(s: &mut Session, settings: &Settings, sample_tx: &mpsc::Sender<Sample>) 
     };
 
     if active && s.shaper.is_none() {
-        start_shaping(s);
+        start_shaping(s, settings);
     } else if !active && s.shaper.is_some() {
         info!("Autorate: link idle, removing shaper from {}", s.iface);
         stop_shaping(s, settings);
@@ -583,14 +591,33 @@ fn step(s: &mut Session, settings: &Settings, sample_tx: &mpsc::Sender<Sample>) 
     }
 }
 
-fn start_shaping(s: &mut Session) {
-    let down = s.ctrl.dl.enabled.then_some(s.ctrl.dl.rate_kbit as u32);
+const INSTALL_RETRY: Duration = Duration::from_secs(30);
+const PROBE_WATCHDOG: Duration = Duration::from_secs(20);
+
+fn start_shaping(s: &mut Session, settings: &Settings) {
+    let now = Instant::now();
+    if s.retry_install_at.is_some_and(|t| now < t) {
+        return;
+    }
+    // Retry download shaping on every install; IFB may have failed only transiently
+    let down = settings
+        .shape_download
+        .then_some(s.ctrl.dl.rate_kbit as u32);
     match Shaper::install(&s.iface, s.ctrl.ul.rate_kbit as u32, down) {
         Ok(sh) => {
             s.ctrl.dl.enabled = sh.ifb.is_some();
             s.shaper = Some(sh);
+            s.retry_install_at = None;
         }
-        Err(e) => warn!("Autorate: cannot install shaper on {}: {}", s.iface, e),
+        Err(e) => {
+            warn!(
+                "Autorate: cannot install shaper on {} ({}); retrying in {} s",
+                s.iface,
+                e,
+                INSTALL_RETRY.as_secs()
+            );
+            s.retry_install_at = Some(now + INSTALL_RETRY);
+        }
     }
 }
 
@@ -607,8 +634,21 @@ fn update_pinger(s: &mut Session, settings: &Settings, sample_tx: &mpsc::Sender<
         s.pinger = None;
         return;
     }
-    if s.pinger.is_some() && s.pinger_fast == fast {
+    let now = Instant::now();
+    // ping exits on its own if the network was unreachable when it started; restart it
+    let silent = s
+        .pinger_started_at
+        .is_some_and(|t| now.duration_since(t) > PROBE_WATCHDOG)
+        && s.last_sample_at
+            .is_none_or(|t| now.duration_since(t) > PROBE_WATCHDOG);
+    if s.pinger.is_some() && s.pinger_fast == fast && !silent {
         return;
+    }
+    if silent {
+        debug!(
+            "Autorate: no latency samples for {} s, restarting probes",
+            PROBE_WATCHDOG.as_secs()
+        );
     }
     let p = Pinger::start(
         &settings.cfg.reflectors,
@@ -621,6 +661,7 @@ fn update_pinger(s: &mut Session, settings: &Settings, sample_tx: &mpsc::Sender<
     }
     s.pinger = Some(p);
     s.pinger_fast = fast;
+    s.pinger_started_at = Some(now);
 }
 
 fn stop_shaping(s: &mut Session, settings: &Settings) {

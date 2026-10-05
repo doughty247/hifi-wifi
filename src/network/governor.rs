@@ -1324,7 +1324,8 @@ impl Governor {
             self.wifi_manager
                 .interfaces()
                 .iter()
-                .find(|ifc| ifc.name == name && self.wifi_manager.is_interface_connected(ifc))
+                // A default route through it already means it is up; no `iw` call needed
+                .find(|ifc| ifc.name == name)
         });
         let target = match managed {
             None => autorate::Target::default(),
