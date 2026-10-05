@@ -189,6 +189,11 @@ pub struct GovernorConfig {
     /// Freeze CAKE during game mode (prevents mid-game jitter)
     pub game_mode_freeze_cake: bool,
 
+    /// Mark game / game-streaming UDP as DSCP EF (Wi-Fi voice/video queue, CAKE priority tin)
+    pub game_priority_enabled: bool,
+    /// UDP port ranges treated as game traffic (source or destination)
+    pub game_priority_udp_ports: Vec<String>,
+
     /// Enable smart band steering
     pub band_steering_enabled: bool,
     /// Hysteresis ticks before roaming (consecutive ticks required)
@@ -288,6 +293,10 @@ impl Default for GovernorConfig {
             game_mode_pps_threshold: 200,
             game_mode_cooldown_secs: 30,
             game_mode_freeze_cake: true, // NEW: Freeze CAKE during gaming
+
+            game_priority_enabled: true,
+            // Steam (game servers, Remote Play, SDR) and Moonlight/Sunshine
+            game_priority_udp_ports: vec!["27000-27100".into(), "47998-48010".into()],
 
             band_steering_enabled: true,
             roam_hysteresis_ticks: 3,

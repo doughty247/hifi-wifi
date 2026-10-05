@@ -131,6 +131,7 @@ pub struct Governor {
     autorate_config: AutorateConfig,
     /// Running autorate controller (owns shaping when present)
     autorate: Option<AutorateHandle>,
+    game_priority: crate::network::priority::GamePriority,
 }
 
 impl Governor {
@@ -147,6 +148,10 @@ impl Governor {
         let power_manager = PowerManager::new();
         let wifi_manager = WifiManager::new()?;
         let now = Instant::now();
+        let game_priority = crate::network::priority::GamePriority::new(
+            config.game_priority_enabled,
+            config.game_priority_udp_ports.clone(),
+        );
 
         let mut initialized_interfaces = std::collections::HashSet::new();
         for ifc in wifi_manager.interfaces() {
@@ -172,6 +177,7 @@ impl Governor {
             initialized_interfaces,
             autorate_config,
             autorate: None,
+            game_priority,
         })
     }
 
@@ -534,6 +540,9 @@ impl Governor {
 
     /// Single tick of the governor loop
     async fn tick(&mut self) -> Result<()> {
+        // Game traffic DSCP marking (re-applied when gamescope's cgroup appears)
+        self.game_priority.ensure();
+
         // Run hot-plug interface check and optimize newly activated interfaces
         self.check_and_initialize_hotplug_interfaces();
 
@@ -685,7 +694,6 @@ impl Governor {
                                 "Game mode ACTIVATED: {} PPS on {} (CAKE frozen)",
                                 pps, interface
                             );
-                            let _ = crate::network::cgroups::set_dscp_prioritization(true);
                             if self.config.breathing_cake_enabled && self.autorate.is_none() {
                                 let _ = state.tc_manager.apply_cake(&interface);
                             }
@@ -702,7 +710,6 @@ impl Governor {
                         if !still_in_game && freeze_cake {
                             state.tc_manager.exit_game_mode();
                             info!("Game mode ENDED on {} (CAKE unfrozen)", interface);
-                            let _ = crate::network::cgroups::set_dscp_prioritization(false);
                             if self.config.breathing_cake_enabled && self.autorate.is_none() {
                                 let _ = state.tc_manager.remove_cake(&interface);
                             }
@@ -1361,7 +1368,7 @@ impl Governor {
         }
 
         // Clean up DSCP tagging
-        let _ = crate::network::cgroups::set_dscp_prioritization(false);
+        self.game_priority.remove();
     }
 
     /// Fallback: Get bitrate from `iw` when NetworkManager reports 0

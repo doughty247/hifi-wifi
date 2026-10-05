@@ -1,10 +1,10 @@
 pub mod autorate;
 pub mod backend_tuner;
-pub mod cgroups;
 pub mod governor;
 pub mod netlink;
 pub mod nm;
 pub mod pinger;
+pub mod priority;
 pub mod shaper;
 pub mod stats;
 pub mod tc;

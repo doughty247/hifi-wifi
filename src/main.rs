@@ -542,7 +542,7 @@ fn run_revert() -> Result<()> {
     }
 
     // Clean up DSCP cgroups tagging
-    let _ = crate::network::cgroups::set_dscp_prioritization(false);
+    crate::network::priority::remove();
 
     // Remove NM power save config
     remove_nm_powersave_config();
