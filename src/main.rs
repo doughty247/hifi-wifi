@@ -702,6 +702,7 @@ fn run_revert() -> Result<()> {
 
     // Remove leftover TEE duplication rules from v3.1.0-beta.1 (feature removed)
     remove_legacy_tee_rules();
+    let _ = std::fs::remove_file(crate::network::autorate::STATUS_PATH);
 
     info!("\n=== Revert Complete ===");
     Ok(())

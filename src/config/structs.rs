@@ -398,6 +398,15 @@ mod tests {
     }
 
     #[test]
+    fn test_example_config_parses() {
+        let c: Config = toml::from_str(include_str!("../../config.example.toml")).unwrap();
+        assert_eq!(c.autorate.mode, AutorateMode::Busy);
+        assert_eq!(c.autorate.reflectors.len(), 3);
+        assert!(c.governor.game_priority_enabled);
+        assert_eq!(c.governor.game_priority_udp_ports.len(), 2);
+    }
+
+    #[test]
     fn test_autorate_config() {
         let c: Config = toml::from_str("[autorate]\nmode = \"always\"\nreflectors = [\"1.0.0.1\"]\nmax_download_mbit = 300.0\n").unwrap();
         assert_eq!(c.autorate.mode, AutorateMode::Always);

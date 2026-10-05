@@ -50,9 +50,8 @@ driver_tweaks_enabled = true
 iwd_periodic_scan_disable = true
 
 [governor]
-# Breathing CAKE (dynamic bandwidth adjustment)
-# Note: Defaults to false. Modern Linux Wi-Fi drivers have native FQ-CoDel + EDCA priority.
-# Enable if you want local software-based shaping at the cost of 15% throughput overhead.
+# Breathing CAKE (shaper rate from the Wi-Fi link rate). Superseded by [autorate], which
+# measures latency instead of guessing; only used when autorate.mode = "off".
 breathing_cake_enabled = false
 cake_median_window = 3
 cake_change_threshold_mbit = 15
@@ -65,8 +64,8 @@ cake_hysteresis_down = 1  # Fast decreases (prevent bufferbloat)
 # Keeps the root physical interface qdisc as mq (preserving EDCA) while shaping in software.
 qos_use_ifb = true
 
-# Internet limits (Mbit/s). Optional - if omitted, it defaults to the dynamic wireless link rate.
-# Specifying your actual internet speeds is highly recommended for proper bufferbloat prevention.
+# Internet limits (Mbit/s). Optional. Autorate finds the bottleneck on its own; if set,
+# these become autorate's upper bounds and starting rates.
 # internet_download_mbit = 100
 # internet_upload_mbit = 20
 
@@ -75,6 +74,12 @@ game_mode_enabled = true
 game_mode_pps_threshold = 200
 game_mode_cooldown_secs = 30
 game_mode_freeze_cake = true
+
+# Mark game / game-streaming UDP as DSCP EF: our transmissions use the Wi-Fi voice/video
+# queue and CAKE's latency tin. Matches source or destination port, IPv4 and IPv6, plus
+# everything in gamescope.slice (SteamOS / Bazzite game mode). Needs `nft`.
+game_priority_enabled = true
+game_priority_udp_ports = ["27000-27100", "47998-48010"]  # Steam, Moonlight/Sunshine
 
 # CPU Governor (coalescing)
 cpu_coalescing_enabled = true
@@ -90,3 +95,21 @@ band_steering_min_improvement = 10
 #   false (default) - Roaming enabled, allows background scans
 #   true - Lowest latency, disables roaming (recommended for stationary/online gaming)
 scan_suppress = false
+
+[autorate]
+# Latency-driven bufferbloat control. Pings the reflectors, and when latency rises while
+# this device is saturating the link, lowers the shaper to just under the real bottleneck
+# (ISP line or Wi-Fi). Raises it again while latency stays clean.
+#   "busy"   - shape only while the link carries traffic (default; no cost when idle)
+#   "always" - keep the shaper installed whenever connected
+#   "off"    - disable (falls back to breathing_cake_enabled)
+mode = "busy"
+reflectors = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]   # IP addresses; half must agree on bloat
+ping_interval_ms = 300          # per reflector, while shaping
+idle_ping_interval_ms = 2000    # while idle, keeps the latency baseline clean (0 = off)
+delay_threshold_ms = 15.0       # smoothed latency increase that counts as bloat
+min_download_mbit = 5.0         # never shape below these
+min_upload_mbit = 1.0
+# max_download_mbit = 300.0     # default: governor.internet_*_mbit, else the link rate
+# max_upload_mbit = 30.0
+remember_rates = true           # remember learned rates and baselines per Wi-Fi network

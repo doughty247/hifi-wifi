@@ -8,10 +8,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev iproute2
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - run: cargo build --release
       - run: cargo test
-      - run: cargo clippy
+      - run: cargo clippy --all-targets -- -D warnings
+
+  # Bufferbloat simulation in network namespaces (see scripts/sim-bufferbloat.sh).
+  # Informational: runner kernels vary in which qdiscs they ship.
+  simulation:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: Install tools and qdisc modules
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iperf3 iproute2 iputils-ping "linux-modules-extra-$(uname -r)" || true
+          sudo modprobe sch_cake || true
+          sudo modprobe sch_netem || true
+          sudo modprobe ifb || true
+      - name: Upload bottleneck (iperf3)
+        run: sudo DIRECTION=upload scripts/sim-bufferbloat.sh target/release/hifi-wifi
+      - name: Download bottleneck (iperf3)
+        run: sudo DIRECTION=download scripts/sim-bufferbloat.sh target/release/hifi-wifi
+      - name: hifi-wifi bench against a local server
+        run: sudo MODE=bench scripts/sim-bufferbloat.sh target/release/hifi-wifi

@@ -297,8 +297,10 @@ pub struct Status {
     pub updated_unix: u64,
 }
 
+/// Current status, if a live autorate wrote it recently (a crashed daemon leaves a stale file)
 pub fn read_status() -> Option<Status> {
-    serde_json::from_str(&std::fs::read_to_string(STATUS_PATH).ok()?).ok()
+    let st: Status = serde_json::from_str(&std::fs::read_to_string(STATUS_PATH).ok()?).ok()?;
+    (now_unix().saturating_sub(st.updated_unix) <= 30).then_some(st)
 }
 
 /// What we remember about one network between sessions
