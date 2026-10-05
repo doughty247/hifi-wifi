@@ -46,6 +46,8 @@ pub struct Link {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct Station {
+    /// "signal avg" from the station dump, used when `iw link` reports nonsense
+    pub signal_avg_dbm: Option<i32>,
     pub tx_packets: u64,
     pub tx_retries: u64,
     pub tx_failed: u64,
@@ -108,6 +110,8 @@ pub fn parse_station(out: &str) -> Option<Station> {
             s.tx_failed = v;
         } else if let Some(v) = num("beacon loss:") {
             s.beacon_loss = v;
+        } else if let Some(v) = value(line, "signal avg:").and_then(first_num::<i32>) {
+            s.signal_avg_dbm = Some(v);
         }
     }
     seen.then_some(s)
@@ -202,7 +206,24 @@ pub fn analyze(i: &Inputs) -> Vec<Finding> {
     let mut f = Vec::new();
     let freq = i.link.freq_mhz.unwrap_or(0.0);
 
-    if let Some(sig) = i.link.signal_dbm {
+    // Some drivers occasionally report impossible values (e.g. -2 dBm); prefer the station
+    // average then, and never call a bogus reading "strong"
+    let plausible = |v: i32| (-100..=-10).contains(&v);
+    let signal = i.link.signal_dbm.filter(|v| plausible(*v)).or_else(|| {
+        i.station
+            .as_ref()
+            .and_then(|(_, after)| after.signal_avg_dbm)
+            .filter(|v| plausible(*v))
+    });
+    if let (None, Some(bogus)) = (signal, i.link.signal_dbm) {
+        f.push(finding(
+            Severity::Warn,
+            format!("Signal reading unavailable (driver reported {} dBm)", bogus),
+            "The Wi-Fi driver returned an impossible signal value, so signal strength could not be judged.",
+            Some("Run doctor again; if it persists, report your adapter and kernel version."),
+        ));
+    }
+    if let Some(sig) = signal {
         let (sev, word) = match sig {
             s if s >= -60 => (Severity::Good, "strong"),
             s if s >= -70 => (Severity::Good, "fine"),
@@ -452,18 +473,51 @@ mod tests {
     }
 
     #[test]
+    fn impossible_signal_is_not_called_strong() {
+        let link = Link {
+            ssid: Some("ThisOne".into()),
+            freq_mhz: Some(5180.0),
+            signal_dbm: Some(-2),
+            ..Default::default()
+        };
+        let mut st = Station {
+            tx_packets: 5000,
+            tx_retries: 100,
+            ..Default::default()
+        };
+        let f = analyze(&Inputs {
+            link: link.clone(),
+            station: Some((st, st)),
+            survey: None,
+            power_save_on: None,
+            scan: vec![],
+        });
+        assert!(f.iter().any(|x| x
+            .title
+            .contains("Signal reading unavailable (driver reported -2 dBm)")));
+        assert!(!f.iter().any(|x| x.title.contains("strong")));
+        st.signal_avg_dbm = Some(-58);
+        let f = analyze(&Inputs {
+            link,
+            station: Some((st, st)),
+            survey: None,
+            power_save_on: None,
+            scan: vec![],
+        });
+        assert!(f.iter().any(|x| x.title == "Signal -58 dBm (strong)"));
+    }
+
+    #[test]
     fn live_window_used_when_traffic_flows() {
         let a = Station {
             tx_packets: 1000,
             tx_retries: 500,
-            tx_failed: 0,
-            beacon_loss: 0,
+            ..Default::default()
         };
         let b = Station {
             tx_packets: 2000,
             tx_retries: 550,
-            tx_failed: 0,
-            beacon_loss: 0,
+            ..Default::default()
         };
         let (r, _, live) = retry_ratio(&a, &b);
         assert!(live);
@@ -475,8 +529,7 @@ mod tests {
         let s = Station {
             tx_packets: 5000,
             tx_retries: 100,
-            tx_failed: 0,
-            beacon_loss: 0,
+            ..Default::default()
         };
         let f = analyze(&Inputs {
             link: Link {
