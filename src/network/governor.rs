@@ -21,7 +21,10 @@ use std::time::{Duration, Instant};
 use tokio::process::Command as TokioCommand;
 use tokio::time;
 
-use crate::config::structs::{GovernorConfig, PowerConfig, ScanSuppressMode, WifiConfig};
+use crate::config::structs::{
+    AutorateConfig, AutorateMode, GovernorConfig, PowerConfig, ScanSuppressMode, WifiConfig,
+};
+use crate::network::autorate::{self, AutorateHandle};
 use crate::network::nm::NmClient;
 use crate::network::stats::PpsMonitor;
 use crate::network::tc::{EthtoolManager, TcManager};
@@ -66,20 +69,8 @@ struct InterfaceState {
     bandwidth_valid: bool,
     /// Last known good bitrate (Kbit/s) - used when current reading is garbage (MCS0 probes)
     last_good_bitrate: Option<u32>,
-    /// Last known retransmits for loss detection
-    last_retransmits: u32,
-    /// Whether packet duplication is active
-    multipath_active: bool,
-    /// Consecutive ticks where duplication Trigger ON condition is met
-    duplication_on_ticks: u32,
-    /// Consecutive ticks where duplication Trigger OFF condition is met
-    duplication_off_ticks: u32,
-    /// Last known bytes of primary class (1:11)
-    last_primary_bytes: u64,
-    /// Last known bytes of delayed class (1:12)
-    last_delayed_bytes: u64,
-    /// Last time class stats were queried
-    last_class_stats_time: Option<Instant>,
+    /// SSID of the current network (key for autorate's remembered rates)
+    ssid: Option<String>,
 }
 
 impl InterfaceState {
@@ -115,13 +106,7 @@ impl InterfaceState {
             last_stats_time: None,
             bandwidth_valid: false,
             last_good_bitrate: None,
-            last_retransmits: 0,
-            multipath_active: false,
-            duplication_on_ticks: 0,
-            duplication_off_ticks: 0,
-            last_primary_bytes: 0,
-            last_delayed_bytes: 0,
-            last_class_stats_time: None,
+            ssid: None,
         }
     }
 }
@@ -132,7 +117,6 @@ pub struct Governor {
     wifi_config: WifiConfig,
     power_config: PowerConfig,
     system_config: crate::config::structs::SystemConfig,
-    multipath_config: crate::config::structs::MultipathConfig,
     nm_client: NmClient,
     cpu_monitor: CpuMonitor,
     power_manager: PowerManager,
@@ -142,10 +126,11 @@ pub struct Governor {
     scan_suppress_active: Arc<AtomicBool>,
     last_tick_at: Instant,
     last_resume_at: Option<Instant>,
-    ebpf_manager: crate::network::ebpf::EbpfManager,
-    multipath_manager: crate::network::multipath::MultipathManager,
     current_applied_cc: Option<String>,
     initialized_interfaces: std::collections::HashSet<String>,
+    autorate_config: AutorateConfig,
+    /// Running autorate controller (owns shaping when present)
+    autorate: Option<AutorateHandle>,
 }
 
 impl Governor {
@@ -155,7 +140,7 @@ impl Governor {
         wifi_config: WifiConfig,
         power_config: PowerConfig,
         system_config: crate::config::structs::SystemConfig,
-        multipath_config: crate::config::structs::MultipathConfig,
+        autorate_config: AutorateConfig,
     ) -> Result<Self> {
         let nm_client = NmClient::new().await?;
         let cpu_monitor = CpuMonitor::new(config.cpu_avg_window_size);
@@ -175,7 +160,6 @@ impl Governor {
             wifi_config,
             power_config,
             system_config,
-            multipath_config,
             nm_client,
             cpu_monitor,
             power_manager,
@@ -184,10 +168,10 @@ impl Governor {
             scan_suppress_active: Arc::new(AtomicBool::new(false)),
             last_tick_at: now,
             last_resume_at: Some(now), // Treat startup as initial grace period
-            ebpf_manager: crate::network::ebpf::EbpfManager::new(),
-            multipath_manager: crate::network::multipath::MultipathManager::new(),
             current_applied_cc: None,
             initialized_interfaces,
+            autorate_config,
+            autorate: None,
         })
     }
 
@@ -209,6 +193,20 @@ impl Governor {
             );
         } else {
             info!("Scan suppression disabled by config");
+        }
+
+        // Autorate owns bufferbloat shaping when enabled and tc is present
+        if self.autorate_config.mode != AutorateMode::Off && crate::network::tc::is_tc_available() {
+            info!(
+                "Autorate enabled (mode: {:?}, reflectors: {:?})",
+                self.autorate_config.mode, self.autorate_config.reflectors
+            );
+            self.autorate = Some(autorate::spawn(autorate::Settings {
+                cfg: self.autorate_config.clone(),
+                internet_down_mbit: self.config.internet_download_mbit,
+                internet_up_mbit: self.config.internet_upload_mbit,
+                shape_download: self.config.qos_use_ifb,
+            }));
         }
 
         // Setup inotify watcher for connection events
@@ -347,9 +345,6 @@ impl Governor {
             state.power_save_enabled = None; // Force re-apply on next tick
         }
 
-        // Clear gateway RTT cache - may have changed (VPN, roaming, multi-hop)
-        crate::network::tc::reset_gateway_rtt_cache();
-
         // Wait 1 second for link to stabilize (per legacy dispatcher behavior)
         info!("Waiting 1s for link to stabilize...");
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -357,9 +352,10 @@ impl Governor {
         self.reapply_irq_affinity();
 
         // FIX for Issue #15: Force immediate CAKE application after reconnection
-        // Don't wait for warmup samples - apply with conservative 100Mbit default
-        info!("Forcing immediate CAKE application on all interfaces (warmup bypass)");
-        for (interface, state) in &mut self.interface_states {
+        // Don't wait for warmup samples - apply with conservative 100Mbit default.
+        // Autorate re-detects the link on its own, so this only applies to breathing CAKE.
+        let breathing = self.config.breathing_cake_enabled && self.autorate.is_none();
+        for (interface, state) in self.interface_states.iter_mut().filter(|_| breathing) {
             // Apply CAKE with conservative 100Mbit (will be adjusted by tick() once samples arrive)
             let default_mbit = 100;
             let scaled_mbit = (default_mbit as f64 * 0.85) as u32; // 85Mbit
@@ -543,18 +539,6 @@ impl Governor {
 
         // Optimize TCP congestion control based on currently active connection media
         self.optimize_congestion_control_for_media();
-        // 0. Ensure CAKE is applied on active Ethernet interfaces
-        for ifc in self.wifi_manager.interfaces() {
-            if ifc.interface_type == crate::network::wifi::InterfaceType::Ethernet
-                && self.wifi_manager.is_interface_connected(ifc)
-                && !Self::has_cake(&ifc.name)
-            {
-                let bandwidth = self.calculate_cake_bandwidth(ifc);
-                if let Err(e) = self.wifi_manager.apply_cake(ifc, bandwidth.max(1)) {
-                    warn!("Failed to apply CAKE on {}: {}", ifc.name, e);
-                }
-            }
-        }
 
         // 1. Sample CPU load
         let cpu_load = self.cpu_monitor.sample();
@@ -580,7 +564,7 @@ impl Governor {
         // Ensure interface states exist
         for (interface, _, _, _) in &device_infos {
             if !self.interface_states.contains_key(interface) {
-                let state = InterfaceState::new(&self.config);
+                let mut state = InterfaceState::new(&self.config);
                 let _ = state.tc_manager.remove_cake(interface);
                 self.interface_states.insert(interface.clone(), state);
             }
@@ -671,10 +655,11 @@ impl Governor {
             );
 
             // Get or create interface state
-            if !self.interface_states.contains_key(&interface) {
-                self.interface_states
-                    .insert(interface.clone(), InterfaceState::new(&self.config));
-            }
+            let ssid = active_ap.as_ref().map(|ap| ap.ssid.clone());
+            self.interface_states
+                .entry(interface.clone())
+                .or_insert_with(|| InterfaceState::new(&self.config))
+                .ssid = ssid;
 
             // 3. Game Mode Detection (PPS) - with CAKE freezing
             if self.config.game_mode_enabled {
@@ -701,12 +686,7 @@ impl Governor {
                                 pps, interface
                             );
                             let _ = crate::network::cgroups::set_dscp_prioritization(true);
-                            if self.config.ebpf_bypass_enabled {
-                                if let Err(e) = self.ebpf_manager.load_bypass(&interface) {
-                                    warn!("Failed to load eBPF game bypass: {}", e);
-                                }
-                            }
-                            if self.config.breathing_cake_enabled {
+                            if self.config.breathing_cake_enabled && self.autorate.is_none() {
                                 let _ = state.tc_manager.apply_cake(&interface);
                             }
                         } else {
@@ -723,187 +703,18 @@ impl Governor {
                             state.tc_manager.exit_game_mode();
                             info!("Game mode ENDED on {} (CAKE unfrozen)", interface);
                             let _ = crate::network::cgroups::set_dscp_prioritization(false);
-                            if self.config.ebpf_bypass_enabled {
-                                let _ = self.ebpf_manager.unload_bypass(&interface);
-                            }
-                            if self.config.multipath_bonding_enabled {
-                                let _ = self.multipath_manager.deactivate_duplication();
-                                state.multipath_active = false;
-                            }
-                            if self.config.breathing_cake_enabled {
+                            if self.config.breathing_cake_enabled && self.autorate.is_none() {
                                 let _ = state.tc_manager.remove_cake(&interface);
                             }
                         }
                     }
 
-                    // Predictive multipath bonding telemetry monitoring (Game Mode only)
-                    let is_in_game = state
-                        .game_mode_until
-                        .map(|until| Instant::now() < until)
-                        .unwrap_or(false);
-
-                    let multipath_enabled = self.multipath_config.enabled && self.config.multipath_bonding_enabled;
-
-                    if is_in_game && multipath_enabled {
-                        // 1. Query class statistics for HTB classes 1:11 and 1:12
-                        let (primary_stats, delayed_stats) = state.tc_manager.query_class_stats(&interface).unwrap_or((None, None));
-                        
-                        let now = Instant::now();
-                        let mut primary_mbps = 0.0;
-
-                        if let Some(last_time) = state.last_class_stats_time {
-                            let elapsed = now.duration_since(last_time).as_secs_f64();
-                            if elapsed > 0.0 {
-                                if let (Some(prim), Some(del)) = (primary_stats, delayed_stats) {
-                                    let prim_delta = prim.bytes.saturating_sub(state.last_primary_bytes);
-                                    let del_delta = del.bytes.saturating_sub(state.last_delayed_bytes);
-                                    primary_mbps = (prim_delta as f64 * 8.0) / (elapsed * 1_000_000.0);
-                                    let delayed_mbps = (del_delta as f64 * 8.0) / (elapsed * 1_000_000.0);
-                                    debug!(
-                                        "Class stats throughput on {}: Primary={:.2} Mbps, Delayed={:.2} Mbps (elapsed={:.2}s)",
-                                        interface, primary_mbps, delayed_mbps, elapsed
-                                    );
-                                }
-                            }
-                        }
-
-                        if let (Some(prim), Some(del)) = (primary_stats, delayed_stats) {
-                            state.last_primary_bytes = prim.bytes;
-                            state.last_delayed_bytes = del.bytes;
-                            state.last_class_stats_time = Some(now);
-                        } else {
-                            state.last_class_stats_time = Some(now);
-                        }
-
-                        // 2. Headroom calculation and congestion evaluation
-                        let mut link_rate_kbit = 100_000; // default 100Mbit
-                        let nm_bitrate = bitrate;
-                        let iw_bitrate = Self::get_bitrate_from_iw(&interface).unwrap_or(0);
-                        let min_valid_kbit = 20_000;
-                        let nm_valid = nm_bitrate >= min_valid_kbit;
-                        let iw_valid = iw_bitrate >= min_valid_kbit;
-                        let effective_bitrate = match (nm_valid, iw_valid) {
-                            (true, true) => (nm_bitrate + iw_bitrate) / 2,
-                            (true, false) => nm_bitrate,
-                            (false, true) => iw_bitrate,
-                            (false, false) => 0,
-                        };
-                        if effective_bitrate > 0 {
-                            link_rate_kbit = effective_bitrate;
-                        } else if let Some(last_good) = state.last_good_bitrate {
-                            link_rate_kbit = last_good;
-                        }
-
-                        // Determine dynamic scaling factor (real-world protocol overhead) based on band and RSSI (Strategy 4)
-                        let base_sf = if let Some(ref ap) = active_ap {
-                            match ap.frequency {
-                                0..=2500 => 0.50,      // 2.4 GHz
-                                2501..=5924 => 0.70,  // 5 GHz
-                                _ => 0.85,          // 6 GHz
-                            }
-                        } else {
-                            0.70 // Fallback
-                        };
-
-                        let link_rate_mbit_adjusted = (link_rate_kbit as f64 / 1000.0) * base_sf;
-                        
-                        let game_stream_mbps = if primary_mbps > 1.0 {
-                            primary_mbps
-                        } else {
-                            self.multipath_config.game_stream_bitrate as f64
-                        };
-
-                        // Headroom threshold check:
-                        // Capacity Headroom = Current Local Link Rate (adjusted) - (Game Stream Bitrate * Duplication Multiplier)
-                        // Note: Duplication Multiplier is always 2.0 to check if the link can safely handle the duplication load.
-                        let capacity_headroom = link_rate_mbit_adjusted - (game_stream_mbps * 2.0);
-                        let congestion_suppressed = self.multipath_config.auto_suppress_on_congestion 
-                            && capacity_headroom < 10.0;
-
-                        if congestion_suppressed {
-                            debug!(
-                                "Multipath congestion suppression active: headroom={:.2} Mbps (link adjusted={:.2} Mbps, game={:.2} Mbps). Disabling/preventing duplication.",
-                                capacity_headroom, link_rate_mbit_adjusted, game_stream_mbps
-                            );
-                        }
-
-                        if let Ok(telemetry) = crate::network::tcp_info::get_gaming_telemetry() {
-                            let jitter_ms = telemetry.rtt_var_us as f64 / 1000.0;
-                            let retrans_diff = if telemetry.retransmits >= state.last_retransmits {
-                                telemetry.retransmits - state.last_retransmits
-                            } else {
-                                0
-                            };
-                            state.last_retransmits = telemetry.retransmits;
-
-                            let rssi = active_ap.as_ref().map(|ap| ap.signal_strength).unwrap_or(-60);
-
-                            // Trigger ON: RSSI < -75 OR Jitter > 15ms OR packets retransmitted
-                            let trigger_on = rssi < -75 || jitter_ms > 15.0 || retrans_diff > 0;
-
-                            // Trigger OFF: RSSI >= -68 AND Jitter < 8ms AND no retransmissions
-                            let trigger_off = rssi >= -68 && jitter_ms < 8.0 && retrans_diff == 0;
-
-                            if trigger_on {
-                                state.duplication_on_ticks += 1;
-                                state.duplication_off_ticks = 0;
-                            } else if trigger_off {
-                                state.duplication_off_ticks += 1;
-                                state.duplication_on_ticks = 0;
-                            } else {
-                                state.duplication_on_ticks = 0;
-                                state.duplication_off_ticks = 0;
-                            }
-
-                            if !state.multipath_active {
-                                if !congestion_suppressed && state.duplication_on_ticks >= 3 {
-                                    info!(
-                                        "RTT Telemetry Jitter/Loss/RSSI threshold crossed for 3 ticks (jitter: {:.1}ms, retransmits: {}, RSSI: {}dBm). Activating single-connection temporal duplication.",
-                                        jitter_ms, retrans_diff, rssi
-                                    );
-                                    if let Err(e) =
-                                        self.multipath_manager.activate_duplication(&interface)
-                                    {
-                                        warn!("Failed to activate single-connection duplication: {}", e);
-                                    } else {
-                                        state.multipath_active = true;
-                                    }
-                                    state.duplication_on_ticks = 0;
-                                }
-                            } else {
-                                // Active - check if we should deactivate (requires 15 ticks of confirmed stability, i.e., 30s)
-                                // OR if congestion suppression is triggered, deactivate immediately!
-                                if congestion_suppressed {
-                                    info!(
-                                        "Congestion detected on {} (headroom: {:.1} Mbps). Suppressing single-connection temporal duplication immediately.",
-                                        interface, capacity_headroom
-                                    );
-                                    let _ = self.multipath_manager.deactivate_duplication();
-                                    state.multipath_active = false;
-                                    state.duplication_off_ticks = 0;
-                                } else if state.duplication_off_ticks >= 15 {
-                                    info!(
-                                        "Network stable for 15 ticks (jitter: {:.1}ms, RSSI: {}dBm). Deactivating single-connection temporal duplication.",
-                                        jitter_ms, rssi
-                                    );
-                                    let _ = self.multipath_manager.deactivate_duplication();
-                                    state.multipath_active = false;
-                                    state.duplication_off_ticks = 0;
-                                }
-                            }
-                        }
-                    } else if (!is_in_game || !multipath_enabled) && state.multipath_active {
-                        // Deactivate immediately if we are no longer in game mode or it has been disabled
-                        let _ = self.multipath_manager.deactivate_duplication();
-                        state.multipath_active = false;
-                        state.duplication_on_ticks = 0;
-                        state.duplication_off_ticks = 0;
-                    }
                 }
             }
 
-            // 4. Breathing CAKE (Dynamic QoS) with throughput monitoring
-            if self.config.breathing_cake_enabled {
+            // 4. Breathing CAKE (Dynamic QoS) with throughput monitoring.
+            // With autorate this only tracks the link rate (autorate's upper bound); it never shapes.
+            if self.config.breathing_cake_enabled || self.autorate.is_some() {
                 // Get bitrate from BOTH sources and average for stability
                 let nm_bitrate = bitrate; // Already in Kbit/s from NetworkManager
                 let iw_bitrate = Self::get_bitrate_from_iw(&interface).unwrap_or(0);
@@ -936,7 +747,8 @@ impl Governor {
                         .game_mode_until
                         .map(|until| Instant::now() < until)
                         .unwrap_or(false);
-                    let should_apply_cake = !self.config.game_mode_enabled || is_in_game;
+                    let should_apply_cake = (!self.config.game_mode_enabled || is_in_game)
+                        && self.autorate.is_none();
 
                     // Update throughput estimate from actual traffic
                     Self::update_throughput_estimate(state, &interface);
@@ -976,21 +788,8 @@ impl Governor {
                         let sf_adjusted = base_sf * rssi_multiplier;
                         
                         // Calculate global ceiling
-                        let mut calculated_mbit = ((bitrate_mbit as f64) * sf_adjusted).round() as u32;
-                        calculated_mbit = calculated_mbit.clamp(min_ceil, max_ceil);
-
-                        // If RTT jitter spikes, apply an additional safety penalty
-                        if let Ok(telemetry) = crate::network::tcp_info::get_gaming_telemetry() {
-                            if telemetry.rtt_var_us > 15_000 {
-                                let jitter_ms = telemetry.rtt_var_us / 1000;
-                                let penalty = (jitter_ms as f64 * 0.01).min(0.30); // max 30% reduction
-                                calculated_mbit = ((calculated_mbit as f64) * (1.0 - penalty)).round() as u32;
-                                info!(
-                                    "RTT Jitter detected ({}ms). Scaling CAKE ceiling down to {}Mbit",
-                                    jitter_ms, calculated_mbit
-                                );
-                            }
-                        }
+                        let calculated_mbit = ((bitrate_mbit as f64) * sf_adjusted).round() as u32;
+                        let calculated_mbit = calculated_mbit.clamp(min_ceil, max_ceil);
 
                         debug!(
                             "CAKE: NM={}Kbit, iw={}Kbit, base_kbit={}Kbit, dynamic_scaled={}Mbit (sf_adj={:.3}, rssi={}dBm)",
@@ -1511,21 +1310,54 @@ impl Governor {
             }
         }
 
+        self.update_autorate_target();
+
         Ok(())
     }
 
-    pub fn stop(&mut self) {
+    /// Point autorate at the interface carrying the default route
+    fn update_autorate_target(&self) {
+        let Some(handle) = &self.autorate else {
+            return;
+        };
+        let managed = default_route_iface().and_then(|name| {
+            self.wifi_manager
+                .interfaces()
+                .iter()
+                .find(|ifc| ifc.name == name && self.wifi_manager.is_interface_connected(ifc))
+        });
+        let target = match managed {
+            None => autorate::Target::default(),
+            Some(ifc) if ifc.interface_type == crate::network::wifi::InterfaceType::Wifi => {
+                let state = self.interface_states.get(&ifc.name);
+                autorate::Target {
+                    iface: Some(ifc.name.clone()),
+                    network_key: state.and_then(|st| st.ssid.clone()),
+                    link_kbit: state.and_then(|st| st.last_good_bitrate),
+                }
+            }
+            Some(ifc) => autorate::Target {
+                iface: Some(ifc.name.clone()),
+                network_key: Some(format!("wired:{}", ifc.name)),
+                link_kbit: std::fs::read_to_string(format!("/sys/class/net/{}/speed", ifc.name))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .filter(|mbit| *mbit > 0 && *mbit < 1_000_000)
+                    .map(|mbit| mbit * 1000),
+            },
+        };
+        handle.set_target(target);
+    }
+
+    pub async fn stop(&mut self) {
         info!("Governor stopping, cleaning up...");
 
-        for (interface, state) in &self.interface_states {
-            let _ = state.tc_manager.remove_cake(interface);
-            if self.config.ebpf_bypass_enabled {
-                let _ = self.ebpf_manager.unload_bypass(interface);
-            }
+        if let Some(handle) = self.autorate.take() {
+            handle.shutdown().await;
         }
 
-        if self.config.multipath_bonding_enabled || self.multipath_config.enabled {
-            let _ = self.multipath_manager.deactivate_duplication();
+        for (interface, state) in &mut self.interface_states {
+            let _ = state.tc_manager.remove_cake(interface);
         }
 
         // Clean up DSCP tagging
@@ -1623,14 +1455,6 @@ impl Governor {
     }
 
     /// Calculate CAKE bandwidth from link stats (fallback to 200Mbit)
-    fn calculate_cake_bandwidth(&self, ifc: &crate::network::wifi::WifiInterface) -> u32 {
-        match self.wifi_manager.get_link_stats(ifc) {
-            Ok(stats) if stats.tx_bitrate_mbps > 0.0 => (stats.tx_bitrate_mbps * 0.60) as u32,
-            Ok(_) => 200,
-            Err(_) => 200,
-        }
-    }
-
     /// Update throughput estimate from /sys/class/net statistics
     fn update_throughput_estimate(state: &mut InterfaceState, interface: &str) {
         let rx_path = format!("/sys/class/net/{}/statistics/rx_bytes", interface);
@@ -1739,181 +1563,41 @@ fn find_wifi_interfaces() -> Vec<String> {
     result
 }
 
+/// Interface of the IPv4 default route with the lowest metric (from /proc/net/route)
+pub fn default_route_iface() -> Option<String> {
+    let table = std::fs::read_to_string("/proc/net/route").ok()?;
+    parse_default_route(&table)
+}
+
+fn parse_default_route(table: &str) -> Option<String> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            // Iface Destination Gateway Flags RefCnt Use Metric Mask ...
+            if f.len() > 7 && f[1] == "00000000" && f[7] == "00000000" {
+                Some((f[6].parse::<u32>().unwrap_or(u32::MAX), f[0].to_string()))
+            } else {
+                None
+            }
+        })
+        .min()
+        .map(|(_, iface)| iface)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network::tcp_info::SocketTelemetry;
-
-    fn tick_state_machine(
-        state: &mut InterfaceState,
-        multipath_manager: &mut crate::network::multipath::MultipathManager,
-        telemetry: &SocketTelemetry,
-        rssi: i32,
-        interface: &str,
-    ) {
-        let jitter_ms = telemetry.rtt_var_us as f64 / 1000.0;
-        let retrans_diff = if telemetry.retransmits >= state.last_retransmits {
-            telemetry.retransmits - state.last_retransmits
-        } else {
-            0
-        };
-        state.last_retransmits = telemetry.retransmits;
-
-        let trigger_on = rssi < -75 || jitter_ms > 15.0 || retrans_diff > 0;
-        let trigger_off = rssi >= -68 && jitter_ms < 8.0 && retrans_diff == 0;
-
-        if trigger_on {
-            state.duplication_on_ticks += 1;
-            state.duplication_off_ticks = 0;
-        } else if trigger_off {
-            state.duplication_off_ticks += 1;
-            state.duplication_on_ticks = 0;
-        } else {
-            state.duplication_on_ticks = 0;
-            state.duplication_off_ticks = 0;
-        }
-
-        if !state.multipath_active {
-            if state.duplication_on_ticks >= 3 {
-                if let Err(_) = multipath_manager.activate_duplication(interface) {
-                    // Fail - state remains inactive
-                } else {
-                    if multipath_manager.mock_mode && !multipath_manager.mock_iptables_fail {
-                        state.multipath_active = true;
-                    } else if !multipath_manager.mock_mode {
-                        state.multipath_active = true;
-                    }
-                }
-                state.duplication_on_ticks = 0;
-            }
-        } else {
-            if state.duplication_off_ticks >= 15 {
-                let _ = multipath_manager.deactivate_duplication();
-                state.multipath_active = false;
-                state.duplication_off_ticks = 0;
-            }
-        }
-    }
 
     #[test]
-    fn test_multi_fault_stress_and_recovery() {
-        let config = GovernorConfig::default();
-        let mut state = InterfaceState::new(&config);
-        let mut manager = crate::network::multipath::MultipathManager::new();
-        manager.enable_mock_mode("192.168.1.1");
-
-        let mut telemetry = SocketTelemetry {
-            rtt_us: 10_000,
-            rtt_var_us: 2000, // 2ms jitter
-            retransmits: 0,
-            lost_packets: 0,
-        };
-
-        // 1. Initial stable state
-        tick_state_machine(&mut state, &mut manager, &telemetry, -60, "wlan0");
-        assert!(!state.multipath_active);
-        assert_eq!(state.duplication_on_ticks, 0);
-
-        // 2. Multi-fault spike (jitter = 25ms, RSSI = -78dBm)
-        telemetry.rtt_var_us = 25_000;
-        
-        // Tick 1
-        tick_state_machine(&mut state, &mut manager, &telemetry, -78, "wlan0");
-        assert!(!state.multipath_active);
-        assert_eq!(state.duplication_on_ticks, 1);
-
-        // Tick 2
-        tick_state_machine(&mut state, &mut manager, &telemetry, -78, "wlan0");
-        assert!(!state.multipath_active);
-        assert_eq!(state.duplication_on_ticks, 2);
-
-        // Tick 3 - Should activate duplication
-        tick_state_machine(&mut state, &mut manager, &telemetry, -78, "wlan0");
-        assert!(state.multipath_active);
-        assert_eq!(state.duplication_on_ticks, 0);
-
-        // 3. Fast Recovery (jitter = 4ms, RSSI = -65dBm)
-        telemetry.rtt_var_us = 4000;
-        
-        // Run 14 ticks of recovery - should remain active
-        for i in 1..=14 {
-            tick_state_machine(&mut state, &mut manager, &telemetry, -65, "wlan0");
-            assert!(state.multipath_active, "Should remain active at tick {}", i);
-            assert_eq!(state.duplication_off_ticks, i as u32);
-        }
-
-        // Tick 15 of recovery - should finally deactivate
-        tick_state_machine(&mut state, &mut manager, &telemetry, -65, "wlan0");
-        assert!(!state.multipath_active, "Should deactivate after 15 ticks of stability");
-        assert_eq!(state.duplication_off_ticks, 0);
-    }
-
-    #[test]
-    fn test_fast_flapping_loop_suppression() {
-        let config = GovernorConfig::default();
-        let mut state = InterfaceState::new(&config);
-        let mut manager = crate::network::multipath::MultipathManager::new();
-        manager.enable_mock_mode("192.168.1.1");
-
-        let telemetry = SocketTelemetry {
-            rtt_us: 10_000,
-            rtt_var_us: 2000,
-            retransmits: 0,
-            lost_packets: 0,
-        };
-
-        // Oscillate RSSI between -74 (stable) and -76 (fault)
-        for i in 0..10 {
-            let rssi = if i % 2 == 0 { -76 } else { -74 };
-            tick_state_machine(&mut state, &mut manager, &telemetry, rssi, "wlan0");
-            assert!(!state.multipath_active, "Should never activate on flapping link");
-            assert!(state.duplication_on_ticks <= 1, "Hysteresis guard should keep ticks <= 1");
-        }
-    }
-
-    #[test]
-    fn test_teardown_validation_under_failure() {
-        let config = GovernorConfig::default();
-        let mut state = InterfaceState::new(&config);
-        let mut manager = crate::network::multipath::MultipathManager::new();
-        manager.enable_mock_mode("192.168.1.1");
-        manager.set_mock_iptables_fail(true); // force iptables failure
-
-        let telemetry = SocketTelemetry {
-            rtt_us: 10_000,
-            rtt_var_us: 30_000, // high jitter
-            retransmits: 0,
-            lost_packets: 0,
-        };
-
-        // Tick 1
-        tick_state_machine(&mut state, &mut manager, &telemetry, -60, "wlan0");
-        // Tick 2
-        tick_state_machine(&mut state, &mut manager, &telemetry, -60, "wlan0");
-        // Tick 3 - attempts to activate but fails
-        tick_state_machine(&mut state, &mut manager, &telemetry, -60, "wlan0");
-
-        assert!(!state.multipath_active, "Should not be active if command failed");
-        assert_eq!(state.duplication_on_ticks, 0);
-    }
-
-    #[test]
-    fn test_congestion_suppression_logic() {
-        // Capacity Headroom = Current Local Link Rate (adjusted) - (Game Stream Bitrate * 2)
-        // Under severe congestion (Capacity Headroom < 10 Mbps), duplication must be suppressed.
-        let game_stream_bitrate = 50.0; // 50 Mbps config/measured
-
-        // Scenario 1: High link rate (e.g. 150 Mbps adjusted) -> Headroom = 150 - 100 = 50 Mbps (safe)
-        let link_rate_adjusted_safe = 150.0;
-        let headroom_safe = link_rate_adjusted_safe - (game_stream_bitrate * 2.0);
-        let suppressed_safe = headroom_safe < 10.0;
-        assert!(!suppressed_safe);
-
-        // Scenario 2: Low link rate (e.g. 105 Mbps adjusted) -> Headroom = 105 - 100 = 5 Mbps (congested)
-        let link_rate_adjusted_congested = 105.0;
-        let headroom_congested = link_rate_adjusted_congested - (game_stream_bitrate * 2.0);
-        let suppressed_congested = headroom_congested < 10.0;
-        assert!(suppressed_congested);
+    fn default_route_picks_lowest_metric() {
+        let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+            wlan0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
+            enp3s0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+            wlan0\t0001A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n";
+        assert_eq!(parse_default_route(table), Some("enp3s0".to_string()));
+        assert_eq!(parse_default_route("Iface\tDestination\n"), None);
     }
 
     #[test]

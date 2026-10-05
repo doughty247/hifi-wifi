@@ -95,6 +95,18 @@ enum Commands {
     /// Check system compatibility for advanced networking features
     #[command(name = "check-compat")]
     CheckCompat,
+    /// Run autorate in the foreground on one interface and print what it does
+    /// (stop the service first: sudo hifi-wifi off)
+    Autorate {
+        /// Interface to shape (default: the one carrying the default route)
+        iface: Option<String>,
+        /// Keep shaping even when the link is idle
+        #[arg(long)]
+        always: bool,
+        /// Latency reflector IP (repeatable; overrides the config file)
+        #[arg(long = "reflector")]
+        reflectors: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -185,8 +197,83 @@ async fn main() -> Result<()> {
         Commands::CheckCompat => {
             let _ = run_check_compat()?;
         }
+        Commands::Autorate { iface, always, reflectors } => {
+            run_autorate(&config, iface, always, reflectors).await?;
+        }
     }
 
+    Ok(())
+}
+
+async fn run_autorate(
+    config: &config::structs::Config,
+    iface: Option<String>,
+    always: bool,
+    reflectors: Vec<String>,
+) -> Result<()> {
+    use crate::network::autorate;
+
+    let iface = match iface.or_else(crate::network::governor::default_route_iface) {
+        Some(i) if crate::network::shaper::is_valid_iface(&i) => i,
+        _ => anyhow::bail!("No interface given and no default route found"),
+    };
+    let service_active = Command::new("systemctl")
+        .args(["is-active", "--quiet", "hifi-wifi.service"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if service_active {
+        anyhow::bail!("The hifi-wifi service is running and owns shaping. Stop it first: sudo hifi-wifi off");
+    }
+
+    let mut cfg = config.autorate.clone();
+    if always {
+        cfg.mode = config::structs::AutorateMode::Always;
+    }
+    if !reflectors.is_empty() {
+        cfg.reflectors = reflectors;
+    }
+    let handle = autorate::spawn(autorate::Settings {
+        cfg,
+        internet_down_mbit: config.governor.internet_download_mbit,
+        internet_up_mbit: config.governor.internet_upload_mbit,
+        shape_download: config.governor.qos_use_ifb,
+    });
+    handle.set_target(autorate::Target {
+        iface: Some(iface.clone()),
+        network_key: None,
+        link_kbit: None,
+    });
+    println!("Autorate running on {} (Ctrl-C to stop and remove the shaper)", iface);
+    println!("{:>8} {:>8} {:>12} {:>12} {:>10} {:>9} {:>6}", "time", "shaping", "down kbit", "up kbit", "base ms", "delay ms", "cuts");
+
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+    let start = std::time::Instant::now();
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if let Some(st) = autorate::read_status() {
+                    let f = |v: Option<f64>| v.map(|x| format!("{:.1}", x)).unwrap_or_else(|| "-".into());
+                    println!(
+                        "{:>7}s {:>8} {:>12} {:>12} {:>10} {:>9} {:>6}",
+                        start.elapsed().as_secs(),
+                        if st.shaping { "yes" } else { "no" },
+                        st.download_kbit.map(|d| d.to_string()).unwrap_or_else(|| "-".into()),
+                        st.upload_kbit,
+                        f(st.baseline_ms),
+                        f(st.delay_ms),
+                        st.bloat_events
+                    );
+                }
+            }
+            _ = sigint.recv() => break,
+            _ = sigterm.recv() => break,
+        }
+    }
+    handle.shutdown().await;
     Ok(())
 }
 
@@ -195,70 +282,63 @@ fn run_check_compat() -> Result<bool> {
     println!("| Component / Check | Status | Details |");
     println!("| --- | --- | --- |");
 
-    let mut compatible = true;
-
-    // 1. Check xt_TEE support
-    let tee_status = std::process::Command::new("modprobe")
-        .args(["--dry-run", "xt_TEE"])
-        .output();
-    let tee_ok = match tee_status {
-        Ok(out) => out.status.success(),
-        Err(_) => false,
+    let has_bin = |bin: &str| {
+        std::process::Command::new(bin)
+            .arg("-V")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
     };
-    if tee_ok {
-        println!("| **xt_TEE (Netfilter)** | :white_check_mark: Supported | Kernel module xt_TEE is available for temporal packet duplication. |");
-    } else {
-        println!("| **xt_TEE (Netfilter)** | :warning: Unsupported | Kernel module xt_TEE is missing. Temporal packet duplication will be disabled. |");
-    }
+    let has_module = |module: &str| {
+        Path::new(&format!("/sys/module/{}", module)).exists()
+            || std::process::Command::new("modprobe")
+                .args(["--dry-run", module])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+    };
+    let row = |name: &str, ok: bool, mandatory: bool, good: &str, bad: &str| {
+        let status = match (ok, mandatory) {
+            (true, _) => ":white_check_mark: OK",
+            (false, true) => ":x: Missing (Mandatory)",
+            (false, false) => ":warning: Missing",
+        };
+        println!("| **{}** | {} | {} |", name, status, if ok { good } else { bad });
+    };
 
-    // 2. Check /sys/fs/bpf
-    let bpf_fs_ok = std::path::Path::new("/sys/fs/bpf").exists();
-    if bpf_fs_ok {
-        println!("| **BPF Filesystem** | :white_check_mark: Mounted | `/sys/fs/bpf` is available for eBPF maps/programs. |");
-    } else {
-        println!("| **BPF Filesystem** | :warning: Missing | `/sys/fs/bpf` is not mounted. eBPF features might fail or operate in legacy mode. |");
-    }
+    let tc_ok = has_bin("tc");
+    row("Traffic Control (tc)", tc_ok, true,
+        "`tc` is installed for shaping.",
+        "`tc` (iproute2) is missing. Bufferbloat control cannot work.");
+    let cake_ok = has_module("sch_cake");
+    row("CAKE qdisc (sch_cake)", cake_ok, false,
+        "CAKE is available (preferred shaper).",
+        "CAKE is unavailable. Falls back to HTB + fq_codel shaping.");
+    row("IFB (ifb)", has_module("ifb"), false,
+        "Download (ingress) shaping is possible.",
+        "IFB is unavailable. Only upload can be shaped; download bufferbloat stays uncontrolled.");
+    row("ping (iputils)", has_bin("ping"), false,
+        "Latency probes for autorate and bench are available.",
+        "`ping` is missing. Autorate falls back to a fixed shaper rate; bench cannot run.");
+    row("nftables (nft)", has_bin("nft"), false,
+        "Game traffic DSCP prioritization is available.",
+        "`nft` is missing. Game traffic will not be prioritized over other uploads.");
+    row("iw", has_bin("iw"), false,
+        "Wi-Fi link diagnostics (doctor) are available.",
+        "`iw` is missing. Power save control and diagnostics are limited.");
+    row("curl", has_bin("curl"), false,
+        "Load generation for `hifi-wifi bench` is available.",
+        "`curl` is missing. `hifi-wifi bench` cannot generate load.");
 
-    // 3. Check allowed congestion controls
     let cc_allowed = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_allowed_congestion_control")
         .unwrap_or_default();
-    let has_bbr = cc_allowed.contains("bbr");
-    let has_cubic = cc_allowed.contains("cubic");
-    if has_bbr {
-        println!("| **TCP BBR** | :white_check_mark: Available | BBR is supported by the kernel for optimal low-latency baseline. |");
-    } else {
-        println!("| **TCP BBR** | :warning: Missing | BBR is not listed in allowed congestion controls. Will fallback to Cubic/Default. |");
-    }
-    if has_cubic {
-        println!("| **TCP Cubic** | :white_check_mark: Available | Cubic is supported by the kernel for saturated CAKE shaper pivots. |");
-    } else {
-        println!("| **TCP Cubic** | :warning: Missing | Cubic is not listed in allowed congestion controls. |");
-    }
-
-    // 4. Check tc capability (MANDATORY)
-    let tc_status = std::process::Command::new("tc")
-        .arg("-V")
-        .output();
-    let tc_ok = tc_status.is_ok();
-    if tc_ok {
-        println!("| **Traffic Control (tc)** | :white_check_mark: Available | `tc` utility is installed for shaping and eBPF loading. |");
-    } else {
-        println!("| **Traffic Control (tc)** | :x: Missing (Mandatory) | `tc` utility is missing from the system. QoS shaper and eBPF will not work. |");
-        compatible = false;
-    }
-
-    // 5. Check iptables capability
-    let iptables_status = std::process::Command::new("iptables")
-        .arg("-V")
-        .output();
-    if iptables_status.is_ok() {
-        println!("| **iptables** | :white_check_mark: Available | `iptables` utility is installed for packet duplication rules. |");
-    } else {
-        println!("| **iptables** | :warning: Missing | `iptables` utility is missing. Temporal packet duplication will not work. |");
-    }
+    row("TCP BBR", cc_allowed.contains("bbr"), false,
+        "BBR is available.",
+        "BBR is not in allowed congestion controls. The kernel default is used.");
 
     println!("\nCompatibility check finished.");
-    Ok(compatible)
+    Ok(tc_ok)
 }
 
 fn run_apply(config: &config::structs::Config) -> Result<()> {
@@ -363,34 +443,7 @@ fn run_apply(config: &config::structs::Config) -> Result<()> {
         } else {
             wifi_mgr.disable_power_save(ifc)?;
         }
-
-        // 5. Get link stats and apply CAKE
-        // Always apply CAKE, even if we can't get link stats
-        let bandwidth = match wifi_mgr.get_link_stats(ifc) {
-            Ok(stats) if stats.tx_bitrate_mbps > 0.0 => {
-                info!(
-                    "Link: {}Mbps TX, {}dBm signal",
-                    stats.tx_bitrate_mbps, stats.signal_dbm
-                );
-                // Use 60% of link rate for realistic Wi-Fi throughput
-                (stats.tx_bitrate_mbps * 0.60) as u32
-            }
-            Ok(stats) => {
-                warn!(
-                    "Link stats returned 0 bitrate (signal: {}dBm), using 200Mbit default",
-                    stats.signal_dbm
-                );
-                200
-            }
-            Err(e) => {
-                warn!("Failed to get link stats: {}, using 200Mbit default", e);
-                200
-            }
-        };
-
-        if let Err(e) = wifi_mgr.apply_cake(ifc, bandwidth.max(1)) {
-            error!("Failed to apply CAKE on {}: {}", ifc.name, e);
-        }
+        // Shaping is owned by the daemon (autorate / breathing CAKE), not one-shot apply.
     }
 
     // 6. Apply backend tuning
@@ -455,7 +508,7 @@ fn run_dry_run() -> Result<()> {
 
     info!("  - Would create /etc/sysctl.d/99-hifi-wifi.conf");
     info!("  - Would create driver-specific modprobe config");
-    info!("  - Would apply CAKE qdisc for bufferbloat mitigation");
+    info!("  - Daemon would run autorate bufferbloat control while the link is busy");
     info!("  - Would optimize IRQ affinity");
 
     Ok(())
@@ -466,12 +519,10 @@ fn run_revert() -> Result<()> {
 
     let wifi_mgr = WifiManager::new()?;
 
-    // Remove CAKE qdiscs, ingress qdiscs, eBPF filters, and restore defaults on all interfaces (connected or not)
-    let ebpf_mgr = crate::network::ebpf::EbpfManager::new();
+    // Remove shaping qdiscs (egress + ingress redirect) and restore defaults on all interfaces
     for ifc in wifi_mgr.interfaces() {
         info!("Reverting optimizations on {}", ifc.name);
-        let _ = wifi_mgr.remove_cake(ifc);
-        let _ = ebpf_mgr.unload_bypass(&ifc.name);
+        let _ = crate::network::shaper::remove(&ifc.name);
         let _ = std::process::Command::new("tc")
             .args(["qdisc", "del", "dev", &ifc.name, "ingress"])
             .output();
@@ -504,13 +555,28 @@ fn run_revert() -> Result<()> {
     let backend_tuner = BackendTuner::default();
     backend_tuner.revert()?;
 
-    // Revert multipath duplication / IPTables TEE rules
-    let mut multipath_mgr = crate::network::multipath::MultipathManager::new();
-    multipath_mgr.is_active = true;
-    let _ = multipath_mgr.deactivate_duplication();
+    // Remove leftover TEE duplication rules from v3.1.0-beta.1 (feature removed)
+    remove_legacy_tee_rules();
 
     info!("\n=== Revert Complete ===");
     Ok(())
+}
+
+/// v3.1.0-beta.1 installed iptables TEE/MARK rules (mark 0x99) in mangle POSTROUTING.
+/// They normally vanish on stop or reboot; delete any that survived a crash.
+fn remove_legacy_tee_rules() {
+    let Ok(out) = Command::new("iptables").args(["-t", "mangle", "-S", "POSTROUTING"]).output() else {
+        return;
+    };
+    for rule in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(spec) = rule.strip_prefix("-A POSTROUTING ") {
+            if spec.contains("0x99") && (spec.contains("-j TEE") || spec.contains("-j MARK")) {
+                let mut args = vec!["-t", "mangle", "-D", "POSTROUTING"];
+                args.extend(spec.split_whitespace());
+                let _ = Command::new("iptables").args(&args).output();
+            }
+        }
+    }
 }
 
 /// Check if we're running on SteamOS
@@ -537,7 +603,7 @@ async fn run_monitor(config: &config::structs::Config) -> Result<()> {
         config.wifi.clone(),
         config.power.clone(),
         config.system.clone(),
-        config.multipath.clone(),
+        config.autorate.clone(),
     )
     .await?;
 
@@ -559,11 +625,11 @@ async fn run_monitor(config: &config::structs::Config) -> Result<()> {
         }
         _ = sigint.recv() => {
             info!("Received SIGINT, shutting down gracefully...");
-            governor.stop();
+            governor.stop().await;
         }
         _ = sigterm.recv() => {
             info!("Received SIGTERM, shutting down gracefully...");
-            governor.stop();
+            governor.stop().await;
         }
     }
 

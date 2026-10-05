@@ -129,12 +129,12 @@ setup_homebrew_build_deps() {
     local HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"
     eval "$($HOMEBREW_PREFIX/bin/brew shellenv)"
     
-    # Install gcc, llvm (for clang/eBPF compilation), linux-headers (for UAPI headers), and iproute2 (for tc)
+    # Install gcc (Rust linker) and iproute2 (for tc)
     # Note: brew install may return non-zero for post-install warnings
     if [[ $EUID -eq 0 ]] && [[ -n "$SUDO_USER" ]]; then
-        sudo -u "$SUDO_USER" "$HOMEBREW_PREFIX/bin/brew" install gcc llvm linux-headers iproute2 || true
+        sudo -u "$SUDO_USER" "$HOMEBREW_PREFIX/bin/brew" install gcc iproute2 || true
     else
-        brew install gcc llvm linux-headers iproute2 || true
+        brew install gcc iproute2 || true
     fi
     
     # Verify GCC actually works by finding the versioned binary
@@ -186,21 +186,6 @@ setup_homebrew_runtime_deps() {
     return 1
 }
 
-# Install eBPF dependencies via Homebrew (when native GCC is available)
-setup_homebrew_ebpf_deps() {
-    echo -e "${BLUE}Installing eBPF compile dependencies via Homebrew...${NC}"
-    
-    local HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"
-    eval "$($HOMEBREW_PREFIX/bin/brew shellenv)"
-    
-    if [[ $EUID -eq 0 ]] && [[ -n "$SUDO_USER" ]]; then
-        sudo -u "$SUDO_USER" "$HOMEBREW_PREFIX/bin/brew" install llvm linux-headers iproute2 || true
-    else
-        brew install llvm linux-headers iproute2 || true
-    fi
-    return 0
-}
-
 # Setup SteamOS/Bazzite build environment
 setup_steamos_build_env() {
     echo -e "${BLUE}[SteamOS/Bazzite] Preparing build environment...${NC}"
@@ -217,14 +202,7 @@ setup_steamos_build_env() {
 
     if [ "$has_native_cc" = true ]; then
         echo -e "${GREEN}Native system compiler found at $(command -v cc). Skipping Homebrew GCC setup.${NC}"
-        
-        # We still need clang/llvm-strip and linux-headers for eBPF.
-        # Check if native clang is available.
-        if ! command -v clang &>/dev/null; then
-            setup_homebrew || exit 1
-            setup_homebrew_ebpf_deps || exit 1
-            export PATH="/home/linuxbrew/.linuxbrew/opt/llvm/bin:/home/linuxbrew/.linuxbrew/bin:$PATH"
-        fi
+
         echo -e "${GREEN}Build environment ready! (using native system CC)${NC}\n"
         return 0
     fi
@@ -262,11 +240,11 @@ setup_steamos_build_env() {
         ln -sf "$gxx_bin" "$HOMEBREW_PREFIX/bin/c++"
     fi
     
-    export PATH="$HOMEBREW_PREFIX/opt/llvm/bin:$HOMEBREW_PREFIX/bin:$PATH"
+    export PATH="$HOMEBREW_PREFIX/bin:$PATH"
     export CC="$gcc_bin"
     export CXX="$gxx_bin"
     
-    echo -e "${GREEN}Build environment ready! (CC=$CC, PATH includes LLVM)${NC}\n"
+    echo -e "${GREEN}Build environment ready! (CC=$CC)${NC}\n"
 }
 
 # Check for Rust toolchain, install if missing
@@ -509,19 +487,19 @@ main() {
                 echo -e "${BLUE}[2/5] Setting up Homebrew build environment...${NC}"
                 setup_steamos_build_env
             elif [[ "$distro_id" == *"arch"* ]]; then
-                if ! command -v cc &>/dev/null || ! command -v clang &>/dev/null; then
+                if ! command -v cc &>/dev/null; then
                     echo -e "${BLUE}[2/5] Setting up build environment...${NC}"
                     # Arch but not SteamOS - use pacman directly
-                    sudo pacman -Sy --noconfirm --needed base-devel clang llvm
+                    sudo pacman -Sy --noconfirm --needed base-devel
                 else
                     echo -e "${BLUE}[2/5] Build tools already installed${NC}\n"
                 fi
             else
                 echo -e "${BLUE}[2/5] Build environment check...${NC}"
-                if (! command -v cc &>/dev/null || ! command -v clang &>/dev/null) && [[ "$distro_id" == "bazzite" ]]; then
-                    echo -e "${YELLOW}gcc or clang not found. On Bazzite, run: ${BLUE}ujust install-rust${NC} and install clang/llvm using rpm-ostree if needed.\n"
-                elif ! command -v cc &>/dev/null || ! command -v clang &>/dev/null; then
-                    echo -e "${YELLOW}Warning: gcc or clang not found. Ensure build-essential/base-devel and clang/llvm are installed on your system.${NC}\n"
+                if ! command -v cc &>/dev/null && [[ "$distro_id" == "bazzite" ]]; then
+                    echo -e "${YELLOW}gcc not found. On Bazzite, run: ${BLUE}ujust install-rust${NC}\n"
+                elif ! command -v cc &>/dev/null; then
+                    echo -e "${YELLOW}Warning: gcc not found. Ensure build-essential/base-devel is installed on your system.${NC}\n"
                 else
                     echo -e "${GREEN}Build tools available${NC}\n"
                 fi

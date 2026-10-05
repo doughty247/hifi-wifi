@@ -1,11 +1,11 @@
+pub mod autorate;
 pub mod backend_tuner;
 pub mod cgroups;
-pub mod ebpf;
 pub mod governor;
-pub mod multipath;
 pub mod netlink;
 pub mod nm;
+pub mod pinger;
+pub mod shaper;
 pub mod stats;
 pub mod tc;
-pub mod tcp_info;
 pub mod wifi;

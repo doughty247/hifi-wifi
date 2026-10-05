@@ -15,7 +15,7 @@ pub struct Config {
     #[serde(default)]
     pub governor: GovernorConfig,
     #[serde(default)]
-    pub multipath: MultipathConfig,
+    pub autorate: AutorateConfig,
 }
 
 impl Default for Config {
@@ -27,7 +27,7 @@ impl Default for Config {
             system: SystemConfig::default(),
             backend: BackendConfig::default(),
             governor: GovernorConfig::default(),
-            multipath: MultipathConfig::default(),
+            autorate: AutorateConfig::default(),
         }
     }
 }
@@ -215,15 +215,6 @@ pub struct GovernorConfig {
     pub internet_download_mbit: Option<u32>,
     /// Configured internet upload limit in Mbit/s (optional)
     pub internet_upload_mbit: Option<u32>,
-
-    /// Enable eBPF-based bypass for game UDP streams
-    pub ebpf_bypass_enabled: bool,
-    /// Enable predictive multipath bonding / duplication
-    pub multipath_bonding_enabled: bool,
-    /// Packet loss threshold for multipath activation (0.0 - 1.0)
-    pub multipath_packet_loss_threshold: f64,
-    /// Jitter threshold for multipath activation (ms)
-    pub multipath_jitter_threshold_ms: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,27 +302,57 @@ impl Default for GovernorConfig {
             internet_download_mbit: None,
             internet_upload_mbit: None,
 
-            ebpf_bypass_enabled: true,
-            multipath_bonding_enabled: true,
-            multipath_packet_loss_threshold: 0.02,
-            multipath_jitter_threshold_ms: 15.0,
         }
     }
 }
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct MultipathConfig {
-    pub enabled: bool,
-    pub game_stream_bitrate: u32,
-    pub auto_suppress_on_congestion: bool,
+/// When autorate shapes the connection
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutorateMode {
+    /// Shape only while the link carries real traffic (default; no cost when idle)
+    Busy,
+    /// Keep the shaper installed whenever connected
+    Always,
+    /// Disable autorate (falls back to breathing CAKE settings)
+    Off,
 }
 
-impl Default for MultipathConfig {
+/// Latency-driven bufferbloat control (cake-autorate style)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AutorateConfig {
+    pub mode: AutorateMode,
+    /// ICMP reflectors (IP literals). At least half of the responsive ones must agree on bloat.
+    pub reflectors: Vec<String>,
+    /// Interval between pings to each reflector while shaping
+    pub ping_interval_ms: u64,
+    /// Interval while connected but idle (keeps baselines clean). 0 disables idle probing.
+    pub idle_ping_interval_ms: u64,
+    /// Smoothed RTT increase over baseline that counts as bufferbloat
+    pub delay_threshold_ms: f64,
+    /// Lower bounds for the shaper, so a bad measurement can never starve the link
+    pub min_download_mbit: f64,
+    pub min_upload_mbit: f64,
+    /// Upper bounds. Default: governor.internet_*_mbit if set, else the link rate.
+    pub max_download_mbit: Option<f64>,
+    pub max_upload_mbit: Option<f64>,
+    /// Remember learned rates per Wi-Fi network across restarts
+    pub remember_rates: bool,
+}
+
+impl Default for AutorateConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            game_stream_bitrate: 50,
-            auto_suppress_on_congestion: true,
+            mode: AutorateMode::Busy,
+            reflectors: vec!["1.1.1.1".into(), "8.8.8.8".into(), "9.9.9.9".into()],
+            ping_interval_ms: 300,
+            idle_ping_interval_ms: 2000,
+            delay_threshold_ms: 15.0,
+            min_download_mbit: 5.0,
+            min_upload_mbit: 1.0,
+            max_download_mbit: None,
+            max_upload_mbit: None,
+            remember_rates: true,
         }
     }
 }
@@ -373,12 +394,18 @@ mod tests {
         "#;
         let c: Config = toml::from_str(toml_str).unwrap();
         assert!(c.governor.breathing_cake_enabled);
-        assert!(c.governor.ebpf_bypass_enabled);
-        assert!(c.governor.multipath_bonding_enabled);
-        assert_eq!(c.governor.multipath_packet_loss_threshold, 0.02);
-        assert_eq!(c.governor.multipath_jitter_threshold_ms, 15.0);
-        assert!(c.multipath.enabled);
-        assert_eq!(c.multipath.game_stream_bitrate, 50);
-        assert!(c.multipath.auto_suppress_on_congestion);
+        // Removed v3.1.0-beta.1 keys must not break parsing of old config files
+        let old = "[governor]\nebpf_bypass_enabled = true\n[multipath]\nenabled = true\n";
+        let c: Config = toml::from_str(old).unwrap();
+        assert_eq!(c.autorate.mode, AutorateMode::Busy);
+    }
+
+    #[test]
+    fn test_autorate_config() {
+        let c: Config = toml::from_str("[autorate]\nmode = \"always\"\nreflectors = [\"1.0.0.1\"]\nmax_download_mbit = 300.0\n").unwrap();
+        assert_eq!(c.autorate.mode, AutorateMode::Always);
+        assert_eq!(c.autorate.reflectors, vec!["1.0.0.1".to_string()]);
+        assert_eq!(c.autorate.max_download_mbit, Some(300.0));
+        assert_eq!(c.autorate.ping_interval_ms, 300);
     }
 }
