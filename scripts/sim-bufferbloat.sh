@@ -73,6 +73,7 @@ if [[ "${MODE:-iperf}" == bench ]]; then
     sleep 8
     echo "=== with hifi-wifi autorate ==="
     ip netns exec client "$BIN" "${args[@]}" --label sim-on 2>&1 | grep -v '^\[' || true
+    grep -o 'Shaper installed.*' "$OUT/autorate.log" | head -n 1
     exit 0
 fi
 
@@ -113,5 +114,6 @@ printf "%-12s %10s %12s %12s %12s\n" "" "idle p50" "loaded p50" "loaded p95" "th
 printf "%-12s %8sms %10sms %10sms %7s Mbit\n" "no shaping" "$i1" "$l1" "$p1" "$m1"
 printf "%-12s %8sms %10sms %10sms %7s Mbit\n" "hifi-wifi" "$i2" "$l2" "$p2" "$m2"
 echo
+grep -o 'Shaper installed.*' "$OUT/autorate.log" | head -n 1
 echo "Autorate log ($OUT/autorate.log):"
 grep -v '^\s*$' "$OUT/autorate.log" | tail -n 8
