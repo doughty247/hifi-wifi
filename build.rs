@@ -25,15 +25,25 @@ fn main() {
     if Path::new("/usr/include").exists() {
         cmd.arg("-I/usr/include");
     }
+    // Debian/Ubuntu/Fedora-style multiarch dirs hold asm/types.h
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    for triple in [
+        format!("/usr/include/{}-linux-gnu", arch),
+        format!("/usr/include/{}-linux-gnu", std::env::consts::ARCH),
+    ] {
+        if Path::new(&triple).exists() {
+            cmd.arg(format!("-I{}", triple));
+        }
+    }
 
-    let status = cmd.status();
-
-    match status {
+    match cmd.status() {
         Ok(s) if s.success() => {
             println!("cargo:warning=Successfully compiled src/bpf/game_bypass.c to BPF bytecode");
         }
         _ => {
-            panic!("Error: clang compilation failed or clang is missing. Clang and LLVM are mandatory for v3.1.0 to compile the eBPF game bypass program.");
+            // An empty object makes the runtime fall back to legacy tc u32 filters.
+            println!("cargo:warning=clang failed or is missing; building without eBPF bytecode (legacy tc fallback only)");
+            std::fs::write(&dest_path, []).expect("failed to write empty BPF object");
         }
     }
 }
