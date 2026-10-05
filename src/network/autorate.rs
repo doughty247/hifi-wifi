@@ -429,6 +429,8 @@ struct Session {
     busy_until: Option<Instant>,
     /// Whether the running pinger uses the fast (shaping) interval
     pinger_fast: bool,
+    /// Link is busy: probe fast and watch for bloat, even before any shaper exists
+    watching: bool,
     pinger_started_at: Option<Instant>,
     last_sample_at: Option<Instant>,
     /// Back off after a failed shaper install instead of retrying every tick
@@ -532,6 +534,7 @@ impl Settings {
             last_counters: None,
             busy_until: None,
             pinger_fast: false,
+            watching: false,
             pinger_started_at: None,
             last_sample_at: None,
             retry_install_at: None,
@@ -616,17 +619,37 @@ fn step(s: &mut Session, settings: &Settings, sample_tx: &mpsc::Sender<Sample>) 
     if dl_kbit >= BUSY_DL_KBIT || ul_kbit >= BUSY_UL_KBIT {
         s.busy_until = Some(now + BUSY_HOLD);
     }
-    let active = match settings.cfg.mode {
-        AutorateMode::Always => true,
-        AutorateMode::Busy => s.busy_until.is_some_and(|u| now < u),
-        AutorateMode::Off => false,
-    };
+    let busy = s.busy_until.is_some_and(|u| now < u);
+    s.watching = busy;
 
-    if active && s.shaper.is_none() {
-        start_shaping(s, settings);
-    } else if !active && s.shaper.is_some() {
-        info!("Autorate: link idle, removing shaper from {}", s.iface);
-        stop_shaping(s, settings);
+    match settings.cfg.mode {
+        AutorateMode::Always if s.shaper.is_none() => start_shaping(s, settings),
+        // Measure first, shape second: while busy, watch latency without a shaper and install
+        // one only when the controller sees bloat it would cut for. A clean line (no bloat)
+        // is never touched, so it pays no CPU or throughput cost.
+        AutorateMode::Busy if busy && s.shaper.is_none() => {
+            let cuts = s.ctrl.bloat_events;
+            s.ctrl.tick(dl_kbit, ul_kbit);
+            if s.ctrl.bloat_events > cuts {
+                info!(
+                    "Autorate: bufferbloat under load on {} (+{:.0} ms), shaping",
+                    s.iface,
+                    s.ctrl.delta_ms().unwrap_or(0.0)
+                );
+                start_shaping(s, settings);
+                s.rates_learned = true;
+            }
+            update_pinger(s, settings, sample_tx);
+            if s.ticks.is_multiple_of(4) {
+                write_status(s);
+            }
+            return;
+        }
+        AutorateMode::Busy if !busy && s.shaper.is_some() => {
+            info!("Autorate: link idle, removing shaper from {}", s.iface);
+            stop_shaping(s, settings);
+        }
+        _ => {}
     }
     update_pinger(s, settings, sample_tx);
 
@@ -701,7 +724,7 @@ fn start_shaping(s: &mut Session, settings: &Settings) {
 /// Fast probing while shaping; slow probing while idle keeps baselines clean
 /// (a baseline first measured under load would hide the bloat it is meant to detect).
 fn update_pinger(s: &mut Session, settings: &Settings, sample_tx: &mpsc::Sender<Sample>) {
-    let fast = s.shaper.is_some();
+    let fast = s.shaper.is_some() || s.watching;
     let interval = if fast {
         settings.cfg.ping_interval_ms
     } else {

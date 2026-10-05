@@ -69,7 +69,7 @@ if [[ "${MODE:-iperf}" == bench ]]; then
           --download-url http://10.9.9.9:8080/down --upload-url http://10.9.9.9:8080/up)
     echo "=== without hifi-wifi ==="
     ip netns exec client "$BIN" "${args[@]}" --label sim-off 2>&1 | grep -v '^\[' || true
-    ip netns exec client "$BIN" autorate cli0 --always --reflector 10.9.9.9 > "$OUT/autorate.log" 2>&1 &
+    ip netns exec client "$BIN" autorate cli0 ${AUTORATE_FLAGS:-} --reflector 10.9.9.9 > "$OUT/autorate.log" 2>&1 &
     sleep 8
     echo "=== with hifi-wifi autorate ==="
     ip netns exec client "$BIN" "${args[@]}" --label sim-on 2>&1 | grep -v '^\[' || true
@@ -105,7 +105,7 @@ EOF
 echo "Bottleneck: $RATE $DIRECTION, buffer $BUFFER${NO_NETEM:+ (no netem: base RTT ~0)}"
 read -r i1 l1 p1 m1 < <(measure baseline)
 
-ip netns exec client "$BIN" autorate cli0 --always --reflector 10.9.9.9 > "$OUT/autorate.log" 2>&1 &
+ip netns exec client "$BIN" autorate cli0 ${AUTORATE_FLAGS:-} --reflector 10.9.9.9 > "$OUT/autorate.log" 2>&1 &
 sleep 8   # idle probing builds the baseline
 read -r i2 l2 p2 m2 < <(measure autorate)
 

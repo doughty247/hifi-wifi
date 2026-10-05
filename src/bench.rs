@@ -19,6 +19,9 @@ use crate::network::pinger::{Pinger, Sample};
 pub const RESULTS_DIR: &str = "/var/lib/hifi-wifi/bench";
 /// Public large-file sources for the download load, tried in order
 pub const DEFAULT_DOWNLOAD_URLS: &[&str] = &[
+    // 100 MB keeps a gigabit stream busy ~1 s per request (25 MB spent most of its time in
+    // TCP ramp-up); 25 MB is the fallback if Cloudflare refuses the larger size
+    "https://speed.cloudflare.com/__down?bytes=100000000",
     "https://speed.cloudflare.com/__down?bytes=25000000",
     "https://proof.ovh.net/files/1Gb.dat",
     "http://speedtest.tele2.net/1GB.zip",

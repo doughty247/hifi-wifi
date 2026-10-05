@@ -119,8 +119,8 @@ enum Commands {
         /// Seconds of untimed load before measuring (lets autorate find the bottleneck)
         #[arg(long, default_value_t = 10)]
         warmup: u64,
-        /// Parallel transfers per direction
-        #[arg(long, default_value_t = 4)]
+        /// Parallel transfers per direction (gigabit lines need several)
+        #[arg(long, default_value_t = 8)]
         streams: usize,
         /// URL to download from (must serve a large file). Default: Cloudflare's speed test,
         /// then OVH's and Tele2's public test files if a server refuses
@@ -305,7 +305,7 @@ async fn run_doctor(iface: Option<String>) -> Result<()> {
         Some(st) => println!(
             "Bufferbloat control: autorate on {}, {} (download {}, upload {} kbit, {} corrections so far)",
             st.iface,
-            if st.shaping { "shaping now" } else { "idle (shapes when the link gets busy)" },
+            if st.shaping { "shaping now" } else { "not shaping (steps in only if latency rises under load)" },
             st.download_kbit.map(|d| format!("{} kbit", d)).unwrap_or_else(|| "unshaped".into()),
             st.upload_kbit,
             st.bloat_events
@@ -1076,7 +1076,7 @@ async fn run_status_async() -> Result<()> {
                 st.download_kbit.map(|d| format!("{} kbit", d)).unwrap_or_else(|| "unshaped".into()),
                 st.upload_kbit
             ),
-            Some(_) => "Autorate (idle; shapes when the link is busy)".to_string(),
+            Some(_) => "Autorate (not shaping; steps in only if latency rises under load)".to_string(),
             None if config.autorate.mode != config::structs::AutorateMode::Off => {
                 "Autorate (not running)".to_string()
             }
