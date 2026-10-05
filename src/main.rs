@@ -122,9 +122,10 @@ enum Commands {
         /// Parallel transfers per direction
         #[arg(long, default_value_t = 4)]
         streams: usize,
-        /// URL to download from (must serve a large file)
-        #[arg(long, default_value = "https://speed.cloudflare.com/__down?bytes=25000000")]
-        download_url: String,
+        /// URL to download from (must serve a large file). Default: Cloudflare's speed test,
+        /// then OVH's and Tele2's public test files if a server refuses
+        #[arg(long)]
+        download_url: Option<String>,
         /// URL that accepts a streamed POST upload
         #[arg(long, default_value = "https://speed.cloudflare.com/__up")]
         upload_url: String,
@@ -255,7 +256,17 @@ async fn main() -> Result<()> {
                 .or_else(|| config.autorate.reflectors.first().cloned())
                 .unwrap_or_else(|| "1.1.1.1".into());
             let mut opts = bench::Options {
-                iface, reflector, secs, warmup_secs: warmup, streams, download_url, upload_url, label,
+                iface,
+                reflector,
+                secs,
+                warmup_secs: warmup,
+                streams,
+                download_urls: match download_url {
+                    Some(u) => vec![u],
+                    None => bench::DEFAULT_DOWNLOAD_URLS.iter().map(|s| s.to_string()).collect(),
+                },
+                upload_url,
+                label,
             };
             run_bench(&mut opts, ab).await?;
         }

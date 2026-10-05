@@ -8,6 +8,8 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -15,6 +17,12 @@ use tokio::sync::mpsc;
 use crate::network::pinger::{Pinger, Sample};
 
 pub const RESULTS_DIR: &str = "/var/lib/hifi-wifi/bench";
+/// Public large-file sources for the download load, tried in order
+pub const DEFAULT_DOWNLOAD_URLS: &[&str] = &[
+    "https://speed.cloudflare.com/__down?bytes=25000000",
+    "https://proof.ovh.net/files/1Gb.dat",
+    "http://speedtest.tele2.net/1GB.zip",
+];
 const PING_INTERVAL_MS: u64 = 200;
 
 pub struct Options {
@@ -23,7 +31,8 @@ pub struct Options {
     pub secs: u64,
     pub warmup_secs: u64,
     pub streams: usize,
-    pub download_url: String,
+    /// Tried in order; a stream moves to the next one when a server refuses
+    pub download_urls: Vec<String>,
     pub upload_url: String,
     pub label: String,
 }
@@ -44,6 +53,9 @@ pub struct Phase {
     /// URL unreachable...). Such a phase measures an idle line and is excluded from the grade.
     #[serde(default = "default_true")]
     pub load_ok: bool,
+    /// Why the load generator failed, if it did
+    #[serde(default)]
+    pub load_errors: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -138,6 +150,7 @@ fn summarize(name: &str, rtts: &[f64], secs: f64, down_mbit: f64, up_mbit: f64) 
         down_mbit,
         up_mbit,
         load_ok: true,
+        load_errors: Vec::new(),
     }
 }
 
@@ -159,6 +172,23 @@ enum Load {
     Both,
 }
 
+/// Download source in use; shared by all streams and kept across the A/B runs
+static DL_URL_INDEX: AtomicUsize = AtomicUsize::new(0);
+/// Why load generation failed, for the report
+static LOAD_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn record_error(msg: String) {
+    if let Ok(mut e) = LOAD_ERRORS.lock() {
+        if !e.contains(&msg) {
+            e.push(msg);
+        }
+    }
+}
+
+fn host_of(url: &str) -> &str {
+    url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or(url)
+}
+
 /// Keep `streams` curl transfers running until `deadline`.
 async fn run_load(o: &Options, load: Load, deadline: Instant) {
     let mut tasks = Vec::new();
@@ -173,10 +203,10 @@ async fn run_load(o: &Options, load: Load, deadline: Instant) {
             if !wanted {
                 continue;
             }
-            let url = if upload {
-                o.upload_url.clone()
+            let urls = if upload {
+                vec![o.upload_url.clone()]
             } else {
-                o.download_url.clone()
+                o.download_urls.clone()
             };
             let iface = o.iface.clone();
             tasks.push(tokio::spawn(async move {
@@ -185,10 +215,14 @@ async fn run_load(o: &Options, load: Load, deadline: Instant) {
                         break;
                     }
                     let mut cmd = Command::new("curl");
-                    cmd.args(["-s", "-o", "/dev/null", "--interface", &iface, "--max-time"])
-                        .arg(format!("{:.1}", left.as_secs_f64()))
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
+                    let idx = if upload { 0 } else { DL_URL_INDEX.load(Ordering::Relaxed) };
+                    let Some(url) = urls.get(idx).cloned() else {
+                        break; // every download source refused
+                    };
+                    cmd.args(["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--interface", &iface])
+                        .args(["--max-time", &format!("{:.1}", left.as_secs_f64())])
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
                         .kill_on_drop(true);
                     if upload {
                         // Stream zeros from stdin: unbounded upload without buffering in memory
@@ -208,9 +242,31 @@ async fn run_load(o: &Options, load: Load, deadline: Instant) {
                         cmd.stdin(Stdio::null());
                     }
                     cmd.arg(&url);
-                    match cmd.status().await {
-                        Ok(_) => {}
-                        Err(_) => break,
+                    let started = Instant::now();
+                    let Ok(out) = cmd.output().await else {
+                        record_error("curl could not be started".into());
+                        break;
+                    };
+                    let code: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0);
+                    // Exit 28 = hit --max-time, the normal end of a load phase
+                    let timed_out = out.status.code() == Some(28);
+                    let refused = code >= 400 || (!out.status.success() && !timed_out);
+                    if refused && started.elapsed() < Duration::from_secs(3) {
+                        let why = if code >= 400 {
+                            format!("HTTP {}", code)
+                        } else {
+                            String::from_utf8_lossy(&out.stderr).trim().to_string()
+                        };
+                        record_error(format!("{}: {}", host_of(&url), why));
+                        if !upload {
+                            // Move every download stream on to the next source (once per failure)
+                            let _ = DL_URL_INDEX.compare_exchange(
+                                idx,
+                                idx + 1,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            );
+                        }
                     }
                     // Avoid a hot loop if the server refuses immediately
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -288,6 +344,9 @@ pub async fn run(o: &Options) -> Result<Report> {
             .map(|w| if name == "download" { w.down_mbit } else { w.up_mbit })
             .unwrap_or(0.0);
         check_load(&mut p, reference);
+        if !p.load_ok {
+            p.load_errors = LOAD_ERRORS.lock().map(|e| e.clone()).unwrap_or_default();
+        }
         phases.push(p);
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -336,15 +395,32 @@ pub fn print(r: &Report) {
         );
     }
     if r.phases.iter().any(|p| !p.load_ok) {
-        println!("  Warning: a loaded phase did not saturate the link (the test server may be throttling).");
-        println!("  Its latency is that of an idle line. Re-run later or pass --download-url / --upload-url.");
+        println!("  Warning: a loaded phase did not load the link, so it measured an idle line.");
+        for e in r.phases.iter().flat_map(|p| &p.load_errors) {
+            println!("    load error: {}", e);
+        }
+        println!("  Try again later, or pass --download-url / --upload-url with a server near you.");
     }
     if let Some(b) = r.bloat_ms() {
+        let graded: Vec<&str> = r
+            .phases
+            .iter()
+            .filter(|p| p.name != "idle" && p.load_ok)
+            .map(|p| p.name.as_str())
+            .collect();
+        let scope = if graded.len() < 2 {
+            format!(", {} only", graded.join(""))
+        } else {
+            String::new()
+        };
         println!(
-            "  Latency increase under load: +{:.1} ms (grade {})",
+            "  Latency increase under load: +{:.1} ms (grade {}{})",
             b,
-            grade(b)
+            grade(b),
+            scope
         );
+    } else {
+        println!("  No loaded phase succeeded; no grade.");
     }
 }
 
